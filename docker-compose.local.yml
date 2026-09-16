@@ -1,0 +1,21 @@
+# Local production-style run (no public DNS / no Let's Encrypt).
+# Usage:
+#   cp .env.example .env   # set LIVEKIT_URL=ws://localhost:7880 and local keys
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# Then open http://localhost:3000
+
+services:
+  caddy:
+    profiles: ["disabled"]
+
+  app:
+    ports:
+      - "3000:3000"
+
+  livekit:
+    environment:
+      LIVEKIT_USE_EXTERNAL_IP: "false"
+    ports:
+      # Signaling exposed to the host browser (Caddy is off in this overlay).
+      - "7880:7880"

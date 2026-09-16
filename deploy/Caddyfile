@@ -1,0 +1,27 @@
+# Meet — Caddy reverse proxy (automatic Let's Encrypt HTTPS)
+#
+# Requires DOMAIN and ACME_EMAIL in the environment (see .env.example).
+# App:     https://{$DOMAIN}
+# LiveKit: wss://livekit.{$DOMAIN}  (signaling; media uses UDP/TCP on the host)
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode gzip
+
+	header {
+		# Extra defense in depth; Next.js also sets security headers.
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	reverse_proxy app:3000
+}
+
+livekit.{$DOMAIN} {
+	# WebSocket / HTTP signaling to LiveKit
+	reverse_proxy livekit:7880
+}

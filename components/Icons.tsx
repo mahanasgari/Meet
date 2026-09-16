@@ -111,3 +111,47 @@ export function CloseIcon(props: IconProps) {
     </Icon>
   );
 }
+
+export function MusicIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M9 18V5l12-2v13" />
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="18" cy="16" r="3" />
+    </Icon>
+  );
+}
+
+export function PlayIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" />
+    </Icon>
+  );
+}
+
+export function PauseIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
+      <rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
+    </Icon>
+  );
+}
+
+export function SkipIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M5 5v14l8-7z" fill="currentColor" stroke="none" />
+      <path d="M19 5v14" />
+    </Icon>
+  );
+}
+
+export function StopIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none" />
+    </Icon>
+  );
+}

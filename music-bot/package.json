@@ -1,0 +1,14 @@
+{
+  "name": "meet-music-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "^1.0.0",
+    "livekit-server-sdk": "^2.19.0"
+  }
+}

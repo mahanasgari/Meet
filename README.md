@@ -45,8 +45,16 @@ cp .env.example .env.local
 #   LIVEKIT_URL=ws://localhost:7880
 #   LIVEKIT_API_KEY=devkey
 #   LIVEKIT_API_SECRET=local_dev_only_secret_do_not_use_in_prod
+#   MUSIC_BOT_URL=http://127.0.0.1:4100
 
-# 3. Run the app
+# 3. Music bot (optional, separate terminal; requires ffmpeg)
+cp .env.example music-bot/.env 2>/dev/null || true
+LIVEKIT_URL=ws://localhost:7880 \
+LIVEKIT_API_KEY=devkey \
+LIVEKIT_API_SECRET=local_dev_only_secret_do_not_use_in_prod \
+npm run music-bot
+
+# 4. Run the app
 npm install
 npm run dev
 ```
@@ -99,6 +107,8 @@ Edit `.env` (required):
 | `LIVEKIT_RTC_TCP_PORT` | no | Default `7881` |
 | `LIVEKIT_RTC_PORT_START` / `END` | no | Default `50000`–`50100` |
 | `LIVEKIT_LOG_LEVEL` | no | Default `info` |
+| `MUSIC_BOT_URL` | no | Music bot HTTP URL (compose: `http://music-bot:4100`) |
+| `LIVEKIT_BOT_URL` | no | LiveKit URL for the bot process (compose: `ws://livekit:7880`) |
 
 Do **not** commit `.env`. Do **not** use local/dev credentials off localhost —
 the app refuses those defaults when `LIVEKIT_URL` is non-local in production.
@@ -169,6 +179,7 @@ deploy/
   livekit-entrypoint.sh  Builds LiveKit config from env (no secrets in git)
   livekit.yaml.example Reference config shape
   nginx.example.conf   Optional Nginx instead of Caddy
+music-bot/             Isolated music bot process (FFmpeg → LiveKit audio)
 docker-compose.yml           Production stack
 docker-compose.local.yml     Local prod-style (no TLS)
 docker-compose.noproxy.yml   Behind an existing reverse proxy

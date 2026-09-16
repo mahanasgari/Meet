@@ -1,0 +1,21 @@
+# Reference LiveKit config shape. Production Compose generates this at
+# container start from environment variables (see deploy/livekit-entrypoint.sh).
+# Do not put real API secrets in this file or commit them.
+
+port: 7880
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: true
+  # node_ip: 203.0.113.10
+
+redis:
+  address: redis:6379
+
+keys:
+  # "YOUR_API_KEY": "YOUR_API_SECRET"
+
+logging:
+  level: info

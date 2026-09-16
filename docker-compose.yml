@@ -1,0 +1,122 @@
+# Production stack for a small VPS:
+#   Caddy (HTTPS) → Next.js app
+#   Caddy (WSS)   → LiveKit signaling
+#   LiveKit RTC UDP/TCP published on the host
+#   Redis for LiveKit
+#
+# Setup:
+#   1. cp .env.example .env   # fill DOMAIN, ACME_EMAIL, LiveKit secrets
+#   2. Point DNS A records: DOMAIN and livekit.DOMAIN → VPS IP
+#   3. Open firewall: 80/tcp, 443/tcp, 7881/tcp, 50000-50100/udp
+#   4. docker compose up -d --build
+#
+# Local smoke test (no TLS / no public DNS):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - meet
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meet-app:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      LIVEKIT_URL: ${LIVEKIT_URL:?Set LIVEKIT_URL in .env}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+    expose:
+      - "3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    depends_on:
+      livekit:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - meet
+
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+      LIVEKIT_USE_EXTERNAL_IP: ${LIVEKIT_USE_EXTERNAL_IP:-true}
+      LIVEKIT_NODE_IP: ${LIVEKIT_NODE_IP:-}
+      LIVEKIT_RTC_PORT_START: ${LIVEKIT_RTC_PORT_START:-50000}
+      LIVEKIT_RTC_PORT_END: ${LIVEKIT_RTC_PORT_END:-50100}
+      LIVEKIT_LOG_LEVEL: ${LIVEKIT_LOG_LEVEL:-info}
+      LIVEKIT_REDIS_ADDRESS: redis:6379
+    volumes:
+      - ./deploy/livekit-entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      # RTC over TCP (fallback when UDP is blocked)
+      - "${LIVEKIT_RTC_TCP_PORT:-7881}:7881"
+      # WebRTC media (UDP) — must reach the host from the internet
+      - "${LIVEKIT_RTC_PORT_START:-50000}-${LIVEKIT_RTC_PORT_END:-50100}:${LIVEKIT_RTC_PORT_START:-50000}-${LIVEKIT_RTC_PORT_END:-50100}/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - meet
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - meet
+
+networks:
+  meet:
+    driver: bridge
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

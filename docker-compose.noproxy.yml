@@ -1,0 +1,21 @@
+# Use when TLS is terminated by an existing Nginx/Caddy/Traefik on the host.
+# Publishes app + LiveKit signaling on localhost; RTC ports come from the base file.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.noproxy.yml up -d --build
+#
+# Proxy:
+#   https://DOMAIN            → 127.0.0.1:3000
+#   wss://livekit.DOMAIN      → 127.0.0.1:7880
+# See deploy/nginx.example.conf
+
+services:
+  caddy:
+    profiles: ["disabled"]
+
+  app:
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  livekit:
+    ports:
+      - "127.0.0.1:7880:7880"

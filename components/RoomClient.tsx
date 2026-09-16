@@ -4,10 +4,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CloseIcon, LinkIcon, UsersIcon } from "./Icons";
 import { AudioRenderer } from "./AudioRenderer";
 import { ControlBar } from "./ControlBar";
+import { MusicPanel, MusicToggleButton } from "./MusicPanel";
 import { ParticipantList } from "./ParticipantList";
 import { PreJoin } from "./PreJoin";
 import { VideoTile } from "./VideoTile";
 import { useLiveKitRoom } from "@/lib/useLiveKitRoom";
+
+function isMusicBot(identity: string) {
+  return identity.startsWith("music-bot-");
+}
 
 export function RoomClient({ roomName }: { roomName: string }) {
   const {
@@ -26,6 +31,7 @@ export function RoomClient({ roomName }: { roomName: string }) {
   } = useLiveKitRoom(roomName);
 
   const [participantsOpen, setParticipantsOpen] = useState(false);
+  const [musicOpen, setMusicOpen] = useState(false);
 
   if (status !== "connected") {
     return (
@@ -43,6 +49,9 @@ export function RoomClient({ roomName }: { roomName: string }) {
     (person) => person.screenSharing && person.screenTrack,
   );
   const audioTracks = participants.flatMap((person) => person.audioTracks);
+  const videoParticipants = participants.filter(
+    (person) => !isMusicBot(person.identity),
+  );
   const sharing = screenShares.length > 0;
 
   return (
@@ -56,7 +65,13 @@ export function RoomClient({ roomName }: { roomName: string }) {
             {roomName}
           </span>
         </div>
-        <CopyLinkButton />
+        <div className="flex shrink-0 items-center gap-1.5">
+          <MusicToggleButton
+            active={musicOpen}
+            onClick={() => setMusicOpen((open) => !open)}
+          />
+          <CopyLinkButton />
+        </div>
       </header>
 
       {!canPlayAudio && (
@@ -103,13 +118,13 @@ export function RoomClient({ roomName }: { roomName: string }) {
               </div>
             )}
 
-            {participants.length === 0 ? (
+            {videoParticipants.length === 0 ? (
               <div className="flex flex-1 items-center justify-center text-sm text-[var(--text-faint)]">
                 Connecting&hellip;
               </div>
             ) : (
-              <div className="video-grid" data-count={participants.length}>
-                {participants.map((person) => (
+              <div className="video-grid" data-count={videoParticipants.length}>
+                {videoParticipants.map((person) => (
                   <VideoTile
                     key={person.identity}
                     info={person}
@@ -119,6 +134,12 @@ export function RoomClient({ roomName }: { roomName: string }) {
               </div>
             )}
           </div>
+
+          <MusicPanel
+            roomName={roomName}
+            open={musicOpen}
+            onClose={() => setMusicOpen(false)}
+          />
         </main>
 
         <button

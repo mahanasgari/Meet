@@ -7,12 +7,28 @@ interface FakePublication {
   isMuted?: boolean;
   videoTrack?: unknown;
   audioTrack?: unknown;
+  source?: Track.Source;
 }
 
 function fakeParticipant(
   publications: Partial<Record<Track.Source, FakePublication>>,
   overrides: Record<string, unknown> = {},
 ): Participant {
+  const audioTrackPublications = new Map<string, FakePublication>();
+  for (const [source, publication] of Object.entries(publications)) {
+    const sourceNum = Number(source) as unknown as Track.Source;
+    if (
+      sourceNum === Track.Source.Microphone ||
+      sourceNum === Track.Source.ScreenShareAudio ||
+      sourceNum === Track.Source.Unknown
+    ) {
+      audioTrackPublications.set(String(source), {
+        ...publication,
+        source: sourceNum,
+      });
+    }
+  }
+
   return {
     identity: "identity",
     name: "Alex",
@@ -21,6 +37,7 @@ function fakeParticipant(
     isCameraEnabled: false,
     isScreenShareEnabled: false,
     getTrackPublication: (source: Track.Source) => publications[source],
+    audioTrackPublications,
     ...overrides,
   } as unknown as Participant;
 }
@@ -78,10 +95,23 @@ describe("toParticipantInfo", () => {
     expect(info.audioTracks).toEqual([microphoneTrack]);
   });
 
+  it("plays music-bot Unknown audio tracks", () => {
+    const musicTrack = { id: "music" };
+    const info = toParticipantInfo(
+      fakeParticipant({
+        [Track.Source.Unknown]: { audioTrack: musicTrack },
+      }),
+      false,
+    );
+
+    expect(info.audioTracks).toEqual([musicTrack]);
+  });
+
   it("never plays back local audio", () => {
     const info = toParticipantInfo(
       fakeParticipant({
         [Track.Source.Microphone]: { audioTrack: { id: "mic" } },
+        [Track.Source.Unknown]: { audioTrack: { id: "music" } },
       }),
       true,
     );

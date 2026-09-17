@@ -15,7 +15,7 @@ function AudioTrack({ track }: { track: Track }) {
     };
   }, [track]);
 
-  return <audio ref={audioRef} autoPlay />;
+  return <audio ref={audioRef} autoPlay playsInline />;
 }
 
 export function AudioRenderer({ tracks }: { tracks: Track[] }) {

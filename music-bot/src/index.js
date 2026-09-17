@@ -246,8 +246,9 @@ async function ensureConnected(session) {
   const source = new AudioSource(SAMPLE_RATE, CHANNELS, 4_000);
   const track = LocalAudioTrack.createAudioTrack("music", source);
   const options = new TrackPublishOptions();
-  // Not MICROPHONE — avoids client-side voice processing / AGC on receivers.
-  options.source = TrackSource.SOURCE_UNKNOWN;
+  // Prefer ScreenShareAudio so clients that only wire mic/screenshare still
+  // hear music; participants.ts also plays Unknown/any remote audio.
+  options.source = TrackSource.SOURCE_SCREENSHARE_AUDIO;
   const local = room.localParticipant;
   if (!local) {
     await room.disconnect().catch(() => undefined);

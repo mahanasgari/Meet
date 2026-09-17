@@ -18,19 +18,16 @@ export function toParticipantInfo(
   isLocal: boolean,
 ): ParticipantInfo {
   const camera = participant.getTrackPublication(Track.Source.Camera);
-  const microphone = participant.getTrackPublication(Track.Source.Microphone);
   const screen = participant.getTrackPublication(Track.Source.ScreenShare);
-  const screenAudio = participant.getTrackPublication(
-    Track.Source.ScreenShareAudio,
-  );
 
+  // Collect every remote audio publication — mic, screenshare audio, and
+  // Unknown (used by the music bot). Limiting to Microphone muted the bot.
   const audioTracks: Track[] = [];
   if (!isLocal) {
-    if (microphone?.audioTrack && !microphone.isMuted) {
-      audioTracks.push(microphone.audioTrack);
-    }
-    if (screenAudio?.audioTrack && !screenAudio.isMuted) {
-      audioTracks.push(screenAudio.audioTrack);
+    for (const publication of participant.audioTrackPublications.values()) {
+      if (publication.audioTrack && !publication.isMuted) {
+        audioTracks.push(publication.audioTrack);
+      }
     }
   }
 

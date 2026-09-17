@@ -14,6 +14,11 @@ function isMusicBot(identity: string) {
   return identity.startsWith("music-bot-");
 }
 
+type FocusedTile = {
+  identity: string;
+  source: "camera" | "screen";
+};
+
 export function RoomClient({ roomName }: { roomName: string }) {
   const {
     status,
@@ -32,6 +37,41 @@ export function RoomClient({ roomName }: { roomName: string }) {
 
   const [participantsOpen, setParticipantsOpen] = useState(false);
   const [musicOpen, setMusicOpen] = useState(false);
+  const [focused, setFocused] = useState<FocusedTile | null>(null);
+
+  useEffect(() => {
+    if (!focused) return;
+    const person = participants.find(
+      (participant) => participant.identity === focused.identity,
+    );
+    if (!person || isMusicBot(person.identity)) {
+      setFocused(null);
+      return;
+    }
+    if (
+      focused.source === "screen" &&
+      !(person.screenSharing && person.screenTrack)
+    ) {
+      setFocused(null);
+    }
+  }, [focused, participants]);
+
+  useEffect(() => {
+    if (!focused) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setFocused(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [focused]);
+
+  const toggleMaximize = useCallback((tile: FocusedTile) => {
+    setFocused((current) =>
+      current?.identity === tile.identity && current.source === tile.source
+        ? null
+        : tile,
+    );
+  }, []);
 
   if (status !== "connected") {
     return (
@@ -53,6 +93,21 @@ export function RoomClient({ roomName }: { roomName: string }) {
     (person) => !isMusicBot(person.identity),
   );
   const sharing = screenShares.length > 0;
+
+  const focusedPerson = focused
+    ? videoParticipants.find((person) => person.identity === focused.identity)
+    : undefined;
+  const focusActive = Boolean(focused && focusedPerson);
+  const primaryStage = focusActive || sharing;
+
+  const stripParticipants = focusActive
+    ? videoParticipants.filter((person) => {
+        if (focused!.source === "camera") {
+          return person.identity !== focused!.identity;
+        }
+        return true;
+      })
+    : videoParticipants;
 
   return (
     <div className="room-shell">
@@ -104,35 +159,64 @@ export function RoomClient({ roomName }: { roomName: string }) {
         <main className="room-main">
           <div
             className="video-stage"
-            data-sharing={sharing ? "true" : "false"}
+            data-sharing={!focusActive && sharing ? "true" : "false"}
+            data-focused={focusActive ? "true" : "false"}
           >
-            {sharing && (
+            {focusActive && focusedPerson && focused && (
+              <div className="focus-stage">
+                <VideoTile
+                  key={`focus-${focused.source}-${focusedPerson.identity}`}
+                  info={focusedPerson}
+                  source={focused.source}
+                  maximized
+                  onToggleMaximize={() => toggleMaximize(focused)}
+                />
+              </div>
+            )}
+
+            {!focusActive && sharing && (
               <div className="screen-stage">
                 {screenShares.map((person) => (
                   <VideoTile
                     key={`screen-${person.identity}`}
                     info={person}
                     source="screen"
+                    onToggleMaximize={() =>
+                      toggleMaximize({
+                        identity: person.identity,
+                        source: "screen",
+                      })
+                    }
                   />
                 ))}
               </div>
             )}
 
-            {videoParticipants.length === 0 ? (
+            {stripParticipants.length === 0 && !primaryStage ? (
               <div className="flex flex-1 items-center justify-center text-sm text-[var(--text-faint)]">
                 Connecting&hellip;
               </div>
-            ) : (
-              <div className="video-grid" data-count={videoParticipants.length}>
-                {videoParticipants.map((person) => (
+            ) : stripParticipants.length > 0 ? (
+              <div className="video-grid" data-count={stripParticipants.length}>
+                {stripParticipants.map((person) => (
                   <VideoTile
                     key={person.identity}
                     info={person}
                     source="camera"
+                    maximized={
+                      focused?.identity === person.identity &&
+                      focused.source === "camera"
+                    }
+                    onToggleMaximize={() =>
+                      toggleMaximize({
+                        identity: person.identity,
+                        source: "camera",
+                      })
+                    }
                   />
                 ))}
               </div>
-            )}
+            ) : null}
           </div>
 
           <MusicPanel

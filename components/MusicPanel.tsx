@@ -14,7 +14,10 @@ export type MusicStatus = {
   room: string;
   status: "idle" | "playing" | "paused";
   current: string | null;
+  title?: string | null;
   queue: string[];
+  queueTitles?: (string | null)[];
+  lastError?: string | null;
 };
 
 async function musicRequest(
@@ -39,10 +42,36 @@ async function musicRequest(
 function shortUrl(value: string) {
   try {
     const parsed = new URL(value);
+    if (/youtu\.be|youtube\.com/i.test(parsed.hostname)) {
+      return "YouTube";
+    }
     const path = parsed.pathname.split("/").filter(Boolean).pop() || parsed.host;
     return decodeURIComponent(path).slice(0, 48);
   } catch {
     return value.slice(0, 48);
+  }
+}
+
+function displayTrack(url: string | null | undefined, title?: string | null) {
+  if (title?.trim()) return title.trim().slice(0, 64);
+  if (!url) return "";
+  return shortUrl(url);
+}
+
+function errorMessage(code: string) {
+  switch (code) {
+    case "music_unavailable":
+      return "Music bot is offline.";
+    case "invalid_url":
+      return "Enter a YouTube or direct media URL (https://…).";
+    case "queue_full":
+      return "Queue is full.";
+    case "no_audio":
+    case "playback_failed":
+    case "extract_failed":
+      return "Couldn't play that link. Try another YouTube URL or a direct mp3.";
+    default:
+      return "Couldn't update playback.";
   }
 }
 
@@ -92,15 +121,7 @@ export function MusicPanel({
       if (action === "enqueue") setUrl("");
     } catch (cause) {
       const code = cause instanceof Error ? cause.message : "music_error";
-      if (code === "music_unavailable") {
-        setError("Music bot is offline.");
-      } else if (code === "invalid_url") {
-        setError("Enter an http(s) media URL.");
-      } else if (code === "queue_full") {
-        setError("Queue is full.");
-      } else {
-        setError("Couldn't update playback.");
-      }
+      setError(errorMessage(code));
     } finally {
       setBusy(false);
     }
@@ -144,7 +165,7 @@ export function MusicPanel({
           type="url"
           value={url}
           onChange={(event) => setUrl(event.target.value)}
-          placeholder="https://… media URL"
+          placeholder="YouTube or mp3 URL"
           data-testid="music-url"
           className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-white/[0.03] px-3 text-sm text-white placeholder:text-[var(--text-faint)] outline-none focus:border-[var(--border-strong)]"
         />
@@ -200,23 +221,23 @@ export function MusicPanel({
 
       {status?.current && (
         <p className="mt-2 truncate text-xs text-[var(--text-muted)]">
-          Now: {shortUrl(status.current)}
+          Now: {displayTrack(status.current, status.title)}
         </p>
       )}
 
       {status && status.queue.length > 0 && (
         <ul className="mt-1 max-h-24 space-y-0.5 overflow-y-auto text-xs text-[var(--text-faint)]">
-          {status.queue.map((item) => (
-            <li key={item} className="truncate">
-              Queued: {shortUrl(item)}
+          {status.queue.map((item, index) => (
+            <li key={`${item}-${index}`} className="truncate">
+              Queued: {displayTrack(item, status.queueTitles?.[index])}
             </li>
           ))}
         </ul>
       )}
 
-      {error && (
+      {(error || status?.lastError) && (
         <p className="mt-2 text-xs text-rose-300" role="alert">
-          {error}
+          {error || errorMessage(status?.lastError || "playback_failed")}
         </p>
       )}
     </div>

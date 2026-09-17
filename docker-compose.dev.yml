@@ -10,6 +10,7 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-local_dev_only_secret_do_not_use_in_prod}
       LIVEKIT_USE_EXTERNAL_IP: "false"
+      LIVEKIT_RTC_TCP_PORT: ${LIVEKIT_RTC_TCP_PORT:-7881}
       LIVEKIT_RTC_PORT_START: "50000"
       LIVEKIT_RTC_PORT_END: "50100"
       LIVEKIT_LOG_LEVEL: info
@@ -18,7 +19,7 @@ services:
       - ./deploy/livekit-entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "7880:7880"
-      - "7881:7881"
+      - "${LIVEKIT_RTC_TCP_PORT:-7881}:${LIVEKIT_RTC_TCP_PORT:-7881}"
       - "50000-50100:50000-50100/udp"
     depends_on:
       redis:

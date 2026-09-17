@@ -5,6 +5,7 @@ set -eu
 : "${LIVEKIT_API_KEY:?LIVEKIT_API_KEY is required}"
 : "${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET is required}"
 
+RTC_TCP_PORT="${LIVEKIT_RTC_TCP_PORT:-7881}"
 RTC_START="${LIVEKIT_RTC_PORT_START:-50000}"
 RTC_END="${LIVEKIT_RTC_PORT_END:-50100}"
 USE_EXTERNAL_IP="${LIVEKIT_USE_EXTERNAL_IP:-true}"
@@ -16,7 +17,7 @@ CONFIG_PATH="${LIVEKIT_CONFIG_PATH:-/tmp/livekit.yaml}"
 {
   echo "port: 7880"
   echo "rtc:"
-  echo "  tcp_port: 7881"
+  echo "  tcp_port: ${RTC_TCP_PORT}"
   echo "  port_range_start: ${RTC_START}"
   echo "  port_range_end: ${RTC_END}"
   echo "  use_external_ip: ${USE_EXTERNAL_IP}"

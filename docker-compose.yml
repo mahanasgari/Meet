@@ -115,6 +115,7 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
       LIVEKIT_USE_EXTERNAL_IP: ${LIVEKIT_USE_EXTERNAL_IP:-true}
       LIVEKIT_NODE_IP: ${LIVEKIT_NODE_IP:-}
+      LIVEKIT_RTC_TCP_PORT: ${LIVEKIT_RTC_TCP_PORT:-7881}
       LIVEKIT_RTC_PORT_START: ${LIVEKIT_RTC_PORT_START:-50000}
       LIVEKIT_RTC_PORT_END: ${LIVEKIT_RTC_PORT_END:-50100}
       LIVEKIT_LOG_LEVEL: ${LIVEKIT_LOG_LEVEL:-info}
@@ -123,7 +124,7 @@ services:
       - ./deploy/livekit-entrypoint.sh:/entrypoint.sh:ro
     ports:
       # RTC over TCP (fallback when UDP is blocked)
-      - "${LIVEKIT_RTC_TCP_PORT:-7881}:7881"
+      - "${LIVEKIT_RTC_TCP_PORT:-7881}:${LIVEKIT_RTC_TCP_PORT:-7881}"
       # WebRTC media (UDP) — must reach the host from the internet
       - "${LIVEKIT_RTC_PORT_START:-50000}-${LIVEKIT_RTC_PORT_END:-50100}:${LIVEKIT_RTC_PORT_START:-50000}-${LIVEKIT_RTC_PORT_END:-50100}/udp"
     depends_on:

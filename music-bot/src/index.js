@@ -12,6 +12,7 @@ import {
   AudioSource,
   LocalAudioTrack,
   Room,
+  RoomEvent,
   TrackPublishOptions,
   TrackSource,
   dispose,
@@ -25,6 +26,10 @@ const FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2;
 const MAX_QUEUE = 20;
 const MAX_URL_LEN = 2048;
 const BOT_NAME = "Music Bot";
+/** Leave the LiveKit room shortly after the last human participant disconnects. */
+const EMPTY_ROOM_GRACE_MS = Number(process.env.EMPTY_ROOM_GRACE_MS || 5_000);
+/** Periodic sweep in case a disconnect event is missed. */
+const EMPTY_ROOM_SWEEP_MS = Number(process.env.EMPTY_ROOM_SWEEP_MS || 15_000);
 
 /** @type {Map<string, RoomSession>} */
 const sessions = new Map();
@@ -42,6 +47,7 @@ const sessions = new Map();
  * @property {boolean} stopping
  * @property {number} playGeneration
  * @property {Promise<void> | null} pump
+ * @property {ReturnType<typeof setTimeout> | null} emptyTimer
  */
 
 function requireEnv(name) {
@@ -71,6 +77,10 @@ function botIdentity(roomId) {
   return `music-bot-${roomId}`;
 }
 
+function isMusicBotIdentity(identity) {
+  return typeof identity === "string" && identity.startsWith("music-bot-");
+}
+
 function publicStatus(session) {
   return {
     room: session.roomId,
@@ -78,6 +88,54 @@ function publicStatus(session) {
     current: session.current,
     queue: [...session.queue],
   };
+}
+
+function idleStatus(roomId) {
+  return { room: roomId, status: "idle", current: null, queue: [] };
+}
+
+/** Count remote humans (bots / self do not keep a room "occupied"). */
+function humanParticipantCount(room) {
+  if (!room) return 0;
+  let count = 0;
+  for (const participant of room.remoteParticipants.values()) {
+    if (!isMusicBotIdentity(participant.identity)) count += 1;
+  }
+  return count;
+}
+
+function clearEmptyTimer(session) {
+  if (session.emptyTimer) {
+    clearTimeout(session.emptyTimer);
+    session.emptyTimer = null;
+  }
+}
+
+function scheduleLeaveIfEmpty(session) {
+  clearEmptyTimer(session);
+  if (!session.room?.isConnected) return;
+  if (humanParticipantCount(session.room) > 0) return;
+
+  session.emptyTimer = setTimeout(() => {
+    session.emptyTimer = null;
+    if (!session.room?.isConnected) return;
+    if (humanParticipantCount(session.room) > 0) return;
+    console.log(
+      `[music-bot] leaving empty room ${session.roomId} (no human participants)`,
+    );
+    void disconnectSession(session);
+  }, EMPTY_ROOM_GRACE_MS);
+}
+
+function bindRoomLifecycle(session, room) {
+  const onPresenceChange = () => scheduleLeaveIfEmpty(session);
+  room.on(RoomEvent.ParticipantConnected, onPresenceChange);
+  room.on(RoomEvent.ParticipantDisconnected, onPresenceChange);
+  room.on(RoomEvent.Disconnected, () => {
+    clearEmptyTimer(session);
+  });
+  // Initial check in case we joined an already-empty room.
+  scheduleLeaveIfEmpty(session);
 }
 
 async function createBotToken(roomId) {
@@ -113,6 +171,7 @@ function getOrCreateSession(roomId) {
       stopping: false,
       playGeneration: 0,
       pump: null,
+      emptyTimer: null,
     };
     sessions.set(roomId, session);
   }
@@ -127,6 +186,7 @@ async function ensureConnected(session) {
   const room = new Room();
   await room.connect(livekitUrl, jwt);
   session.room = room;
+  bindRoomLifecycle(session, room);
 
   const source = new AudioSource(SAMPLE_RATE, CHANNELS);
   const track = LocalAudioTrack.createAudioTrack("music", source);
@@ -172,6 +232,7 @@ async function stopPlayback(session, { clearQueue = false } = {}) {
 }
 
 async function disconnectSession(session) {
+  clearEmptyTimer(session);
   await stopPlayback(session, { clearQueue: true });
   try {
     await session.track?.close();
@@ -360,8 +421,10 @@ async function handleSkip(session) {
 }
 
 async function handleStop(session) {
-  await stopPlayback(session, { clearQueue: true });
-  return publicStatus(session);
+  // Fully leave so LiveKit can idle-close the room; stop must not keep a
+  // ghost bot participant around after everyone else left.
+  await disconnectSession(session);
+  return idleStatus(session.roomId);
 }
 
 function readBody(req, limit = 8_192) {
@@ -428,12 +491,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const session = getOrCreateSession(roomId);
-
+    // Status polls must not create lasting sessions (panel refreshes often).
     if (action === "status" && req.method === "GET") {
-      sendJson(res, 200, publicStatus(session));
+      const existing = sessions.get(roomId);
+      sendJson(res, 200, existing ? publicStatus(existing) : idleStatus(roomId));
       return;
     }
+
+    const session = getOrCreateSession(roomId);
 
     if (req.method !== "POST") {
       sendJson(res, 405, { error: "method_not_allowed" });
@@ -481,6 +546,15 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[music-bot] listening on :${PORT}`);
 });
+
+// Safety net if a ParticipantDisconnected event is missed.
+setInterval(() => {
+  for (const session of sessions.values()) {
+    if (session.room?.isConnected) {
+      scheduleLeaveIfEmpty(session);
+    }
+  }
+}, EMPTY_ROOM_SWEEP_MS).unref();
 
 async function shutdown() {
   console.log("[music-bot] shutting down");

@@ -14,6 +14,12 @@ rtc:
 redis:
   address: redis:6379
 
+room:
+  # Seconds. Rooms with no participants are closed after empty_timeout;
+  # departure_timeout covers the window after the last participant leaves.
+  empty_timeout: 30
+  departure_timeout: 20
+
 keys:
   # "YOUR_API_KEY": "YOUR_API_SECRET"
 

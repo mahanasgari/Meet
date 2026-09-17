@@ -25,6 +25,10 @@ CONFIG_PATH="${LIVEKIT_CONFIG_PATH:-/tmp/livekit.yaml}"
   fi
   echo "redis:"
   echo "  address: ${REDIS_ADDR}"
+  echo "room:"
+  # Close empty rooms quickly so a stuck bot/process cannot linger forever.
+  echo "  empty_timeout: ${LIVEKIT_EMPTY_TIMEOUT:-30}"
+  echo "  departure_timeout: ${LIVEKIT_DEPARTURE_TIMEOUT:-20}"
   echo "keys:"
   # YAML key may need quoting if it contains special characters.
   echo "  \"${LIVEKIT_API_KEY}\": \"${LIVEKIT_API_SECRET}\""

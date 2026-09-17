@@ -11,7 +11,9 @@ const ACTIONS = new Set([
   "resume",
   "skip",
   "stop",
+  "search",
 ]);
+const MAX_SEARCH_QUERY_LEN = 100;
 
 function botUnavailable() {
   return NextResponse.json({ error: "music_unavailable" }, { status: 503 });
@@ -21,6 +23,7 @@ async function forward(
   room: string,
   action: string,
   body?: Record<string, unknown>,
+  timeoutMs = 15_000,
 ) {
   const path =
     action === "status"
@@ -32,9 +35,24 @@ async function forward(
     method,
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
+  const data = (await response.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  return NextResponse.json(data, { status: response.status });
+}
+
+async function forwardSearch(query: string) {
+  const response = await fetch(
+    `${MUSIC_BOT_URL}/search?q=${encodeURIComponent(query)}`,
+    {
+      method: "GET",
+      signal: AbortSignal.timeout(30_000),
+    },
+  );
   const data = (await response.json().catch(() => ({}))) as Record<
     string,
     unknown
@@ -72,7 +90,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
-  let body: { room?: unknown; action?: unknown; url?: unknown };
+  let body: {
+    room?: unknown;
+    action?: unknown;
+    url?: unknown;
+    query?: unknown;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -86,6 +109,20 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    if (action === "search") {
+      const searchLimited = checkRateLimit(
+        `music-search:${clientRateLimitKey(request)}`,
+        { max: 12, windowMs: 60_000 },
+      );
+      if (!searchLimited.ok) {
+        return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+      }
+      const query = typeof body.query === "string" ? body.query.trim() : "";
+      if (!query || query.length > MAX_SEARCH_QUERY_LEN) {
+        return NextResponse.json({ error: "invalid_query" }, { status: 400 });
+      }
+      return await forwardSearch(query);
+    }
     if (action === "enqueue") {
       if (typeof body.url !== "string") {
         return NextResponse.json({ error: "invalid_url" }, { status: 400 });

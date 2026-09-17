@@ -20,23 +20,48 @@ export type MusicStatus = {
   lastError?: string | null;
 };
 
+export type MusicSearchResult = {
+  id: string;
+  title: string;
+  url: string;
+  duration: number | null;
+  channel: string | null;
+};
+
 async function musicRequest(
   room: string,
   action: string,
-  url?: string,
-): Promise<MusicStatus> {
+  payload?: { url?: string; query?: string },
+): Promise<MusicStatus & { results?: MusicSearchResult[] }> {
   const response = await fetch("/api/music", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ room, action, url }),
+    body: JSON.stringify({ room, action, ...payload }),
   });
   const data = (await response.json().catch(() => ({}))) as MusicStatus & {
     error?: string;
+    results?: MusicSearchResult[];
   };
   if (!response.ok) {
     throw new Error(data.error || "music_error");
   }
   return data;
+}
+
+function looksLikeMediaUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function formatDuration(seconds: number | null) {
+  if (seconds == null || seconds < 0) return null;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
 function shortUrl(value: string) {
@@ -64,8 +89,15 @@ function errorMessage(code: string) {
       return "Music bot is offline.";
     case "invalid_url":
       return "Enter a YouTube or direct media URL (https://…).";
+    case "invalid_query":
+      return "Enter a search term or paste a URL.";
     case "queue_full":
       return "Queue is full.";
+    case "rate_limited":
+      return "Too many searches — wait a moment.";
+    case "search_timeout":
+    case "search_failed":
+      return "Search failed. Try again.";
     case "no_audio":
     case "playback_failed":
     case "extract_failed":
@@ -84,9 +116,11 @@ export function MusicPanel({
   open: boolean;
   onClose: () => void;
 }) {
-  const [url, setUrl] = useState("");
+  const [query, setQuery] = useState("");
   const [status, setStatus] = useState<MusicStatus | null>(null);
+  const [results, setResults] = useState<MusicSearchResult[]>([]);
   const [busy, setBusy] = useState(false);
+  const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -116,9 +150,16 @@ export function MusicPanel({
     setBusy(true);
     setError(null);
     try {
-      const next = await musicRequest(roomName, action, mediaUrl);
+      const next = await musicRequest(
+        roomName,
+        action,
+        mediaUrl ? { url: mediaUrl } : undefined,
+      );
       setStatus(next);
-      if (action === "enqueue") setUrl("");
+      if (action === "enqueue") {
+        setQuery("");
+        setResults([]);
+      }
     } catch (cause) {
       const code = cause instanceof Error ? cause.message : "music_error";
       setError(errorMessage(code));
@@ -127,14 +168,41 @@ export function MusicPanel({
     }
   };
 
+  const submitInput = async () => {
+    const trimmed = query.trim();
+    if (!trimmed || busy || searching) return;
+
+    if (looksLikeMediaUrl(trimmed)) {
+      await run("enqueue", trimmed);
+      return;
+    }
+
+    setSearching(true);
+    setError(null);
+    setResults([]);
+    try {
+      const data = await musicRequest(roomName, "search", { query: trimmed });
+      setResults(data.results ?? []);
+      if (!(data.results?.length)) {
+        setError("No YouTube results. Try another search.");
+      }
+    } catch (cause) {
+      const code = cause instanceof Error ? cause.message : "music_error";
+      setError(errorMessage(code));
+    } finally {
+      setSearching(false);
+    }
+  };
+
   if (!open) return null;
 
   const playing = status?.status === "playing";
   const paused = status?.status === "paused";
+  const inputBusy = busy || searching;
 
   return (
     <div
-      className="absolute bottom-3 left-1/2 z-30 w-[min(100%-1.5rem,22rem)] -translate-x-1/2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-elevated)]/95 p-3 shadow-lg backdrop-blur"
+      className="absolute bottom-3 left-1/2 z-30 w-[min(100%-1.5rem,24rem)] -translate-x-1/2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-elevated)]/95 p-3 shadow-lg backdrop-blur"
       data-testid="music-panel"
     >
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -156,28 +224,66 @@ export function MusicPanel({
         className="flex gap-2"
         onSubmit={(event) => {
           event.preventDefault();
-          const trimmed = url.trim();
-          if (!trimmed || busy) return;
-          void run("enqueue", trimmed);
+          void submitInput();
         }}
       >
         <input
-          type="url"
-          value={url}
-          onChange={(event) => setUrl(event.target.value)}
-          placeholder="YouTube or mp3 URL"
+          type="search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search YouTube or paste URL"
           data-testid="music-url"
+          enterKeyHint="search"
           className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-white/[0.03] px-3 text-sm text-white placeholder:text-[var(--text-faint)] outline-none focus:border-[var(--border-strong)]"
         />
         <button
           type="submit"
-          disabled={busy || !url.trim()}
+          disabled={inputBusy || !query.trim()}
           data-testid="music-add"
           className="h-10 shrink-0 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white disabled:opacity-40"
         >
-          Add
+          {searching
+            ? "…"
+            : looksLikeMediaUrl(query.trim())
+              ? "Add"
+              : "Search"}
         </button>
       </form>
+
+      {results.length > 0 && (
+        <ul
+          className="mt-2 max-h-44 space-y-1 overflow-y-auto"
+          data-testid="music-search-results"
+        >
+          {results.map((item) => {
+            const duration = formatDuration(item.duration);
+            return (
+              <li
+                key={item.id}
+                className="flex items-center gap-2 rounded-lg bg-white/[0.03] px-2 py-1.5"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-medium text-white">
+                    {item.title}
+                  </p>
+                  <p className="truncate text-[11px] text-[var(--text-faint)]">
+                    {[item.channel, duration].filter(Boolean).join(" · ")}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busy}
+                  data-testid="music-search-add"
+                  onClick={() => void run("enqueue", item.url)}
+                  className="h-8 shrink-0 rounded-md bg-white/[0.08] px-2.5 text-xs font-medium text-white disabled:opacity-40"
+                >
+                  Add
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
 
       <div className="mt-2 flex items-center gap-1.5">
         <button

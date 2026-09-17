@@ -399,6 +399,110 @@ function headersToFfmpegArg(headers) {
   return lines ? `${lines}\r\n` : "";
 }
 
+const SEARCH_LIMIT = 8;
+const MAX_SEARCH_QUERY_LEN = 100;
+
+function isValidSearchQuery(value) {
+  return (
+    typeof value === "string" &&
+    value.trim().length >= 1 &&
+    value.trim().length <= MAX_SEARCH_QUERY_LEN
+  );
+}
+
+/**
+ * YouTube search via yt-dlp (metadata only — no media download).
+ * @param {string} query
+ * @returns {Promise<Array<{ id: string, title: string, url: string, duration: number | null, channel: string | null }>>}
+ */
+function searchYouTube(query) {
+  const trimmed = query.trim();
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      YTDLP_BIN,
+      [
+        `ytsearch${SEARCH_LIMIT}:${trimmed}`,
+        "--flat-playlist",
+        "-J",
+        "--no-warnings",
+        "--no-download",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killChild(child);
+      reject(
+        Object.assign(new Error("search_timeout"), { status: 504 }),
+      );
+    }, 25_000);
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(
+          Object.assign(
+            new Error(
+              (stderr.trim().split("\n").pop() || "search_failed").slice(0, 200),
+            ),
+            { status: 502 },
+          ),
+        );
+        return;
+      }
+      try {
+        const info = JSON.parse(stdout);
+        const entries = Array.isArray(info.entries) ? info.entries : [];
+        const results = [];
+        for (const entry of entries) {
+          if (!entry || typeof entry !== "object") continue;
+          const id =
+            typeof entry.id === "string" && entry.id
+              ? entry.id
+              : typeof entry.url === "string" && /^[\w-]{6,}$/.test(entry.url)
+                ? entry.url
+                : null;
+          if (!id) continue;
+          const title =
+            typeof entry.title === "string" && entry.title.trim()
+              ? entry.title.trim()
+              : id;
+          const channel =
+            (typeof entry.channel === "string" && entry.channel) ||
+            (typeof entry.uploader === "string" && entry.uploader) ||
+            null;
+          const duration =
+            typeof entry.duration === "number" && Number.isFinite(entry.duration)
+              ? Math.round(entry.duration)
+              : null;
+          results.push({
+            id,
+            title: title.slice(0, 120),
+            url: `https://www.youtube.com/watch?v=${id}`,
+            duration,
+            channel: channel ? channel.slice(0, 64) : null,
+          });
+        }
+        resolve(results);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error("bad_search_json"));
+      }
+    });
+  });
+}
+
 /**
  * Start ffmpeg to produce s16le PCM on ffmpeg.stdout.
  * @param {string} inputUrl
@@ -747,6 +851,17 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, { ok: true, extractor: "yt-dlp" });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/search") {
+      const q = url.searchParams.get("q") || "";
+      if (!isValidSearchQuery(q)) {
+        sendJson(res, 400, { error: "invalid_query" });
+        return;
+      }
+      const results = await searchYouTube(q);
+      sendJson(res, 200, { results });
       return;
     }
 

@@ -50,6 +50,8 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
       MUSIC_BOT_URL: ${MUSIC_BOT_URL:-http://music-bot:4100}
+      # Same token MiniPlayer uses against /extractor/* (music-bot /search).
+      MUSIC_API_TOKEN: ${MUSIC_API_TOKEN:-}
     expose:
       - "3000"
     healthcheck:
@@ -86,6 +88,16 @@ services:
       LIVEKIT_URL: ${LIVEKIT_BOT_URL:-ws://livekit:7880}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+      # YouTube bot-check (optional). Put Netscape cookies at secrets/youtube_cookies.txt
+      # and set in .env: YTDLP_COOKIES=/data/youtube_cookies.txt
+      YTDLP_COOKIES: ${YTDLP_COOKIES:-}
+      # Shared secret for MiniPlayer + Meet app search proxy.
+      MUSIC_API_TOKEN: ${MUSIC_API_TOKEN:-}
+    volumes:
+      - ./secrets:/data:ro
+    ports:
+      # Host-only — nginx /extractor proxies here for MiniPlayer.
+      - "127.0.0.1:4100:4100"
     expose:
       - "4100"
     healthcheck:

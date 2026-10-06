@@ -46,10 +46,16 @@ async function forward(
 }
 
 async function forwardSearch(query: string) {
+  const headers: Record<string, string> = {};
+  const token = process.env.MUSIC_API_TOKEN;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
   const response = await fetch(
     `${MUSIC_BOT_URL}/search?q=${encodeURIComponent(query)}`,
     {
       method: "GET",
+      headers,
       signal: AbortSignal.timeout(30_000),
     },
   );

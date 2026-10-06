@@ -49,3 +49,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# YouTube yt-dlp cookies (never commit)
+secrets/
+!secrets/.gitkeep

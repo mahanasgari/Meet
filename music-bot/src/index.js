@@ -7,6 +7,17 @@
 
 import http from "node:http";
 import { spawn } from "node:child_process";
+import {
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  readFileSync,
+  mkdirSync,
+  appendFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import {
   AudioFrame,
@@ -33,6 +44,78 @@ const EMPTY_ROOM_GRACE_MS = Number(process.env.EMPTY_ROOM_GRACE_MS || 5_000);
 const EMPTY_ROOM_SWEEP_MS = Number(process.env.EMPTY_ROOM_SWEEP_MS || 15_000);
 const YTDLP_BIN = process.env.YTDLP_PATH || "yt-dlp";
 const FFMPEG_BIN = process.env.FFMPEG_PATH || "ffmpeg";
+/** Netscape cookies.txt — needed when YouTube bot-checks the server IP. */
+const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
+/** Optional: chrome / firefox / chromium (alternative to YTDLP_COOKIES). */
+const YTDLP_BROWSER = process.env.YTDLP_BROWSER || "";
+/**
+ * Shared secret for MiniPlayer / external clients hitting /search and /audio.
+ * Room control endpoints stay on the Docker network and do not need this.
+ */
+const MUSIC_API_TOKEN = process.env.MUSIC_API_TOKEN || "";
+
+/** Optional outbound proxy for yt-dlp (e.g. Cloudflare WARP on a worker
+ * whose own IP YouTube asks to sign in). */
+const YTDLP_PROXY = process.env.YTDLP_PROXY || "";
+function ytdlpNetArgs() {
+  return YTDLP_PROXY ? ["--proxy", YTDLP_PROXY] : [];
+}
+
+function ytdlpCookieArgs() {
+  if (YTDLP_COOKIES) return ["--cookies", YTDLP_COOKIES];
+  if (YTDLP_BROWSER) return ["--cookies-from-browser", YTDLP_BROWSER];
+  return [];
+}
+
+/**
+ * A MiniPlayer user's YouTube session, sent per request as `X-YT-Cookie`
+ * (never stored or logged here), written to a private Netscape cookie file
+ * for yt-dlp. The caller must run the returned cleanup when done.
+ * @param {string | undefined} header
+ * @returns {{ args: string[], cleanup: () => void } | null}
+ */
+function userCookieArgs(header) {
+  if (typeof header !== "string" || !header.includes("=") || header.length > 16_384) {
+    return null;
+  }
+  const lines = ["# Netscape HTTP Cookie File"];
+  const expiry = Math.floor(Date.now() / 1000) + 3600;
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    const value = part.slice(i + 1).trim();
+    if (!/^[\w.-]+$/.test(name) || /[\t\r\n]/.test(value)) continue;
+    lines.push([".youtube.com", "TRUE", "/", "TRUE", expiry, name, value].join("\t"));
+  }
+  if (lines.length < 2) return null;
+  const dir = mkdtempSync(joinPath(tmpdir(), "mp-ck-"));
+  const file = joinPath(dir, "cookies.txt");
+  writeFileSync(file, lines.join("\n") + "\n", { mode: 0o600 });
+  return {
+    args: ["--cookies", file],
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function extractBearerOrHeader(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  const header = req.headers["x-music-token"];
+  return typeof header === "string" ? header.trim() : "";
+}
+
+/** Check MUSIC_API_TOKEN. When [optional], missing token is allowed (in-compose Meet app). */
+function requireApiToken(req, res, { optional = false } = {}) {
+  if (!MUSIC_API_TOKEN) return true;
+  const got = extractBearerOrHeader(req);
+  if (got === MUSIC_API_TOKEN) return true;
+  if (optional && !got) return true;
+  sendJson(res, 401, { error: "unauthorized" });
+  return false;
+}
 
 /** Hosts that need yt-dlp (page URLs, not raw media files). */
 const EXTRACTOR_HOST_RE =
@@ -339,6 +422,8 @@ function resolveExtractorStream(pageUrl) {
         "bestaudio/best",
         "--no-playlist",
         "--no-warnings",
+        ...ytdlpNetArgs(),
+        ...ytdlpCookieArgs(),
         pageUrl,
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
@@ -399,7 +484,91 @@ function headersToFfmpegArg(headers) {
   return lines ? `${lines}\r\n` : "";
 }
 
-const SEARCH_LIMIT = 8;
+/**
+ * Stream extracted audio to an HTTP client (yt-dlp stdout).
+ * Used by MiniPlayer so playback is not tied to the server's googlevideo IP.
+ */
+function pipeExtractorAudio(pageUrl, req, res, userCookies = null) {
+  const child = spawn(
+    YTDLP_BIN,
+    [
+      "-f",
+      "bestaudio/best",
+      "--no-playlist",
+      "--no-warnings",
+      // The listener's own account when they sent one, else the server's.
+      ...ytdlpNetArgs(),
+      ...(userCookies ? userCookies.args : ytdlpCookieArgs()),
+      "-o",
+      "-",
+      pageUrl,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+
+  let stderr = "";
+  let headersSent = false;
+  const timer = setTimeout(() => {
+    killChild(child);
+    if (!headersSent && !res.headersSent) {
+      sendJson(res, 504, { error: "extractor_timeout" });
+    } else {
+      res.destroy();
+    }
+  }, 10 * 60_000);
+
+  child.stderr?.on("data", (chunk) => {
+    stderr += chunk.toString();
+    if (stderr.length > 8_000) stderr = stderr.slice(-4_000);
+  });
+
+  child.stdout?.once("data", (chunk) => {
+    if (headersSent) return;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Cache-Control": "no-store",
+      "Accept-Ranges": "none",
+    });
+    res.write(chunk);
+    child.stdout.pipe(res);
+  });
+
+  child.on("error", (err) => {
+    clearTimeout(timer);
+    console.error("[music-bot] audio spawn error:", err);
+    if (!headersSent && !res.headersSent) {
+      sendJson(res, 502, { error: "extractor_failed" });
+    } else {
+      res.destroy();
+    }
+  });
+
+  child.on("close", () => userCookies?.cleanup());
+  child.on("close", (code) => {
+    clearTimeout(timer);
+    if (!headersSent && !res.headersSent) {
+      sendJson(res, 502, {
+        error: (stderr.trim().split("\n").pop() || "extractor_failed").slice(
+          0,
+          200,
+        ),
+      });
+      return;
+    }
+    if (code !== 0 && !res.writableEnded) {
+      res.destroy();
+    }
+  });
+
+  req.on("close", () => {
+    clearTimeout(timer);
+    killChild(child);
+  });
+}
+
+const SEARCH_LIMIT_DEFAULT = 8;
+const SEARCH_LIMIT_MAX = 40;
 const MAX_SEARCH_QUERY_LEN = 100;
 
 function isValidSearchQuery(value) {
@@ -410,34 +579,149 @@ function isValidSearchQuery(value) {
   );
 }
 
+const YTM_SONGS_PARAMS = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+
+function ytmText(column) {
+  const runs =
+    column?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  return runs.map((r) => r.text || "");
+}
+
+function parseDurationText(text) {
+  if (!/^\d+(:\d{1,2}){1,2}$/.test(text || "")) return null;
+  return text.split(":").reduce((acc, part) => acc * 60 + Number(part), 0);
+}
+
+/**
+ * Official audio tracks only, via YouTube Music's "Songs" search filter.
+ * Music videos carry intros/skits/edits that break synced lyrics; these are
+ * the studio recordings with real artist/album/duration metadata.
+ * @param {string} query
+ * @param {{ limit?: number, offset?: number }} [opts]
+ */
+async function searchYouTubeMusicSongs(query, opts = {}) {
+  const limit = Math.min(Math.max(Number(opts.limit) || SEARCH_LIMIT_DEFAULT, 1), SEARCH_LIMIT_MAX);
+  const offset = Math.max(Number(opts.offset) || 0, 0);
+  const r = await fetch(
+    "https://music.youtube.com/youtubei/v1/search?prettyPrint=false",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://music.youtube.com",
+      },
+      body: JSON.stringify({
+        context: {
+          client: { clientName: "WEB_REMIX", clientVersion: "1.20250101.01.00", hl: "en" },
+        },
+        query: query.trim(),
+        params: decodeURIComponent(YTM_SONGS_PARAMS),
+      }),
+      signal: AbortSignal.timeout(20_000),
+    },
+  );
+  if (!r.ok) {
+    throw Object.assign(new Error(`ytmusic_search_${r.status}`), { status: 502 });
+  }
+  const data = await r.json();
+  const rows = [];
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (node.musicResponsiveListItemRenderer) {
+      rows.push(node.musicResponsiveListItemRenderer);
+      return;
+    }
+    for (const v of Object.values(node)) walk(v);
+  };
+  walk(data);
+  const results = [];
+  for (const row of rows) {
+    const id = row.playlistItemData?.videoId;
+    if (!id || !/^[\w-]{11}$/.test(id)) continue;
+    const title = ytmText(row.flexColumns?.[0]).join("").trim();
+    // "Artist • Album • 3:38" (artist may be "A & B", album may be absent)
+    const parts = ytmText(row.flexColumns?.[1])
+      .join("")
+      .split(" • ")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const durationPart = parts.length ? parts[parts.length - 1] : "";
+    const duration = parseDurationText(durationPart);
+    const meta = duration != null ? parts.slice(0, -1) : parts;
+    // YT Music prefixes the type on some layouts ("Song • Artist • …").
+    if (meta[0] === "Song") meta.shift();
+    results.push({
+      id,
+      title: title || "Unknown title",
+      url: `https://www.youtube.com/watch?v=${id}`,
+      duration,
+      channel: meta[0] || null,
+      album: meta[1] || null,
+      kind: "video",
+      audio: true,
+      count: null,
+    });
+  }
+  return results.slice(offset, offset + limit);
+}
+
 /**
  * YouTube search via yt-dlp (metadata only — no media download).
  * @param {string} query
- * @returns {Promise<Array<{ id: string, title: string, url: string, duration: number | null, channel: string | null }>>}
+ * @param {{ limit?: number, offset?: number, type?: 'video'|'playlist'|'mix' }} [opts]
+ * @returns {Promise<Array<{ id: string, title: string, url: string, duration: number | null, channel: string | null, kind: string, count: number | null }>>}
  */
-function searchYouTube(query) {
+function searchYouTube(query, opts = {}) {
   const trimmed = query.trim();
+  const type = opts.type === "playlist" || opts.type === "mix" ? opts.type : "video";
+  const limit = Math.min(
+    Math.max(Number(opts.limit) || SEARCH_LIMIT_DEFAULT, 1),
+    SEARCH_LIMIT_MAX,
+  );
+  const offset = Math.max(Number(opts.offset) || 0, 0);
+  const fetchCount = Math.min(offset + limit, SEARCH_LIMIT_MAX);
+
+  /** @type {string[]} */
+  let ytdlpArgs;
+  if (type === "playlist" || type === "mix") {
+    // YouTube web results filtered to Playlists (sp=EgIQAw%3D%3D).
+    const resultsUrl =
+      "https://www.youtube.com/results?search_query=" +
+      encodeURIComponent(trimmed) +
+      "&sp=EgIQAw%3D%3D";
+    ytdlpArgs = [
+      resultsUrl,
+      "--flat-playlist",
+      "-J",
+      "--no-warnings",
+      "--no-download",
+      `--playlist-end=${fetchCount}`,
+      ...ytdlpNetArgs(),
+        ...ytdlpCookieArgs(),
+    ];
+  } else {
+    ytdlpArgs = [
+      `ytsearch${fetchCount}:${trimmed}`,
+      "--flat-playlist",
+      "-J",
+      "--no-warnings",
+      "--no-download",
+      ...ytdlpNetArgs(),
+        ...ytdlpCookieArgs(),
+    ];
+  }
+
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      YTDLP_BIN,
-      [
-        `ytsearch${SEARCH_LIMIT}:${trimmed}`,
-        "--flat-playlist",
-        "-J",
-        "--no-warnings",
-        "--no-download",
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const child = spawn(YTDLP_BIN, ytdlpArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
       killChild(child);
-      reject(
-        Object.assign(new Error("search_timeout"), { status: 504 }),
-      );
-    }, 25_000);
+      reject(Object.assign(new Error("search_timeout"), { status: 504 }));
+    }, 35_000);
 
     child.stdout?.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -475,6 +759,273 @@ function searchYouTube(query) {
                 ? entry.url
                 : null;
           if (!id) continue;
+
+          const isPlaylistEntry =
+            entry._type === "playlist" ||
+            entry.ie_key === "YoutubeTab" ||
+            /^PL|^RD|^OL|^UU|^LL|^WL/i.test(id) ||
+            (typeof entry.url === "string" && entry.url.includes("list="));
+
+          if (type === "video" && isPlaylistEntry) continue;
+
+          let kind = "video";
+          if (isPlaylistEntry || type === "playlist" || type === "mix") {
+            kind = /^RD/i.test(id) || /\bmix\b/i.test(String(entry.title || ""))
+              ? "mix"
+              : "playlist";
+          }
+
+          if (type === "mix" && kind !== "mix") continue;
+          if (type === "playlist" && kind === "mix") {
+            // Still allow mixes in playlist search — user asked for both.
+          }
+
+          const title =
+            typeof entry.title === "string" && entry.title.trim()
+              ? entry.title.trim()
+              : id;
+          const channel =
+            (typeof entry.channel === "string" && entry.channel) ||
+            (typeof entry.uploader === "string" && entry.uploader) ||
+            null;
+          const duration =
+            typeof entry.duration === "number" && Number.isFinite(entry.duration)
+              ? Math.round(entry.duration)
+              : null;
+          const count =
+            typeof entry.playlist_count === "number"
+              ? entry.playlist_count
+              : typeof entry.n_entries === "number"
+                ? entry.n_entries
+                : null;
+
+          let pageUrl;
+          if (kind === "video") {
+            pageUrl = `https://www.youtube.com/watch?v=${id}`;
+          } else if (/^RD/i.test(id)) {
+            pageUrl = `https://www.youtube.com/watch?v=${id.slice(2)}&list=${id}`;
+            // RD mixes need a seed video; if id is only RD..., use playlist URL.
+            if (id.length <= 4) {
+              pageUrl = `https://www.youtube.com/playlist?list=${id}`;
+            } else if (!/^RD[A-Za-z0-9_-]{11}/.test(id) && id.startsWith("RD")) {
+              pageUrl = `https://www.youtube.com/playlist?list=${id}`;
+            } else if (/^RD[A-Za-z0-9_-]{11}/.test(id)) {
+              const seed = id.slice(2, 13);
+              pageUrl = `https://www.youtube.com/watch?v=${seed}&list=${id}`;
+            } else {
+              pageUrl = `https://www.youtube.com/playlist?list=${id}`;
+            }
+          } else {
+            pageUrl =
+              typeof entry.url === "string" && entry.url.startsWith("http")
+                ? entry.url
+                : `https://www.youtube.com/playlist?list=${id}`;
+          }
+
+          results.push({
+            id,
+            title: title.slice(0, 120),
+            url: pageUrl,
+            duration,
+            channel: channel ? channel.slice(0, 64) : null,
+            kind,
+            count,
+          });
+        }
+        resolve(results.slice(offset, offset + limit));
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error("bad_search_json"));
+      }
+    });
+  });
+}
+
+/** In-memory metadata cache (url → { at, data }). Avoids re-running yt-dlp on song click. */
+const META_CACHE_TTL_MS = 30 * 60 * 1000;
+const META_CACHE_MAX = 200;
+/** @type {Map<string, { at: number, data: object }>} */
+const metaCache = new Map();
+
+/**
+ * Full metadata for one watch/playlist URL (lazy — called when user opens a song).
+ * @param {string} pageUrl
+ */
+function fetchVideoMeta(pageUrl) {
+  const key = pageUrl.trim();
+  const hit = metaCache.get(key);
+  if (hit && Date.now() - hit.at < META_CACHE_TTL_MS) {
+    return Promise.resolve(hit.data);
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      YTDLP_BIN,
+      [
+        key,
+        "-J",
+        "--no-warnings",
+        "--no-download",
+        "--no-playlist",
+        "--skip-download",
+        ...ytdlpNetArgs(),
+        ...ytdlpCookieArgs(),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killChild(child);
+      reject(Object.assign(new Error("meta_timeout"), { status: 504 }));
+    }, 25_000);
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(
+          Object.assign(
+            new Error(
+              (stderr.trim().split("\n").pop() || "meta_failed").slice(0, 200),
+            ),
+            { status: 502 },
+          ),
+        );
+        return;
+      }
+      try {
+        const info = JSON.parse(stdout);
+        const id =
+          typeof info.id === "string" && info.id
+            ? info.id
+            : null;
+        let thumb = null;
+        if (typeof info.thumbnail === "string" && info.thumbnail) {
+          thumb = info.thumbnail;
+        } else if (Array.isArray(info.thumbnails) && info.thumbnails.length) {
+          const last = info.thumbnails[info.thumbnails.length - 1];
+          if (last && typeof last.url === "string") thumb = last.url;
+        }
+        if (!thumb && id && id.length >= 11) {
+          thumb = `https://i.ytimg.com/vi/${id.slice(0, 11)}/hqdefault.jpg`;
+        }
+        const data = {
+          id,
+          title:
+            typeof info.title === "string" && info.title.trim()
+              ? info.title.trim().slice(0, 200)
+              : null,
+          channel:
+            (typeof info.channel === "string" && info.channel) ||
+            (typeof info.uploader === "string" && info.uploader) ||
+            null,
+          duration:
+            typeof info.duration === "number" && Number.isFinite(info.duration)
+              ? Math.round(info.duration)
+              : null,
+          thumbnail: thumb,
+          description:
+            typeof info.description === "string" && info.description.trim()
+              ? info.description.trim().slice(0, 500)
+              : null,
+          url:
+            typeof info.webpage_url === "string"
+              ? info.webpage_url
+              : key,
+        };
+        if (metaCache.size >= META_CACHE_MAX) {
+          const oldest = metaCache.keys().next().value;
+          if (oldest) metaCache.delete(oldest);
+        }
+        metaCache.set(key, { at: Date.now(), data });
+        resolve(data);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error("bad_meta_json"));
+      }
+    });
+  });
+}
+
+/**
+ * Expand a playlist / mix URL to track entries.
+ * @param {string} pageUrl
+ * @param {{ limit?: number }} [opts]
+ */
+function listPlaylistEntries(pageUrl, opts = {}) {
+  const limit = Math.min(Math.max(Number(opts.limit) || 40, 1), 80);
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      YTDLP_BIN,
+      [
+        pageUrl,
+        "--flat-playlist",
+        "-J",
+        "--no-warnings",
+        "--no-download",
+        "--yes-playlist",
+        `--playlist-end=${limit}`,
+        ...ytdlpNetArgs(),
+        ...ytdlpCookieArgs(),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killChild(child);
+      reject(Object.assign(new Error("playlist_timeout"), { status: 504 }));
+    }, 45_000);
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(
+          Object.assign(
+            new Error(
+              (stderr.trim().split("\n").pop() || "playlist_failed").slice(
+                0,
+                200,
+              ),
+            ),
+            { status: 502 },
+          ),
+        );
+        return;
+      }
+      try {
+        const info = JSON.parse(stdout);
+        const entries = Array.isArray(info.entries) ? info.entries : [];
+        const results = [];
+        for (const entry of entries) {
+          if (!entry || typeof entry !== "object") continue;
+          const id =
+            typeof entry.id === "string" && entry.id
+              ? entry.id
+              : typeof entry.url === "string" && /^[\w-]{11}$/.test(entry.url)
+                ? entry.url
+                : null;
+          if (!id || id.length < 10) continue;
           const title =
             typeof entry.title === "string" && entry.title.trim()
               ? entry.title.trim()
@@ -493,11 +1044,17 @@ function searchYouTube(query) {
             url: `https://www.youtube.com/watch?v=${id}`,
             duration,
             channel: channel ? channel.slice(0, 64) : null,
+            kind: "video",
+            count: null,
           });
+          if (results.length >= limit) break;
         }
-        resolve(results);
+        resolve({
+          title: typeof info.title === "string" ? info.title : null,
+          results,
+        });
       } catch (err) {
-        reject(err instanceof Error ? err : new Error("bad_search_json"));
+        reject(err instanceof Error ? err : new Error("bad_playlist_json"));
       }
     });
   });
@@ -808,6 +1365,85 @@ async function handleStop(session) {
   return idleStatus(session.roomId);
 }
 
+// --- Shared playlists (MiniPlayer): code → {name, tracks} --------------
+const SHARES_DIR = process.env.SHARES_DIR || "/shares";
+const SHARES_FILE = joinPath(SHARES_DIR, "shares.json");
+const SHARES_MAX = 5000;
+/** @type {Map<string, {name: string, tracks: object[], at: number}>} */
+const shares = new Map();
+try {
+  for (const [k, v] of Object.entries(JSON.parse(readFileSync(SHARES_FILE, "utf8")))) {
+    shares.set(k, v);
+  }
+} catch {
+  // first run / no volume
+}
+let sharesSaveTimer = null;
+function saveSharesSoon() {
+  clearTimeout(sharesSaveTimer);
+  sharesSaveTimer = setTimeout(() => {
+    try {
+      mkdirSync(SHARES_DIR, { recursive: true });
+      writeFileSync(SHARES_FILE, JSON.stringify(Object.fromEntries(shares)));
+    } catch (e) {
+      console.error("[shares] save failed", e?.message);
+    }
+  }, 1000);
+}
+function shareCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code;
+  do {
+    code = "";
+    for (let i = 0; i < 6; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  } while (shares.has(code));
+  return code;
+}
+function cleanShareTrack(t) {
+  if (!t || typeof t !== "object") return null;
+  const str = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
+  const id = str(t.id, 80);
+  const u = str(t.u, 300);
+  if (!id || !u || !isAllowedMediaUrl(u)) return null;
+  return {
+    id,
+    t: str(t.t, 200) || "Unknown title",
+    a: str(t.a, 120),
+    u,
+    art: str(t.art, 500).startsWith("http") ? str(t.art, 500) : undefined,
+    d: Number.isFinite(t.d) ? Math.max(0, Math.round(t.d)) : undefined,
+  };
+}
+
+/** Body as JSON; accepts `Content-Encoding: gzip` (small over lossy links). */
+function readJsonMaybeGzip(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(Object.assign(new Error("body_too_large"), { status: 400 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      try {
+        let buf = Buffer.concat(chunks);
+        if ((req.headers["content-encoding"] || "").includes("gzip")) {
+          buf = gunzipSync(buf, { maxOutputLength: 1_000_000 });
+        }
+        resolve(buf.length ? JSON.parse(buf.toString("utf8")) : {});
+      } catch {
+        reject(Object.assign(new Error("invalid_json"), { status: 400 }));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 function readBody(req, limit = 8_192) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -845,23 +1481,949 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
+/** In-memory Listen Together (jam) rooms — synced queue, clients play locally. */
+const JAM_MAX_QUEUE = 80;
+const JAM_IDLE_TTL_MS = 6 * 60 * 60 * 1000;
+/** @type {Map<string, JamSession>} */
+const jamSessions = new Map();
+
+/**
+ * @typedef {object} JamTrack
+ * @property {string} id
+ * @property {string} url
+ * @property {string} title
+ * @property {string} artist
+ * @property {string | null} artworkUrl
+ */
+
+/**
+ * @typedef {object} JamSession
+ * @property {string} roomId
+ * @property {JamTrack[]} queue
+ * @property {number} index
+ * @property {'idle'|'playing'|'paused'} status
+ * @property {number} basePositionMs
+ * @property {number | null} startedAtMs
+ * @property {number} updatedAt
+ */
+
+function randomRoomId(len = 8) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+function jamPositionMs(session) {
+  if (session.status === "playing" && session.startedAtMs != null) {
+    return Math.max(
+      0,
+      session.basePositionMs + (Date.now() - session.startedAtMs),
+    );
+  }
+  return Math.max(0, session.basePositionMs);
+}
+
+function publicJamStatus(session) {
+  const current =
+    session.index >= 0 && session.index < session.queue.length
+      ? session.queue[session.index]
+      : null;
+  return {
+    roomId: session.roomId,
+    status: session.status,
+    index: session.index,
+    current,
+    queue: session.queue,
+    positionMs: jamPositionMs(session),
+    serverTime: Date.now(),
+    messages: (session.messages || []).slice(-JAM_MAX_MESSAGES),
+    // Recent reactions only; clients float each one once.
+    reactions: (session.reactions || []).filter((r) => Date.now() - r.ts < 15_000),
+    listeners: [...(session.seen || new Map()).entries()]
+      .filter(([, at]) => Date.now() - at < 12_000)
+      .map(([n]) => n),
+  };
+}
+
+const JAM_MAX_MESSAGES = 40;
+const JAM_REACTIONS = new Set(["❤️", "🔥", "😂", "👏", "🎉", "😮"]);
+
+function jamName(name) {
+  const n = typeof name === "string" ? name.trim().slice(0, 24) : "";
+  return n || "Guest";
+}
+
+/** Presence: who polled this room recently. */
+function jamSeen(session, name) {
+  if (typeof name !== "string" || !name.trim()) return;
+  (session.seen ||= new Map()).set(jamName(name), Date.now());
+}
+
+function getJam(roomId) {
+  return jamSessions.get(roomId) || null;
+}
+
+function touchJam(session) {
+  session.updatedAt = Date.now();
+}
+
+function createJamSession() {
+  let roomId = randomRoomId(8);
+  while (jamSessions.has(roomId)) roomId = randomRoomId(8);
+  /** @type {JamSession} */
+  const session = {
+    roomId,
+    queue: [],
+    index: -1,
+    status: "idle",
+    basePositionMs: 0,
+    startedAtMs: null,
+    updatedAt: Date.now(),
+  };
+  jamSessions.set(roomId, session);
+  return session;
+}
+
+function jamEnqueue(session, track) {
+  if (session.queue.length >= JAM_MAX_QUEUE) {
+    const err = new Error("queue_full");
+    err.status = 400;
+    throw err;
+  }
+  session.queue.push(track);
+  touchJam(session);
+  if (session.status === "idle" || session.index < 0) {
+    session.index = session.queue.length - 1;
+    session.status = "playing";
+    session.basePositionMs = 0;
+    session.startedAtMs = Date.now();
+  }
+  return publicJamStatus(session);
+}
+
+function jamPause(session) {
+  if (session.status !== "playing") return publicJamStatus(session);
+  session.basePositionMs = jamPositionMs(session);
+  session.startedAtMs = null;
+  session.status = "paused";
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+function jamResume(session) {
+  if (session.status !== "paused") return publicJamStatus(session);
+  if (session.index < 0 || session.index >= session.queue.length) {
+    return publicJamStatus(session);
+  }
+  session.status = "playing";
+  session.startedAtMs = Date.now();
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+function jamSkip(session) {
+  if (session.queue.length === 0) {
+    session.index = -1;
+    session.status = "idle";
+    session.basePositionMs = 0;
+    session.startedAtMs = null;
+    touchJam(session);
+    return publicJamStatus(session);
+  }
+  if (session.index < session.queue.length - 1) {
+    session.index += 1;
+  } else {
+    session.index = -1;
+    session.status = "idle";
+    session.basePositionMs = 0;
+    session.startedAtMs = null;
+    touchJam(session);
+    return publicJamStatus(session);
+  }
+  session.status = "playing";
+  session.basePositionMs = 0;
+  session.startedAtMs = Date.now();
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+function jamPlayAt(session, index) {
+  if (index < 0 || index >= session.queue.length) {
+    const err = new Error("invalid_index");
+    err.status = 400;
+    throw err;
+  }
+  session.index = index;
+  session.status = "playing";
+  session.basePositionMs = 0;
+  session.startedAtMs = Date.now();
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+function jamRemove(session, index) {
+  if (index < 0 || index >= session.queue.length) {
+    const err = new Error("invalid_index");
+    err.status = 400;
+    throw err;
+  }
+  session.queue.splice(index, 1);
+  if (session.queue.length === 0) {
+    session.index = -1;
+    session.status = "idle";
+    session.basePositionMs = 0;
+    session.startedAtMs = null;
+  } else if (index < session.index) {
+    session.index -= 1;
+  } else if (index === session.index) {
+    if (session.index >= session.queue.length) {
+      session.index = session.queue.length - 1;
+    }
+    session.basePositionMs = 0;
+    session.startedAtMs =
+      session.status === "playing" ? Date.now() : null;
+  }
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+function jamStop(session) {
+  session.status = "idle";
+  session.index = -1;
+  session.basePositionMs = 0;
+  session.startedAtMs = null;
+  session.queue = [];
+  touchJam(session);
+  return publicJamStatus(session);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of jamSessions) {
+    if (now - session.updatedAt > JAM_IDLE_TTL_MS) {
+      jamSessions.delete(id);
+    }
+  }
+}, 60_000);
+
+function parseJamTrack(body) {
+  const url = typeof body.url === "string" ? body.url.trim() : "";
+  if (!isAllowedMediaUrl(url)) return null;
+  const id =
+    (typeof body.id === "string" && body.id.trim()) ||
+    `jam_${Buffer.from(url).toString("base64url").slice(0, 24)}`;
+  return {
+    id,
+    url,
+    title:
+      typeof body.title === "string" && body.title.trim()
+        ? body.title.trim().slice(0, 200)
+        : "Unknown title",
+    artist:
+      typeof body.artist === "string" && body.artist.trim()
+        ? body.artist.trim().slice(0, 120)
+        : "Unknown",
+    artworkUrl:
+      typeof body.artworkUrl === "string" && body.artworkUrl.startsWith("http")
+        ? body.artworkUrl.slice(0, 500)
+        : null,
+  };
+}
+
+/** First continuation token in an innertube response, if any. */
+function findContinuation(node) {
+  if (!node || typeof node !== "object") return null;
+  if (node.nextContinuationData?.continuation) {
+    return node.nextContinuationData.continuation;
+  }
+  if (node.continuationCommand?.token) return node.continuationCommand.token;
+  for (const v of Object.values(node)) {
+    const t = findContinuation(v);
+    if (t) return t;
+  }
+  return null;
+}
+
+/** JSON reply, gzip-compressed when the client accepts it (≈10× smaller). */
+function sendMaybeGzip(req, res, status, text) {
+  const headers = { "Content-Type": "application/json" };
+  if (/\bgzip\b/.test(req.headers["accept-encoding"] || "")) {
+    const body = gzipSync(text);
+    res.writeHead(status, { ...headers, "Content-Encoding": "gzip", "Content-Length": body.length });
+    res.end(body);
+    return;
+  }
+  res.writeHead(status, headers);
+  res.end(text);
+}
+
+/** Innertube calls MiniPlayer may relay with the listener's own session. */
+const YTM_ENDPOINTS = new Set([
+  "browse",
+  "next",
+  "player",
+  "search",
+  "account/account_menu",
+  "like/like",
+  "like/removelike",
+]);
+
+/**
+ * The listener's YouTube session headers. `-B64` variants are preferred:
+ * some mobile networks drop requests whose headers contain Google auth
+ * keywords (e.g. "SAPISIDHASH"), so MiniPlayer base64-encodes them.
+ * @param {"cookie" | "auth"} which
+ */
+function ytSessionHeader(req, which) {
+  const b64 = req.headers[`x-yt-${which}-b64`];
+  if (typeof b64 === "string" && b64) {
+    try {
+      return Buffer.from(b64, "base64").toString("utf8");
+    } catch {
+      return undefined;
+    }
+  }
+  const plain = req.headers[`x-yt-${which}`];
+  return typeof plain === "string" ? plain : undefined;
+}
+
+/** Headers for a relayed signed-in call; the session never touches logs. */
+function ytmForwardHeaders(req, extra) {
+  const h = {
+    ...extra,
+    Origin: "https://music.youtube.com",
+    "X-Origin": "https://music.youtube.com",
+    "User-Agent":
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  };
+  const cookie = ytSessionHeader(req, "cookie");
+  const auth = ytSessionHeader(req, "auth");
+  const user = req.headers["x-goog-authuser"];
+  const visitor = req.headers["x-goog-visitor-id"];
+  if (typeof visitor === "string") h["X-Goog-Visitor-Id"] = visitor;
+  h.Referer = "https://music.youtube.com/";
+  const ver = req.headers["x-youtube-client-version"];
+  if (typeof cookie === "string") h.Cookie = cookie;
+  if (typeof auth === "string") h.Authorization = auth;
+  if (typeof user === "string") h["X-Goog-AuthUser"] = user;
+  if (typeof ver === "string") {
+    h["X-YouTube-Client-Name"] = "67";
+    h["X-YouTube-Client-Version"] = ver;
+  }
+  return h;
+}
+
+/** MiniPlayer lyrics proxy: path → fixed upstream + allowed query params. */
+const LYRICS_ROUTES = {
+  "/lyrics/lrclib/get": {
+    url: "https://lrclib.net/api/get",
+    params: ["track_name", "artist_name", "album_name", "duration"],
+  },
+  "/lyrics/lrclib/search": {
+    url: "https://lrclib.net/api/search",
+    params: ["q", "track_name", "artist_name"],
+  },
+  "/lyrics/better": {
+    url: "https://lyrics-api.boidu.dev/getLyrics",
+    params: ["s", "a", "d", "al"],
+  },
+  "/lyrics/lyricsplus": {
+    url: "https://lyricsplus.binimum.org/v2/lyrics/get",
+    params: ["title", "artist", "duration", "album"],
+  },
+  "/lyrics/bini": {
+    url: "https://lyrics-api.binimum.org/",
+    params: ["track", "artist", "album", "duration"],
+  },
+  // Bini search results point at a TTML file named by ISRC.
+  "/lyrics/bini/ttml": {
+    url: (q) => {
+      const id = q.get("id") || "";
+      return /^[A-Za-z0-9]{8,16}$/.test(id)
+        ? `https://lrc.red/s/${id}.ttml`
+        : null;
+    },
+    params: [],
+  },
+  "/lyrics/unison": {
+    url: "https://unison.boidu.dev/lyrics",
+    params: ["song", "artist", "album", "duration"],
+  },
+  "/lyrics/kugou/search": {
+    url: "https://lyrics.kugou.com/search?ver=1&man=yes&client=pc",
+    params: ["keyword", "duration", "hash"],
+  },
+  // Lyrics translation (Google's public endpoint), a few lines per call.
+  "/lyrics/translate": {
+    url: "https://translate.googleapis.com/translate_a/single?client=gtx&dt=t",
+    params: ["sl", "tl", "q"],
+    max: 1500,
+  },
+  "/lyrics/kugou/download": {
+    url: "https://lyrics.kugou.com/download?ver=1&client=pc&fmt=lrc&charset=utf8",
+    params: ["id", "accesskey"],
+  },
+};
+const LYRICS_CACHE_MS = 6 * 60 * 60 * 1000;
+const LYRICS_CACHE_MAX = 500;
+/** @type {Map<string, {at: number, status: number, type: string, body: string}>} */
+const lyricsCache = new Map();
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
 
     if (req.method === "GET" && url.pathname === "/health") {
-      sendJson(res, 200, { ok: true, extractor: "yt-dlp" });
+      sendJson(res, 200, {
+        ok: true,
+        extractor: "yt-dlp",
+        publicApi: Boolean(MUSIC_API_TOKEN),
+        jamRooms: jamSessions.size,
+      });
       return;
     }
 
+    // --- Listen Together (jam) API ---
+    if (req.method === "POST" && url.pathname === "/jam") {
+      if (!requireApiToken(req, res)) return;
+      const session = createJamSession();
+      sendJson(res, 200, publicJamStatus(session));
+      return;
+    }
+
+    const jamMatch = url.pathname.match(
+      /^\/jam\/([a-z0-9]{8,40})(?:\/(enqueue|pause|resume|skip|stop|playAt|remove|chat|react))?$/,
+    );
+    if (jamMatch) {
+      if (!requireApiToken(req, res)) return;
+      const roomId = jamMatch[1];
+      const action = jamMatch[2] || (req.method === "GET" ? "status" : null);
+      if (!isValidRoomId(roomId) || !action) {
+        sendJson(res, 400, { error: "invalid_request" });
+        return;
+      }
+
+      if (action === "status" && req.method === "GET") {
+        const existing = getJam(roomId);
+        if (!existing) {
+          sendJson(res, 404, { error: "room_not_found" });
+          return;
+        }
+        touchJam(existing);
+        jamSeen(existing, url.searchParams.get("name"));
+        sendJson(res, 200, publicJamStatus(existing));
+        return;
+      }
+
+      const session = getJam(roomId);
+      if (!session) {
+        sendJson(res, 404, { error: "room_not_found" });
+        return;
+      }
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "method_not_allowed" });
+        return;
+      }
+
+      if (action === "enqueue") {
+        const body = await readBody(req);
+        const track = parseJamTrack(body);
+        if (!track) {
+          sendJson(res, 400, { error: "invalid_track" });
+          return;
+        }
+        sendJson(res, 200, jamEnqueue(session, track));
+        return;
+      }
+      if (action === "pause") {
+        sendJson(res, 200, jamPause(session));
+        return;
+      }
+      if (action === "resume") {
+        sendJson(res, 200, jamResume(session));
+        return;
+      }
+      if (action === "skip") {
+        sendJson(res, 200, jamSkip(session));
+        return;
+      }
+      if (action === "stop") {
+        sendJson(res, 200, jamStop(session));
+        return;
+      }
+      if (action === "playAt") {
+        const body = await readBody(req);
+        const index = Number(body.index);
+        sendJson(res, 200, jamPlayAt(session, index));
+        return;
+      }
+      if (action === "chat") {
+        const body = await readBody(req);
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!text) {
+          sendJson(res, 400, { error: "empty_message" });
+          return;
+        }
+        const msgs = (session.messages ||= []);
+        msgs.push({
+          id: `${Date.now()}${Math.random().toString(36).slice(2, 6)}`,
+          name: jamName(body.name),
+          text: text.slice(0, 300),
+          ts: Date.now(),
+        });
+        if (msgs.length > JAM_MAX_MESSAGES) msgs.splice(0, msgs.length - JAM_MAX_MESSAGES);
+        jamSeen(session, body.name);
+        touchJam(session);
+        sendJson(res, 200, publicJamStatus(session));
+        return;
+      }
+      if (action === "react") {
+        const body = await readBody(req);
+        if (!JAM_REACTIONS.has(body.emoji)) {
+          sendJson(res, 400, { error: "invalid_reaction" });
+          return;
+        }
+        const list = (session.reactions ||= []);
+        list.push({
+          id: `${Date.now()}${Math.random().toString(36).slice(2, 6)}`,
+          name: jamName(body.name),
+          emoji: body.emoji,
+          ts: Date.now(),
+        });
+        if (list.length > 30) list.splice(0, list.length - 30);
+        jamSeen(session, body.name);
+        touchJam(session);
+        sendJson(res, 200, publicJamStatus(session));
+        return;
+      }
+      if (action === "remove") {
+        const body = await readBody(req);
+        const index = Number(body.index);
+        sendJson(res, 200, jamRemove(session, index));
+        return;
+      }
+
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/share") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readJsonMaybeGzip(req, 200_000);
+      const tracks = (Array.isArray(body.tracks) ? body.tracks : [])
+        .slice(0, 300)
+        .map(cleanShareTrack)
+        .filter(Boolean);
+      if (!tracks.length) {
+        sendJson(res, 400, { error: "no_tracks" });
+        return;
+      }
+      const name =
+        typeof body.name === "string" && body.name.trim()
+          ? body.name.trim().slice(0, 80)
+          : "Shared playlist";
+      if (shares.size >= SHARES_MAX) shares.delete(shares.keys().next().value);
+      const code = shareCode();
+      shares.set(code, { name, tracks, at: Date.now() });
+      saveSharesSoon();
+      sendJson(res, 200, { code });
+      return;
+    }
+    // --- Opt-in listening sync (MiniPlayer): one JSONL file per anonymous id.
+    if (url.pathname === "/sync/events" || url.pathname === "/sync/user") {
+      if (!requireApiToken(req, res)) return;
+      const uid = (url.searchParams.get("uid") || "").toLowerCase();
+      if (req.method === "POST" && url.pathname === "/sync/events") {
+        const body = await readJsonMaybeGzip(req, 300_000);
+        const id = String(body.uid || "").toLowerCase();
+        if (!/^[a-f0-9]{16,40}$/.test(id)) {
+          sendJson(res, 400, { error: "invalid_uid" });
+          return;
+        }
+        const kinds = new Set(["play", "skip", "like", "dislike", "fav", "unfav", "follow"]);
+        const str = (v, n) => (typeof v === "string" ? v.slice(0, n) : undefined);
+        const lines = (Array.isArray(body.events) ? body.events : [])
+          .slice(0, 500)
+          .filter((e) => e && kinds.has(e.t))
+          .map((e) =>
+            JSON.stringify({
+              t: e.t,
+              id: str(e.id, 80),
+              ti: str(e.ti, 200),
+              a: str(e.a, 120),
+              s: Number.isFinite(e.s) ? Math.max(0, Math.min(36000, Math.round(e.s))) : undefined,
+              ts: Number.isFinite(e.ts) ? Math.round(e.ts) : Date.now(),
+            }),
+          );
+        if (lines.length) {
+          mkdirSync(joinPath(SHARES_DIR, "users"), { recursive: true });
+          appendFileSync(joinPath(SHARES_DIR, "users", `${id}.jsonl`), lines.join("\n") + "\n");
+        }
+        sendJson(res, 200, { ok: true, stored: lines.length });
+        return;
+      }
+      if (req.method === "DELETE" && url.pathname === "/sync/user") {
+        if (!/^[a-f0-9]{16,40}$/.test(uid)) {
+          sendJson(res, 400, { error: "invalid_uid" });
+          return;
+        }
+        rmSync(joinPath(SHARES_DIR, "users", `${uid}.jsonl`), { force: true });
+        sendJson(res, 200, { ok: true, deleted: true });
+        return;
+      }
+      sendJson(res, 405, { error: "method_not_allowed" });
+      return;
+    }
+
+    const shareMatch = url.pathname.match(/^\/share\/([A-Za-z0-9]{6})$/);
+    if (req.method === "GET" && shareMatch) {
+      if (!requireApiToken(req, res)) return;
+      const hit = shares.get(shareMatch[1].toUpperCase());
+      if (!hit) {
+        sendJson(res, 404, { error: "share_not_found" });
+        return;
+      }
+      sendJson(res, 200, { name: hit.name, tracks: hit.tracks });
+      return;
+    }
+
+    // --- continue with existing search / playlist / meta / audio / LiveKit rooms ---
+
     if (req.method === "GET" && url.pathname === "/search") {
+      if (!requireApiToken(req, res, { optional: true })) return;
       const q = url.searchParams.get("q") || "";
       if (!isValidSearchQuery(q)) {
         sendJson(res, 400, { error: "invalid_query" });
         return;
       }
-      const results = await searchYouTube(q);
-      sendJson(res, 200, { results });
+      const limit = Number(url.searchParams.get("limit") || SEARCH_LIMIT_DEFAULT);
+      const offset = Number(url.searchParams.get("offset") || 0);
+      const typeRaw = (url.searchParams.get("type") || "video").toLowerCase();
+      const type =
+        typeRaw === "playlist" || typeRaw === "mix" || typeRaw === "song"
+          ? typeRaw
+          : "video";
+      const results =
+        type === "song"
+          ? await searchYouTubeMusicSongs(q, { limit, offset })
+          : await searchYouTube(q, { limit, offset, type });
+      sendJson(res, 200, {
+        results,
+        type,
+        limit: Math.min(
+          Math.max(limit || SEARCH_LIMIT_DEFAULT, 1),
+          SEARCH_LIMIT_MAX,
+        ),
+        offset: Math.max(offset || 0, 0),
+        hasMore:
+          results.length > 0 && offset + results.length < SEARCH_LIMIT_MAX,
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/playlist") {
+      if (!requireApiToken(req, res, { optional: true })) return;
+      const pageUrl = url.searchParams.get("url") || "";
+      if (!isAllowedMediaUrl(pageUrl) || !needsExtractor(pageUrl)) {
+        sendJson(res, 400, { error: "invalid_url" });
+        return;
+      }
+      const limit = Number(url.searchParams.get("limit") || 40);
+      const data = await listPlaylistEntries(pageUrl, { limit });
+      sendJson(res, 200, data);
+      return;
+    }
+
+    // Lazy metadata for MiniPlayer (cover + details on song click, not search).
+    if (req.method === "GET" && url.pathname === "/meta") {
+      if (!requireApiToken(req, res, { optional: true })) return;
+      const pageUrl = url.searchParams.get("url") || "";
+      if (!isAllowedMediaUrl(pageUrl) || !needsExtractor(pageUrl)) {
+        sendJson(res, 400, { error: "invalid_url" });
+        return;
+      }
+      const data = await fetchVideoMeta(pageUrl);
+      sendJson(res, 200, data);
+      return;
+    }
+
+    // Signed-in YouTube Music for MiniPlayer ("Meet server" account mode).
+    // The client signs each call (SAPISIDHASH) and sends its session cookie;
+    // this host only relays allowlisted innertube calls. Nothing is stored.
+    const ytmMatch = url.pathname.match(/^\/ytm\/(.+)$/);
+    if (
+      ytmMatch &&
+      (req.method === "POST" || req.method === "GET") &&
+      YTM_ENDPOINTS.has(ytmMatch[1])
+    ) {
+      if (!requireApiToken(req, res)) return;
+      // GET carries the JSON body base64url-encoded in `b`: some mobile
+      // networks stall POST bodies to this host while GETs go through.
+      let body;
+      if (req.method === "GET") {
+        try {
+          body = JSON.parse(
+            Buffer.from(url.searchParams.get("b") || "", "base64url").toString("utf8"),
+          );
+        } catch {
+          sendJson(res, 400, { error: "invalid_body" });
+          return;
+        }
+      } else {
+        body = await readBody(req, 64_000);
+      }
+      try {
+        const upstream = (payload) =>
+          fetch(
+            `https://music.youtube.com/youtubei/v1/${ytmMatch[1]}?prettyPrint=false`,
+            {
+              method: "POST",
+              headers: ytmForwardHeaders(req, { "Content-Type": "application/json" }),
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(20_000),
+            },
+          );
+        // `pages=N` (browse): follow continuations here and answer
+        // {"pages":[…]} — phones on slow/filtered links then make one small
+        // request instead of several with long continuation tokens.
+        const pages = Math.min(Number(url.searchParams.get("pages") || 0), 8);
+        const skip = Math.min(Number(url.searchParams.get("skip") || 0), pages);
+        let status;
+        let text;
+        if (ytmMatch[1] === "browse" && pages > 0) {
+          const out = [];
+          let next = body;
+          for (let i = 0; i < pages && next; i++) {
+            const r = await upstream(next);
+            if (!r.ok) {
+              if (out.length === 0) status = r.status;
+              break;
+            }
+            const j = await r.json();
+            if (i >= skip) out.push(j);
+            const token = findContinuation(j);
+            next = token ? { context: body.context, continuation: token } : null;
+          }
+          status ??= 200;
+          text = JSON.stringify({ pages: out });
+        } else {
+          const r = await upstream(body);
+          status = r.status;
+          text = await r.text();
+        }
+        sendMaybeGzip(req, res, status, text);
+      } catch {
+        sendJson(res, 502, { error: "ytm_upstream_failed" });
+      }
+      return;
+    }
+    // ytcfg for the listener's session: live client version, visitor data,
+    // datasync id and the player's signature timestamp (MiniPlayer needs
+    // them to sign playable player calls / history). Nothing is stored.
+    if (req.method === "GET" && url.pathname === "/ytm/config") {
+      if (!requireApiToken(req, res)) return;
+      try {
+        const cookie = ytSessionHeader(req, "cookie");
+        const page = await fetch("https://music.youtube.com/?cbrd=1&ucbcb=1", {
+          headers: {
+            "User-Agent": ytmForwardHeaders(req, {})["User-Agent"],
+            "Accept-Language": "en-US,en;q=0.9",
+            Cookie: typeof cookie === "string" ? `${cookie}; SOCS=CAI` : "SOCS=CAI",
+          },
+          signal: AbortSignal.timeout(15_000),
+        }).then((r) => r.text());
+        const pick = (re) => (page.match(re) || [])[1] || null;
+        const out = {
+          clientVersion: pick(/"INNERTUBE_CLIENT_VERSION":"([\d.]+)"/),
+          visitorData: pick(/"VISITOR_DATA":"([^"]+)"/),
+          datasyncId: pick(/"DATASYNC_ID":"([^"]*)"/),
+          signatureTimestamp: null,
+        };
+        const js = pick(/"jsUrl":"([^"]+)"/);
+        if (js && /^\/s\/player\/[\w/.-]+\.js$/.test(js)) {
+          const base = await fetch(`https://music.youtube.com${js}`, {
+            signal: AbortSignal.timeout(20_000),
+          }).then((r) => r.text());
+          const sts = (base.match(/signatureTimestamp:?\D{0,4}(\d{5})/) || [])[1];
+          if (sts) out.signatureTimestamp = Number(sts);
+        }
+        sendJson(res, 200, out);
+      } catch {
+        sendJson(res, 502, { error: "ytm_config_failed" });
+      }
+      return;
+    }
+
+    // History pings (videostats) — YouTube's own stats URLs only.
+    if (req.method === "GET" && url.pathname === "/ytm/ping") {
+      if (!requireApiToken(req, res)) return;
+      let target;
+      try {
+        target = new URL(url.searchParams.get("url") || "");
+      } catch {
+        target = null;
+      }
+      if (
+        !target ||
+        target.protocol !== "https:" ||
+        !/^(s|music|www)\.youtube\.com$/.test(target.hostname) ||
+        !target.pathname.startsWith("/api/stats/")
+      ) {
+        sendJson(res, 400, { error: "invalid_url" });
+        return;
+      }
+      try {
+        const r = await fetch(target, {
+          headers: ytmForwardHeaders(req, {}),
+          signal: AbortSignal.timeout(10_000),
+        });
+        res.writeHead(r.status === 204 ? 204 : r.status);
+        res.end();
+      } catch {
+        sendJson(res, 502, { error: "ping_failed" });
+      }
+      return;
+    }
+    // Account/playlist artwork on Google image hosts (blocked for some users).
+    if (req.method === "GET" && url.pathname === "/img") {
+      if (!requireApiToken(req, res, { optional: true })) return;
+      let target;
+      try {
+        target = new URL(url.searchParams.get("url") || "");
+      } catch {
+        target = null;
+      }
+      if (
+        !target ||
+        target.protocol !== "https:" ||
+        !/(^|\.)(googleusercontent\.com|ggpht\.com|ytimg\.com)$/.test(target.hostname)
+      ) {
+        sendJson(res, 400, { error: "invalid_url" });
+        return;
+      }
+      try {
+        const r = await fetch(target, { signal: AbortSignal.timeout(10_000) });
+        if (!r.ok) {
+          sendJson(res, r.status, { error: "img_failed" });
+          return;
+        }
+        const buf = Buffer.from(await r.arrayBuffer());
+        res.writeHead(200, {
+          "Content-Type": r.headers.get("content-type") || "image/jpeg",
+          "Content-Length": buf.length,
+          "Cache-Control": "public, max-age=604800",
+        });
+        res.end(buf);
+      } catch {
+        sendJson(res, 502, { error: "img_failed" });
+      }
+      return;
+    }
+
+    // Proxy time-synced lyrics lookups for MiniPlayer (same reason as
+    // /thumb: the lyric hosts can be unreachable from the client's network).
+    // Fixed upstreams + allowlisted params only — never an open proxy.
+    const lyricsRoute = LYRICS_ROUTES[url.pathname];
+    if (req.method === "GET" && lyricsRoute) {
+      if (!requireApiToken(req, res)) return;
+      const target =
+        typeof lyricsRoute.url === "function"
+          ? lyricsRoute.url(url.searchParams)
+          : lyricsRoute.url;
+      if (!target) {
+        sendJson(res, 400, { error: "invalid_params" });
+        return;
+      }
+      const upstream = new URL(target);
+      for (const key of lyricsRoute.params) {
+        const v = url.searchParams.get(key);
+        if (v) upstream.searchParams.set(key, v.slice(0, lyricsRoute.max || 300));
+      }
+      const cacheKey = upstream.toString();
+      const hit = lyricsCache.get(cacheKey);
+      if (hit && Date.now() - hit.at < LYRICS_CACHE_MS) {
+        res.writeHead(hit.status, { "Content-Type": hit.type });
+        res.end(hit.body);
+        return;
+      }
+      try {
+        const r = await fetch(upstream, {
+          headers: { "User-Agent": "MiniPlayer lyrics proxy (meet music-bot)" },
+          signal: AbortSignal.timeout(12_000),
+        });
+        const body = await r.text();
+        // Cache answers and clean misses; don't pin transient upstream errors.
+        if (r.status === 200 || r.status === 404) {
+          lyricsCache.set(cacheKey, {
+            at: Date.now(),
+            status: r.status,
+            type: r.headers.get("content-type") || "application/json",
+            body,
+          });
+          if (lyricsCache.size > LYRICS_CACHE_MAX) {
+            lyricsCache.delete(lyricsCache.keys().next().value);
+          }
+        }
+        res.writeHead(r.status, {
+          "Content-Type": r.headers.get("content-type") || "application/json",
+        });
+        res.end(body);
+      } catch {
+        sendJson(res, 502, { error: "lyrics_upstream_failed" });
+      }
+      return;
+    }
+
+    // Proxy YouTube thumbnails: i.ytimg.com is blocked for some MiniPlayer
+    // users (e.g. Iran without VPN) while this host stays reachable.
+    if (req.method === "GET" && url.pathname === "/thumb") {
+      if (!requireApiToken(req, res, { optional: true })) return;
+      const id = url.searchParams.get("id") || "";
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      for (const name of ["hqdefault", "mqdefault", "default"]) {
+        try {
+          const upstream = await fetch(
+            `https://i.ytimg.com/vi/${id}/${name}.jpg`,
+            { signal: AbortSignal.timeout(10_000) },
+          );
+          if (!upstream.ok) continue;
+          const body = Buffer.from(await upstream.arrayBuffer());
+          res.writeHead(200, {
+            "Content-Type": upstream.headers.get("content-type") || "image/jpeg",
+            "Content-Length": body.length,
+            "Cache-Control": "public, max-age=604800, immutable",
+          });
+          res.end(body);
+          return;
+        } catch {
+          // try the next size
+        }
+      }
+      sendJson(res, 404, { error: "thumb_not_found" });
+      return;
+    }
+
+    // Proxy audio through this host so clients are not bound to the server's
+    // googlevideo IP (needed for MiniPlayer on another network).
+    if (req.method === "GET" && url.pathname === "/audio") {
+      if (!requireApiToken(req, res)) return;
+      const pageUrl = url.searchParams.get("url") || "";
+      if (!isAllowedMediaUrl(pageUrl) || !needsExtractor(pageUrl)) {
+        sendJson(res, 400, { error: "invalid_url" });
+        return;
+      }
+      pipeExtractorAudio(
+        pageUrl,
+        req,
+        res,
+        userCookieArgs(ytSessionHeader(req, "cookie")),
+      );
       return;
     }
 

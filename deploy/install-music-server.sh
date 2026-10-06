@@ -47,10 +47,16 @@ PROXY=""
 if [ "$WARP" = 1 ]; then
   say "Cloudflare WARP (proxy mode)"
   if ! command -v warp-cli >/dev/null; then
-    apt-get install -y -q curl gpg >/dev/null
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ noble main" > /etc/apt/sources.list.d/cloudflare-client.list
-    apt-get update -q >/dev/null && apt-get install -y -q cloudflare-warp >/dev/null || true
+    apt-get install -y -q curl gpg >/dev/null || true
+    # pkg.cloudflareclient.com is blocked on some networks: give up quickly.
+    if curl -fsSL --connect-timeout 10 --max-time 25 https://pkg.cloudflareclient.com/pubkey.gpg -o /tmp/cf-warp.gpg \
+       && gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg /tmp/cf-warp.gpg; then
+      echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ noble main" > /etc/apt/sources.list.d/cloudflare-client.list
+      apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update -q >/dev/null 2>&1 || true
+      apt-get install -y -q cloudflare-warp >/dev/null 2>&1 || true
+    fi
+    # Don't leave an unreachable repo behind (it would slow every apt update).
+    command -v warp-cli >/dev/null || rm -f /etc/apt/sources.list.d/cloudflare-client.list
   fi
   if ! command -v warp-cli >/dev/null; then
     echo "WARNING: could not install Cloudflare WARP here; continuing without it."

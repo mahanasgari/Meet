@@ -1,0 +1,5 @@
+# Meet without the music bot (no YouTube/MiniPlayer music features).
+# Use: docker compose -f docker-compose.yml -f docker-compose.nomusic.yml up -d
+services:
+  music-bot:
+    profiles: ["disabled"]

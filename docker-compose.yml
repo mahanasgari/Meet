@@ -73,6 +73,7 @@ services:
         condition: service_healthy
       music-bot:
         condition: service_started
+        required: false # absent with docker-compose.nomusic.yml
     networks:
       - meet
 

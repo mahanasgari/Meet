@@ -61,6 +61,26 @@ npm run dev
 
 Open http://localhost:3000.
 
+## Install Meet (one command)
+
+Point `DOMAIN` and `livekit.DOMAIN` (A records) to your server, then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mahanasgari/Meet/main/deploy/install-meet.sh | sudo bash -s -- --domain meet.example.com
+```
+
+Without the music bot (just video meetings):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mahanasgari/Meet/main/deploy/install-meet.sh | sudo bash -s -- --domain meet.example.com --no-music
+```
+
+Options: `--email` (Let's Encrypt), `--music-token` (MiniPlayer token),
+`--dir` (default `/opt/meet`). It installs Docker + Compose, writes `.env` with
+random LiveKit keys, opens the firewall ports, and starts everything with
+automatic HTTPS. If nginx already uses 80/443 it runs behind it instead
+(see `deploy/nginx.example.conf`). Run it again to update.
+
 ## MiniPlayer music server (one command)
 
 The `music-bot` here also powers [MiniPlayer](https://github.com/mahanasgari/MiniPlayer):

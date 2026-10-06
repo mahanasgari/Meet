@@ -2036,16 +2036,19 @@ const server = http.createServer(async (req, res) => {
     }
     // --- MiniPlayer app updates: latest.json + release files (public, no
     // token, so any old app can always update). Files live in SHARES_DIR/app.
-    if (req.method === "GET" && url.pathname === "/app/latest.json") {
+    // servers.json: the list of music servers apps may use (edited by the
+    // operator, so adding a server needs no app update).
+    const appJson = url.pathname.match(/^\/app\/(latest|servers)\.json$/);
+    if (req.method === "GET" && appJson) {
       try {
-        const body = readFileSync(joinPath(SHARES_DIR, "app", "latest.json"));
+        const body = readFileSync(joinPath(SHARES_DIR, "app", `${appJson[1]}.json`));
         res.writeHead(200, {
           "Content-Type": "application/json",
           "Cache-Control": "no-cache",
         });
         res.end(body);
       } catch {
-        sendJson(res, 404, { error: "no_release" });
+        sendJson(res, 404, { error: appJson[1] === "latest" ? "no_release" : "not_found" });
       }
       return;
     }

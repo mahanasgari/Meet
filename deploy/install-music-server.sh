@@ -50,8 +50,14 @@ if [ "$WARP" = 1 ]; then
     apt-get install -y -q curl gpg >/dev/null
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ noble main" > /etc/apt/sources.list.d/cloudflare-client.list
-    apt-get update -q >/dev/null && apt-get install -y -q cloudflare-warp >/dev/null
+    apt-get update -q >/dev/null && apt-get install -y -q cloudflare-warp >/dev/null || true
   fi
+  if ! command -v warp-cli >/dev/null; then
+    echo "WARNING: could not install Cloudflare WARP here; continuing without it."
+    WARP=0
+  fi
+fi
+if [ "$WARP" = 1 ]; then
   command -v socat >/dev/null || apt-get install -y -q socat >/dev/null
   systemctl enable --now warp-svc >/dev/null; sleep 3
   warp-cli --accept-tos registration new >/dev/null 2>&1 || true
@@ -74,8 +80,13 @@ U
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     ufw allow from 172.17.0.0/16 to 172.17.0.1 port 14000 proto tcp comment "music-bot to WARP" >/dev/null
   fi
-  curl -s -m 15 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(warp|loc)=' | tr '\n' ' '; echo
-  PROXY=http://host.docker.internal:14000
+  if curl -s -m 15 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -q '^warp=on'; then
+    echo "WARP connected"
+    PROXY=http://host.docker.internal:14000
+  else
+    echo "WARNING: WARP did not connect (blocked here?). Continuing without it;"
+    echo "         YouTube may ask this server to sign in. Re-run later, or use --no-warp."
+  fi
 fi
 
 say "Settings ($ENVF)"

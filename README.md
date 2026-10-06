@@ -61,6 +61,35 @@ npm run dev
 
 Open http://localhost:3000.
 
+## MiniPlayer music server (one command)
+
+The `music-bot` here also powers [MiniPlayer](https://github.com/mahanasgari/MiniPlayer):
+YouTube search/audio, YouTube Music, lyrics relays, Listen Together and shared
+playlists. You can run it on its own on any Ubuntu/Debian server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mahanasgari/Meet/main/deploy/install-music-server.sh \
+  | sudo bash -s -- --token YOUR_MUSIC_API_TOKEN --domain music.example.com
+```
+
+It installs Docker (if needed), Cloudflare WARP in proxy mode (so YouTube
+sees a Cloudflare address, not your datacenter IP), runs the prebuilt image
+`ghcr.io/mahanasgari/meet-music-bot` on `127.0.0.1:4100`, and publishes it at
+`https://DOMAIN/extractor/` — through your existing nginx (adds one
+`location`, backs the file up) or with Caddy and automatic HTTPS when ports
+80/443 are free. Run it again to update.
+
+| Option | Meaning |
+|---|---|
+| `--token` | Required. Shared secret the app sends; use the same one on every server. Keep it private. |
+| `--domain` | Domain pointing to this server (enables HTTPS publishing). |
+| `--memory 600m` | Container memory cap (default ≈40% of RAM, 300–900 MB). |
+| `--no-warp` | Skip WARP (if this IP isn't blocked by YouTube). |
+| `--no-web` | Only run on `127.0.0.1:4100`; publish it yourself. |
+
+Check: `curl https://DOMAIN/extractor/health`. Settings live in
+`/etc/miniplayer-music.env`; logs: `docker logs music-bot`.
+
 ## Production deployment (small VPS)
 
 Designed for one inexpensive VPS (1–2 vCPU, 1–2 GB RAM is enough for a few

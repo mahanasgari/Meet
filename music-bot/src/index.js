@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
+import { buildWeeklyChart } from "./charts.js";
 import {
   AudioFrame,
   AudioSource,
@@ -2082,6 +2083,22 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       createReadStream(p, { start, end }).pipe(res);
+      return;
+    }
+
+    // --- "Popular on MiniPlayer": weekly chart from the opt-in sync. Only
+    // songs played by >= CHARTS_MIN_LISTENERS different people appear.
+    if (req.method === "GET" && url.pathname === "/charts/weekly") {
+      if (!requireApiToken(req, res)) return;
+      if (!globalThis.__chart || Date.now() - globalThis.__chart.at > 10 * 60_000) {
+        globalThis.__chart = {
+          at: Date.now(),
+          items: buildWeeklyChart(joinPath(SHARES_DIR, "users"), {
+            minListeners: Number(process.env.CHARTS_MIN_LISTENERS) || 2,
+          }),
+        };
+      }
+      sendJson(res, 200, { items: globalThis.__chart.items, week: true });
       return;
     }
 

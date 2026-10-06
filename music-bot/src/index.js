@@ -22,6 +22,7 @@ import { join as joinPath } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
+import { audioFormat } from "./quality.js";
 import {
   AudioFrame,
   AudioSource,
@@ -491,12 +492,12 @@ function headersToFfmpegArg(headers) {
  * Stream extracted audio to an HTTP client (yt-dlp stdout).
  * Used by MiniPlayer so playback is not tied to the server's googlevideo IP.
  */
-function pipeExtractorAudio(pageUrl, req, res, userCookies = null) {
+function pipeExtractorAudio(pageUrl, req, res, userCookies = null, quality = "") {
   const child = spawn(
     YTDLP_BIN,
     [
       "-f",
-      "bestaudio/best",
+      audioFormat(quality),
       "--no-playlist",
       "--no-warnings",
       // The listener's own account when they sent one, else the server's.
@@ -2493,6 +2494,7 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         userCookieArgs(ytSessionHeader(req, "cookie")),
+        url.searchParams.get("q") || "",
       );
       return;
     }

@@ -14,6 +14,8 @@ import {
   readFileSync,
   mkdirSync,
   appendFileSync,
+  statSync,
+  createReadStream,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
@@ -2032,6 +2034,54 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { code });
       return;
     }
+    // --- MiniPlayer app updates: latest.json + release files (public, no
+    // token, so any old app can always update). Files live in SHARES_DIR/app.
+    if (req.method === "GET" && url.pathname === "/app/latest.json") {
+      try {
+        const body = readFileSync(joinPath(SHARES_DIR, "app", "latest.json"));
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache",
+        });
+        res.end(body);
+      } catch {
+        sendJson(res, 404, { error: "no_release" });
+      }
+      return;
+    }
+    const appFile = url.pathname.match(/^\/app\/files\/([A-Za-z0-9._-]{1,120})$/);
+    if ((req.method === "GET" || req.method === "HEAD") && appFile) {
+      const p = joinPath(SHARES_DIR, "app", "files", appFile[1]);
+      let size;
+      try {
+        size = statSync(p).size;
+      } catch {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+      }
+      // Range support so interrupted downloads can resume.
+      const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || "");
+      const start = m ? Number(m[1]) : 0;
+      const end = m && m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
+      if (start >= size) {
+        res.writeHead(416, { "Content-Range": `bytes */${size}` });
+        res.end();
+        return;
+      }
+      res.writeHead(m ? 206 : 200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": end - start + 1,
+        "Accept-Ranges": "bytes",
+        ...(m ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+      });
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      createReadStream(p, { start, end }).pipe(res);
+      return;
+    }
+
     // --- Opt-in listening sync (MiniPlayer): one JSONL file per anonymous id.
     if (url.pathname === "/sync/events" || url.pathname === "/sync/user") {
       if (!requireApiToken(req, res)) return;

@@ -56,13 +56,13 @@ function run(bin, args, timeoutMs) {
 export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
   const dir = mkdtempSync(join(tmpdir(), "mp-clip-"));
   try {
-    const end = p.start + p.dur;
+    // The whole song via yt-dlp (it honours --proxy; a section download
+    // hands the fetch to ffmpeg, which bypasses the proxy and gets 403s).
     await run(
       ytdlp,
       [
         "-f", "bestaudio/best",
         "--no-playlist", "--no-warnings",
-        "--download-sections", `*${p.start}-${end}`,
         ...ytdlpArgs,
         "-o", join(dir, "src.%(ext)s"),
         p.url,
@@ -90,6 +90,7 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
       ffmpeg,
       [
         "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", String(p.start),
         "-i", join(dir, src),
         ...(cover ? ["-i", cover] : []),
         "-map", "0:a",

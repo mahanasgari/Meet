@@ -52,3 +52,13 @@ test("usage counts per day", () => {
   assert.equal(u.summary("x").today, 2);
   assert.equal(u.summary("nobody").today, 0);
 });
+
+test("removed invites disappear and their tokens stay blocked", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inv-"));
+  const s = new InviteStore(dir);
+  const inv = s.create("Temp");
+  assert.equal(s.remove(inv.code).uid, inv.uid);
+  assert.equal(s.list().length, 0);
+  assert.deepEqual(new InviteStore(dir).disabledUids(), [inv.uid]);
+  assert.equal(s.remove("ZZZZ-ZZZZ"), null);
+});

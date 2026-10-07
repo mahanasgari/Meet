@@ -25,6 +25,7 @@ import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
 import { audioFormat } from "./quality.js";
 import { clipParams, makeClip } from "./clip.js";
+import { renderDownloadPage } from "./download_page.js";
 import {
   InviteStore,
   RateLimiter,
@@ -2098,6 +2099,24 @@ const server = http.createServer(async (req, res) => {
     }
     // --- MiniPlayer app updates: latest.json + release files (public, no
     // token, so any old app can always update). Files live in SHARES_DIR/app.
+    // --- Download page for friends (public).
+    if (req.method === "GET" && (url.pathname === "/app/" || url.pathname === "/app")) {
+      if (url.pathname === "/app") {
+        res.writeHead(301, { Location: "app/" });
+        res.end();
+        return;
+      }
+      let manifest = null;
+      try {
+        manifest = JSON.parse(readFileSync(joinPath(SHARES_DIR, "app", "latest.json"), "utf8"));
+      } catch {
+        // nothing published yet
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+      res.end(renderDownloadPage(manifest));
+      return;
+    }
+
     // --- Invites: redeem a code (public, rate-limited per address).
     if (req.method === "POST" && url.pathname === "/invite/redeem") {
       const ip = String(req.headers["x-real-ip"] || req.socket.remoteAddress || "");
@@ -2196,6 +2215,12 @@ const server = http.createServer(async (req, res) => {
       if (req.method === "POST" && url.pathname === "/admin/invites") {
         const body = await readBody(req, 2_000).catch(() => ({}));
         sendJson(res, 200, invites.create(body.name));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/invites/delete") {
+        const body = await readBody(req, 2_000).catch(() => ({}));
+        const e = invites.remove(body.id);
+        sendJson(res, e ? 200 : 404, e || { error: "not_found" });
         return;
       }
       if (req.method === "POST" && url.pathname === "/admin/invites/block") {

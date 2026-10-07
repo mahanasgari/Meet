@@ -99,14 +99,32 @@ export class InviteStore {
     return entry;
   }
 
+  /** Remove an invite for good (by code or uid); its token stops working. */
+  remove(codeOrUid) {
+    const key = normalizeCode(codeOrUid);
+    const code = this.data.invites[key]
+      ? key
+      : Object.keys(this.data.invites).find((c) => this.data.invites[c].uid === codeOrUid);
+    if (!code) return null;
+    const entry = this.data.invites[code];
+    delete this.data.invites[code];
+    // Keep its uid blocked so a token already handed out can't come back.
+    (this.data.removed ||= []).push(entry.uid);
+    this.save();
+    return entry;
+  }
+
   list() {
     return Object.entries(this.data.invites).map(([code, e]) => ({ code, ...e }));
   }
 
   disabledUids() {
-    return Object.values(this.data.invites)
-      .filter((e) => e.disabled)
-      .map((e) => e.uid);
+    return [
+      ...Object.values(this.data.invites)
+        .filter((e) => e.disabled)
+        .map((e) => e.uid),
+      ...(this.data.removed || []),
+    ];
   }
 }
 

@@ -25,6 +25,13 @@ import { buildWeeklyChart } from "./charts.js";
 import { audioFormat } from "./quality.js";
 import { clipParams, makeClip } from "./clip.js";
 import {
+  InviteStore,
+  RateLimiter,
+  Usage,
+  makeUserToken,
+  verifyUserToken,
+} from "./invites.js";
+import {
   AudioFrame,
   AudioSource,
   LocalAudioTrack,
@@ -112,12 +119,63 @@ function extractBearerOrHeader(req) {
   return typeof header === "string" ? header.trim() : "";
 }
 
-/** Check MUSIC_API_TOKEN. When [optional], missing token is allowed (in-compose Meet app). */
+// --- MiniPlayer invites: personal tokens signed with MUSIC_API_TOKEN.
+// The home server keeps invites.json; workers (HOME_URL set) fetch the list
+// of blocked users from it every few minutes.
+const HOME_URL = (process.env.HOME_URL || "").replace(/\/+$/, "");
+const invites = new InviteStore(process.env.SHARES_DIR || "/shares");
+const usage = new Usage(process.env.SHARES_DIR || "/shares");
+const userLimiter = new RateLimiter(
+  Number(process.env.USER_REQUESTS_PER_10MIN) || 3000,
+  10 * 60_000,
+);
+const redeemLimiter = new RateLimiter(10, 10 * 60_000);
+let remoteBlocked = new Set();
+setInterval(() => usage.save(), 60_000).unref();
+async function refreshBlocked() {
+  if (!HOME_URL) return;
+  try {
+    const r = await fetch(`${HOME_URL}/app/revoked.json`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (r.ok) remoteBlocked = new Set((await r.json()).uids || []);
+  } catch {
+    // keep the last list
+  }
+}
+refreshBlocked();
+setInterval(refreshBlocked, 5 * 60_000).unref();
+const isBlocked = (uid) =>
+  remoteBlocked.has(uid) || invites.disabledUids().includes(uid);
+
+/** True for the server's own secret (admin / owner). */
+function isMasterToken(req) {
+  return Boolean(MUSIC_API_TOKEN) && extractBearerOrHeader(req) === MUSIC_API_TOKEN;
+}
+
+/**
+ * Check MUSIC_API_TOKEN or a MiniPlayer user token (from an invite). When
+ * [optional], missing token is allowed (in-compose Meet app).
+ */
 function requireApiToken(req, res, { optional = false } = {}) {
   if (!MUSIC_API_TOKEN) return true;
   const got = extractBearerOrHeader(req);
   if (got === MUSIC_API_TOKEN) return true;
   if (optional && !got) return true;
+  const uid = verifyUserToken(MUSIC_API_TOKEN, got);
+  if (uid) {
+    if (isBlocked(uid)) {
+      sendJson(res, 403, { error: "blocked" });
+      return false;
+    }
+    if (!userLimiter.hit(uid)) {
+      sendJson(res, 429, { error: "slow_down" });
+      return false;
+    }
+    usage.touch(uid);
+    req.mpUser = uid;
+    return true;
+  }
   sendJson(res, 401, { error: "unauthorized" });
   return false;
 }
@@ -2039,6 +2097,61 @@ const server = http.createServer(async (req, res) => {
     }
     // --- MiniPlayer app updates: latest.json + release files (public, no
     // token, so any old app can always update). Files live in SHARES_DIR/app.
+    // --- Invites: redeem a code (public, rate-limited per address).
+    if (req.method === "POST" && url.pathname === "/invite/redeem") {
+      const ip = String(req.headers["x-real-ip"] || req.socket.remoteAddress || "");
+      if (!redeemLimiter.hit(ip)) {
+        sendJson(res, 429, { error: "too_many_attempts" });
+        return;
+      }
+      const body = await readBody(req, 2_000).catch(() => ({}));
+      const entry = invites.redeem(body.code);
+      if (!entry) {
+        sendJson(res, 404, { error: "invalid_code" });
+        return;
+      }
+      if (entry.disabled) {
+        sendJson(res, 403, { error: "blocked" });
+        return;
+      }
+      sendJson(res, 200, {
+        token: makeUserToken(MUSIC_API_TOKEN, entry.uid),
+        name: entry.name,
+      });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/app/revoked.json") {
+      sendJson(res, 200, { uids: invites.disabledUids() });
+      return;
+    }
+    // --- Invite admin (the server secret only).
+    if (url.pathname.startsWith("/admin/invites")) {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/admin/invites") {
+        usage.save();
+        sendJson(res, 200, {
+          invites: invites.list().map((e) => ({ ...e, usage: usage.summary(e.uid) })),
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/invites") {
+        const body = await readBody(req, 2_000).catch(() => ({}));
+        sendJson(res, 200, invites.create(body.name));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/invites/block") {
+        const body = await readBody(req, 2_000).catch(() => ({}));
+        const e = invites.setDisabled(body.id, body.blocked !== false);
+        sendJson(res, e ? 200 : 404, e || { error: "not_found" });
+        return;
+      }
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+
     // servers.json: the list of music servers apps may use (edited by the
     // operator, so adding a server needs no app update).
     const appJson = url.pathname.match(/^\/app\/(latest|servers)\.json$/);

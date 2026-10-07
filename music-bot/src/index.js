@@ -23,6 +23,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
 import { audioFormat } from "./quality.js";
+import { clipParams, makeClip } from "./clip.js";
 import {
   AudioFrame,
   AudioSource,
@@ -2482,6 +2483,46 @@ const server = http.createServer(async (req, res) => {
 
     // Proxy audio through this host so clients are not bound to the server's
     // googlevideo IP (needed for MiniPlayer on another network).
+    // --- Share a clip: a 5–60 s MP3 piece of a song (title/artist/cover in).
+    if (req.method === "GET" && url.pathname === "/clip") {
+      if (!requireApiToken(req, res)) return;
+      const p = clipParams(url.searchParams);
+      if (!p) {
+        sendJson(res, 400, { error: "invalid_clip" });
+        return;
+      }
+      if ((globalThis.__clips || 0) >= 2) {
+        sendJson(res, 429, { error: "busy" });
+        return;
+      }
+      globalThis.__clips = (globalThis.__clips || 0) + 1;
+      let made = null;
+      try {
+        made = await makeClip(p, {
+          ytdlp: YTDLP_BIN,
+          ffmpeg: FFMPEG_BIN,
+          ytdlpArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+        });
+        const size = statSync(made.file).size;
+        res.writeHead(200, {
+          "Content-Type": "audio/mpeg",
+          "Content-Length": size,
+          "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(made.name)}`,
+        });
+        const dir = made.dir;
+        const stream = createReadStream(made.file);
+        stream.on("close", () => rmSync(dir, { recursive: true, force: true }));
+        stream.pipe(res);
+      } catch (e) {
+        if (made) rmSync(made.dir, { recursive: true, force: true });
+        console.error("clip failed:", String(e).slice(0, 300));
+        if (!res.headersSent) sendJson(res, 502, { error: "clip_failed" });
+      } finally {
+        globalThis.__clips -= 1;
+      }
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/audio") {
       if (!requireApiToken(req, res)) return;
       const pageUrl = url.searchParams.get("url") || "";

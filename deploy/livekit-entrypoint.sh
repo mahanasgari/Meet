@@ -24,6 +24,18 @@ CONFIG_PATH="${LIVEKIT_CONFIG_PATH:-/tmp/livekit.yaml}"
   if [ -n "${LIVEKIT_NODE_IP:-}" ]; then
     echo "  node_ip: ${LIVEKIT_NODE_IP}"
   fi
+  if [ -n "${LIVEKIT_TURN_DOMAIN:-}" ]; then
+    # Built-in TURN: when the direct media connection is blocked (DTLS is
+    # throttled on many networks), browsers relay through TURN over TLS,
+    # which looks like ordinary HTTPS. Uses the site's certificate.
+    echo "turn:"
+    echo "  enabled: true"
+    echo "  domain: ${LIVEKIT_TURN_DOMAIN}"
+    echo "  tls_port: ${LIVEKIT_TURN_TLS_PORT:-5349}"
+    echo "  udp_port: ${LIVEKIT_TURN_UDP_PORT:-3478}"
+    echo "  cert_file: ${LIVEKIT_TURN_CERT:-/etc/letsencrypt/live/${LIVEKIT_TURN_DOMAIN}/fullchain.pem}"
+    echo "  key_file: ${LIVEKIT_TURN_KEY:-/etc/letsencrypt/live/${LIVEKIT_TURN_DOMAIN}/privkey.pem}"
+  fi
   echo "redis:"
   echo "  address: ${REDIS_ADDR}"
   echo "room:"

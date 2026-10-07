@@ -16,6 +16,7 @@ import {
   appendFileSync,
   statSync,
   createReadStream,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
@@ -2124,6 +2125,61 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { uids: invites.disabledUids() });
       return;
     }
+    // --- Feedback from the app (signed-in users; stored on this server).
+    if (req.method === "POST" && url.pathname === "/feedback") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readJsonMaybeGzip(req, 400_000).catch(() => null);
+      const text = typeof body?.text === "string" ? body.text.trim().slice(0, 5000) : "";
+      if (!text) {
+        sendJson(res, 400, { error: "empty" });
+        return;
+      }
+      const who = req.mpUser
+        ? invites.list().find((e) => e.uid === req.mpUser)?.name || req.mpUser
+        : "owner";
+      const entry = {
+        at: new Date().toISOString(),
+        from: who,
+        uid: req.mpUser || null,
+        text,
+        version: String(body.version || "").slice(0, 40),
+        platform: String(body.platform || "").slice(0, 40),
+        log: typeof body.log === "string" ? body.log.slice(0, 200_000) : null,
+      };
+      const dir = joinPath(SHARES_DIR, "feedback");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        joinPath(dir, `${entry.at.replace(/[:.]/g, "-")}-${req.mpUser || "owner"}.json`),
+        JSON.stringify(entry, null, 1),
+      );
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/admin/feedback") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const dir = joinPath(SHARES_DIR, "feedback");
+      let files = [];
+      try {
+        files = readdirSync(dir).filter((f) => f.endsWith(".json")).sort().reverse();
+      } catch {
+        // none yet
+      }
+      const limit = Math.min(Number(url.searchParams.get("limit")) || 30, 200);
+      sendJson(res, 200, {
+        feedback: files.slice(0, limit).map((f) => {
+          try {
+            return { file: f, ...JSON.parse(readFileSync(joinPath(dir, f), "utf8")) };
+          } catch {
+            return { file: f, error: "unreadable" };
+          }
+        }),
+      });
+      return;
+    }
+
     // --- Invite admin (the server secret only).
     if (url.pathname.startsWith("/admin/invites")) {
       if (!isMasterToken(req)) {

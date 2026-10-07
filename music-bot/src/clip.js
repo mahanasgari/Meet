@@ -16,13 +16,18 @@ export function clipParams(q) {
   const url = q.get("url") || "";
   const m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(url);
   if (!m || !/^https:\/\/(www\.|music\.)?youtube\.com\/watch\?/.test(url)) return null;
-  const start = Math.floor(Number(q.get("start")));
-  const dur = Math.floor(Number(q.get("dur")));
-  if (!Number.isFinite(start) || start < 0 || start > 36000) return null;
-  if (!Number.isFinite(dur) || dur < 5 || dur > 60) return null;
+  // full=1: the whole song as a file (songs up to 20 minutes).
+  const full = q.get("full") === "1";
+  const start = full ? 0 : Math.floor(Number(q.get("start")));
+  const dur = full ? 0 : Math.floor(Number(q.get("dur")));
+  if (!full) {
+    if (!Number.isFinite(start) || start < 0 || start > 36000) return null;
+    if (!Number.isFinite(dur) || dur < 5 || dur > 60) return null;
+  }
   return {
     url: `https://www.youtube.com/watch?v=${m[1]}`,
     id: m[1],
+    full,
     start,
     dur,
     title: clean(q.get("title"), 120) || "Clip",
@@ -63,6 +68,7 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
       [
         "-f", "bestaudio/best",
         "--no-playlist", "--no-warnings",
+        ...(p.full ? ["--match-filter", "duration < 1200"] : []),
         ...ytdlpArgs,
         "-o", join(dir, "src.%(ext)s"),
         p.url,
@@ -70,7 +76,8 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
       120_000,
     );
     const src = readdirSync(dir).find((f) => f.startsWith("src."));
-    if (!src) throw new Error("no audio");
+    // (A full song over 20 minutes is skipped by --match-filter: no file.)
+    if (!src) throw new Error(p.full ? "too_long_or_unavailable" : "no audio");
     // Cover art is optional: the clip still works without it.
     let cover = null;
     try {
@@ -90,7 +97,7 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
       ffmpeg,
       [
         "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", String(p.start),
+        ...(p.full ? [] : ["-ss", String(p.start)]),
         "-i", join(dir, src),
         ...(cover ? ["-i", cover] : []),
         "-map", "0:a",
@@ -98,8 +105,9 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
           ? ["-map", "1:v", "-c:v", "mjpeg", "-vf", "crop=ih:ih", "-disposition:v", "attached_pic",
              "-metadata:s:v", "title=Cover"]
           : []),
-        "-t", String(p.dur),
-        "-af", `afade=t=in:d=0.4,afade=t=out:st=${fadeOut}:d=1`,
+        ...(p.full
+          ? []
+          : ["-t", String(p.dur), "-af", `afade=t=in:d=0.4,afade=t=out:st=${fadeOut}:d=1`]),
         "-c:a", "libmp3lame", "-b:a", "160k",
         "-id3v2_version", "3",
         "-metadata", `title=${p.title}`,
@@ -110,7 +118,7 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
     );
     if (statSync(out).size < 10_000) throw new Error("clip too small");
     const safe = `${p.artist ? p.artist + " - " : ""}${p.title}`.replace(/[\/\\:*?<>|]/g, "").slice(0, 100);
-    return { dir, file: out, name: `${safe} (clip).mp3` };
+    return { dir, file: out, name: p.full ? `${safe}.mp3` : `${safe} (clip).mp3` };
   } catch (e) {
     rmSync(dir, { recursive: true, force: true });
     throw e;

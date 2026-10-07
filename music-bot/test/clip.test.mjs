@@ -19,3 +19,10 @@ test("rejects bad urls, lengths and starts", () => {
   assert.equal(clipParams(q({ url: "https://www.youtube.com/watch?v=jIZFZQgURX8", start: -5, dur: 30 })), null);
   assert.equal(clipParams(q({ url: "https://www.youtube.com/watch?v=jIZFZQgURX8", start: "x", dur: 30 })), null);
 });
+
+test("full=1 asks for the whole song, ignoring start/dur", () => {
+  const p = clipParams(new URLSearchParams({ url: "https://www.youtube.com/watch?v=jIZFZQgURX8", full: "1", title: "T" }));
+  assert.equal(p.full, true);
+  assert.equal(p.start, 0);
+  assert.equal(clipParams(new URLSearchParams({ url: "https://www.youtube.com/watch?v=jIZFZQgURX8" })), null, "no full, no range");
+});

@@ -268,3 +268,58 @@ export function appStats(snaps, days, now = Date.now()) {
     checks: [...checks].map(([day, n]) => ({ day, n })).sort((a, b) => (a.day < b.day ? -1 : 1)),
   };
 }
+
+const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+
+/**
+ * YouTube ids played (t === "play") at least once in the last [days] days,
+ * by anyone. Ids may carry a "yt_" prefix, which is stripped. Sorted by
+ * distinct listeners, then total plays, both descending.
+ */
+export function playedIds(usersDir, days = 30, now = Date.now(), { limit = 2000 } = {}) {
+  const from = now - days * DAY;
+  const songs = new Map(); // id -> { plays, listeners: Set }
+  let files = [];
+  try {
+    files = readdirSync(usersDir).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    // no sync yet
+  }
+  for (const f of files) {
+    const path = join(usersDir, f);
+    try {
+      if (statSync(path).mtimeMs < from) continue;
+    } catch {
+      continue;
+    }
+    const who = f.slice(0, -6);
+    let text = "";
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let e;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (e.t !== "play") continue;
+      const ts = Number(e.ts);
+      if (!(ts >= from && ts <= now)) continue;
+      const id = typeof e.id === "string" ? e.id.replace(/^yt_/, "") : "";
+      if (!YT_ID.test(id)) continue;
+      const s = songs.get(id) || { plays: 0, listeners: new Set() };
+      s.plays++;
+      s.listeners.add(who);
+      songs.set(id, s);
+    }
+  }
+  return [...songs]
+    .sort((a, b) => b[1].listeners.size - a[1].listeners.size || b[1].plays - a[1].plays)
+    .slice(0, limit)
+    .map(([id]) => id);
+}

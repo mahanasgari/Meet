@@ -54,7 +54,34 @@ const MIGRATIONS = [
   ALTER TABLE songs ADD COLUMN format_id TEXT;
   ALTER TABLE songs ADD COLUMN container TEXT;
   CREATE INDEX songs_source_kind ON songs(source_kind);`,
+  `CREATE TABLE tracks (
+    video_id TEXT PRIMARY KEY, title TEXT, artists_json TEXT, album TEXT, album_id TEXT,
+    year INTEGER, duration_s REAL, first_seen INTEGER, last_seen INTEGER
+  );
+  CREATE TABLE artists (
+    id TEXT PRIMARY KEY, name TEXT, subscribers INTEGER, description TEXT,
+    first_seen INTEGER, last_seen INTEGER
+  );
+  CREATE TABLE song_artists (
+    video_id TEXT NOT NULL, artist_id TEXT NOT NULL, position INTEGER,
+    PRIMARY KEY (video_id, artist_id)
+  );
+  CREATE INDEX song_artists_artist ON song_artists(artist_id);
+  CREATE TABLE artist_related (
+    artist_id TEXT NOT NULL, related_id TEXT NOT NULL, rank INTEGER, seen_at INTEGER,
+    PRIMARY KEY (artist_id, related_id)
+  );
+  CREATE TABLE albums (
+    id TEXT PRIMARY KEY, title TEXT, kind TEXT, year INTEGER, artist_id TEXT
+  );
+  CREATE TABLE crawl (
+    video_id TEXT PRIMARY KEY, crawled_at INTEGER, ok INTEGER, error TEXT,
+    up_next INTEGER, related INTEGER
+  );
+  CREATE INDEX crawl_at ON crawl(crawled_at);`,
 ];
+const CRAWL_OK_MS = 30 * DAY;
+const CRAWL_FAIL_MS = DAY;
 
 const parse = (s, fallback = null) => {
   if (s == null) return fallback;
@@ -306,6 +333,126 @@ export class Catalog {
           .run(videoId, it.id, it.kind, it.rank ?? i);
       }
     });
+  }
+
+  // Stored songs that still need a graph crawl: never crawled first, then oldest.
+  needsCrawl(limit = 1, now = Date.now()) {
+    return this.#sql(`SELECT s.video_id FROM songs s LEFT JOIN crawl c ON c.video_id=s.video_id
+      WHERE s.status='stored' AND (c.video_id IS NULL
+        OR (c.ok=1 AND c.crawled_at<=?) OR (c.ok=0 AND c.crawled_at<=?))
+      ORDER BY (c.video_id IS NOT NULL), c.crawled_at, s.stored_at, s.rowid LIMIT ?`)
+      .all(now - CRAWL_OK_MS, now - CRAWL_FAIL_MS, limit).map((r) => r.video_id);
+  }
+
+  markCrawl(videoId, ok, error = null, now = Date.now()) {
+    this.#sql(`INSERT INTO crawl(video_id,crawled_at,ok,error,up_next,related) VALUES(?,?,?,?,0,0)
+      ON CONFLICT(video_id) DO UPDATE SET crawled_at=excluded.crawled_at, ok=excluded.ok,
+        error=excluded.error`).run(videoId, now, ok ? 1 : 0, ok || error == null ? null : String(error));
+  }
+
+  #upsertTrack(t, now) {
+    this.#sql(`INSERT INTO tracks(video_id,title,artists_json,album,album_id,year,duration_s,first_seen,last_seen)
+      VALUES(?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(video_id) DO UPDATE SET title=COALESCE(excluded.title,title),
+        artists_json=COALESCE(excluded.artists_json,artists_json), album=COALESCE(excluded.album,album),
+        album_id=COALESCE(excluded.album_id,album_id), year=COALESCE(excluded.year,year),
+        duration_s=COALESCE(excluded.duration_s,duration_s), last_seen=excluded.last_seen`)
+      .run(t.videoId, t.title ?? null, t.artists?.length ? json(t.artists) : null, t.album?.name ?? null,
+        t.album?.id ?? null, t.year ?? null, t.durationS ?? null, now, now);
+    for (const [i, a] of (t.artists ?? []).entries()) {
+      if (!a?.id) continue;
+      this.#upsertArtist(a, now);
+      this.#sql("INSERT OR REPLACE INTO song_artists(video_id,artist_id,position) VALUES(?,?,?)")
+        .run(t.videoId, a.id, i);
+    }
+  }
+
+  #upsertArtist(a, now) {
+    this.#sql(`INSERT INTO artists(id,name,subscribers,first_seen,last_seen) VALUES(?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET name=COALESCE(excluded.name,name),
+        subscribers=COALESCE(excluded.subscribers,subscribers), last_seen=excluded.last_seen`)
+      .run(a.id, a.name ?? null, a.subscribers ?? null, now, now);
+  }
+
+  // Store one crawl result atomically.
+  saveGraph(videoId, { upNext = [], related = [], similarArtists = [], albums = [], description = null } = {}, now = Date.now()) {
+    this.#tx(() => {
+      this.#sql("DELETE FROM related WHERE video_id=? AND kind IN ('next','related')").run(videoId);
+      const edge = (kind, list) => {
+        for (const [i, s] of list.entries()) {
+          this.#upsertTrack(s, now);
+          this.#sql("INSERT OR REPLACE INTO related(video_id,related_id,kind,rank) VALUES(?,?,?,?)")
+            .run(videoId, s.videoId, kind, s.rank ?? i);
+        }
+      };
+      edge("next", upNext);
+      edge("related", related);
+      // Main artist: the song's own UC channel, else the first up-next artist.
+      const row = this.#sql("SELECT yt_channel_id, artists_json FROM songs WHERE video_id=?").get(videoId);
+      let main = row?.yt_channel_id?.startsWith("UC") ? row.yt_channel_id : null;
+      if (!main) main = parse(row?.artists_json, []).find((a) => a?.id?.startsWith?.("UC"))?.id ?? null;
+      if (!main) main = this.#sql("SELECT artist_id FROM song_artists WHERE video_id=? ORDER BY position LIMIT 1")
+        .get(videoId)?.artist_id ?? null;
+      if (main) {
+        this.#upsertArtist({ id: main, name: null }, now);
+        this.#sql("INSERT OR IGNORE INTO song_artists(video_id,artist_id,position) VALUES(?,?,0)").run(videoId, main);
+        for (const [i, a] of similarArtists.entries()) {
+          if (!a?.id || a.id === main) continue;
+          this.#upsertArtist(a, now);
+          this.#sql("INSERT OR REPLACE INTO artist_related(artist_id,related_id,rank,seen_at) VALUES(?,?,?,?)")
+            .run(main, a.id, a.rank ?? i, now);
+        }
+        for (const al of albums) {
+          if (!al?.id) continue;
+          this.#sql(`INSERT INTO albums(id,title,kind,year,artist_id) VALUES(?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET title=COALESCE(excluded.title,title), kind=COALESCE(excluded.kind,kind),
+              year=COALESCE(excluded.year,year), artist_id=COALESCE(artist_id,excluded.artist_id)`)
+            .run(al.id, al.title ?? null, al.kind ?? null, al.year ?? null, main);
+        }
+        if (description) this.#sql("UPDATE artists SET description=? WHERE id=?").run(description, main);
+      }
+      this.#sql(`INSERT INTO crawl(video_id,crawled_at,ok,error,up_next,related) VALUES(?,?,1,NULL,?,?)
+        ON CONFLICT(video_id) DO UPDATE SET crawled_at=excluded.crawled_at, ok=1, error=NULL,
+          up_next=excluded.up_next, related=excluded.related`).run(videoId, now, upNext.length, related.length);
+    });
+  }
+
+  graphStats() {
+    const n = (t, ...a) => this.#sql(t).get(...a).n;
+    return {
+      crawled: n("SELECT COUNT(*) n FROM crawl WHERE ok=1"),
+      failed: n("SELECT COUNT(*) n FROM crawl WHERE ok=0"),
+      pending: n(`SELECT COUNT(*) n FROM songs s LEFT JOIN crawl c ON c.video_id=s.video_id
+        WHERE s.status='stored' AND c.video_id IS NULL`),
+      edges: {
+        next: n("SELECT COUNT(*) n FROM related WHERE kind='next'"),
+        related: n("SELECT COUNT(*) n FROM related WHERE kind='related'"),
+      },
+      tracks: n("SELECT COUNT(*) n FROM tracks"),
+      artists: n("SELECT COUNT(*) n FROM artists"),
+      artistLinks: n("SELECT COUNT(*) n FROM artist_related"),
+      albums: n("SELECT COUNT(*) n FROM albums"),
+    };
+  }
+
+  neighbors(videoId, limit = 20) {
+    const edges = (kind) => this.#sql(`SELECT r.related_id id, r.rank, t.title tt, t.artists_json ta,
+        s.title st, s.artists_json sa, s.status FROM related r
+        LEFT JOIN tracks t ON t.video_id=r.related_id LEFT JOIN songs s ON s.video_id=r.related_id
+        WHERE r.video_id=? AND r.kind=? ORDER BY r.rank LIMIT ?`).all(videoId, kind, limit).map((r) => ({
+        videoId: r.id, title: r.tt ?? r.st ?? null, artists: parse(r.ta ?? r.sa, []),
+        rank: r.rank, archived: r.status === "stored",
+      }));
+    return {
+      next: edges("next"),
+      related: edges("related"),
+      artists: this.#sql(`SELECT a.id, a.name FROM song_artists sa JOIN artists a ON a.id=sa.artist_id
+        WHERE sa.video_id=? ORDER BY sa.position`).all(videoId).map((r) => ({ id: r.id, name: r.name })),
+      similarArtists: this.#sql(`SELECT a.id, a.name, a.subscribers FROM song_artists sa
+        JOIN artist_related ar ON ar.artist_id=sa.artist_id JOIN artists a ON a.id=ar.related_id
+        WHERE sa.video_id=? ORDER BY sa.position, ar.rank LIMIT ?`).all(videoId, limit)
+        .map((r) => ({ id: r.id, name: r.name, subscribers: r.subscribers })),
+    };
   }
 
   stats(days = 7, now = Date.now()) {

@@ -3,7 +3,7 @@ import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { appStats, dayRange, listeningStats, trafficStats, userStats } from "../src/analytics.js";
+import { appStats, dayRange, listeningStats, playedIds, trafficStats, userStats } from "../src/analytics.js";
 
 const DAY = 864e5;
 const H = 3600e3;
@@ -265,4 +265,75 @@ test("appStats: downloads summed across servers, out-of-range days dropped", () 
     { day: "2026-10-09", n: 2 },
     { day: "2026-10-10", n: 5 },
   ]);
+});
+
+test("playedIds: plays only, prefix stripped, invalid ids ignored, skip-only excluded", () => {
+  const dir = tmp();
+  writeUser(dir, "abc", [
+    { t: "play", id: "yt_aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "bbbbbbbbbbb", ts: NOW - H },
+    { t: "skip", id: "ccccccccccc", ts: NOW - H },
+    { t: "like", id: "ddddddddddd", ts: NOW - H },
+    { t: "play", id: "short", ts: NOW - H },
+    { t: "play", id: "way-too-long-id-here", ts: NOW - H },
+    { t: "play", id: "bad!chars!!", ts: NOW - H },
+    { t: "play", id: "yt_", ts: NOW - H },
+    { t: "play", id: 12345678901, ts: NOW - H },
+    { t: "play", ts: NOW - H },
+  ]);
+  writeUser(dir, "def", [
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - 2 * H },
+  ]);
+  assert.deepEqual(playedIds(dir, 30, NOW), ["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+});
+
+test("playedIds: ordered by distinct listeners, then total plays", () => {
+  const dir = tmp();
+  writeUser(dir, "u1", [
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "bbbbbbbbbbb", ts: NOW - H },
+    { t: "play", id: "eeeeeeeeeee", ts: NOW - H },
+    { t: "play", id: "eeeeeeeeeee", ts: NOW - H },
+    { t: "play", id: "ccccccccccc", ts: NOW - H },
+  ]);
+  writeUser(dir, "u2", [
+    { t: "play", id: "bbbbbbbbbbb", ts: NOW - H },
+    { t: "play", id: "eeeeeeeeeee", ts: NOW - H },
+    { t: "play", id: "eeeeeeeeeee", ts: NOW - H },
+    { t: "play", id: "ccccccccccc", ts: NOW - H },
+  ]);
+  writeUser(dir, "u3", [{ t: "play", id: "ccccccccccc", ts: NOW - H }]);
+  // 3 listeners (c), 2 listeners with 4 plays (e), 2 listeners with 2 plays (b), 1 listener (a).
+  assert.deepEqual(playedIds(dir, 30, NOW), ["ccccccccccc", "eeeeeeeeeee", "bbbbbbbbbbb", "aaaaaaaaaaa"]);
+});
+
+test("playedIds: window cutoff by event ts and by file mtime", () => {
+  const dir = tmp();
+  writeUser(dir, "abc", [
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - 6 * DAY },
+    { t: "play", id: "bbbbbbbbbbb", ts: NOW - 8 * DAY }, // outside 7 days
+    { t: "play", id: "ccccccccccc", ts: NOW + H }, // after now
+  ]);
+  writeUser(dir, "old", [{ t: "play", id: "ddddddddddd", ts: NOW - DAY }]);
+  const old = (NOW - 40 * DAY) / 1000;
+  utimesSync(join(dir, "old.jsonl"), old, old); // file not touched in the window
+  assert.deepEqual(playedIds(dir, 7, NOW), ["aaaaaaaaaaa"]);
+});
+
+test("playedIds: limit caps the result", () => {
+  const dir = tmp();
+  writeUser(dir, "abc", [
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "aaaaaaaaaaa", ts: NOW - H },
+    { t: "play", id: "bbbbbbbbbbb", ts: NOW - H },
+    { t: "play", id: "ccccccccccc", ts: NOW - H },
+  ]);
+  assert.deepEqual(playedIds(dir, 30, NOW, { limit: 2 }), ["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+  assert.deepEqual(playedIds(dir, 30, NOW, { limit: 0 }), []);
+});
+
+test("playedIds: missing dir gives []", () => {
+  assert.deepEqual(playedIds(join(tmp(), "nope"), 30, NOW), []);
 });

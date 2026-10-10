@@ -28,13 +28,14 @@ import { audioFormat } from "./quality.js";
 import { clipParams, makeClip } from "./clip.js";
 import { renderDownloadPage } from "./download_page.js";
 import { Metrics, routeKey } from "./metrics.js";
-import { appStats, listeningStats, trafficStats, userStats } from "./analytics.js";
+import { appStats, listeningStats, playedIds, trafficStats, userStats } from "./analytics.js";
 import { Monitor, parseServices, slug } from "./monitor.js";
 import { TelegramBot, escHtml } from "./telegram_bot.js";
 import { updateYtdlp } from "./ytdlp_update.js";
 import { dailyReport, weeklyReport } from "./reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
+import { SongGraph } from "./song_graph.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
 import {
@@ -521,7 +522,8 @@ if (catalog) {
   // Grow the archive from what friends already listen to (opt-in sync).
   const seed = () => {
     try {
-      const ids = listeningStats(joinPath(SHARES, "users"), 30).topSongs.map((t) => String(t.id).replace(/^yt_/, "")).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id));
+      // Everything anyone played in the last 30 days, most-shared first.
+      const ids = playedIds(joinPath(SHARES, "users"), 30);
       const n = catalog.enqueue(ids, "prefetch");
       if (n) console.log(`[archive] queued ${n} songs from listening history`);
     } catch (e) {
@@ -584,6 +586,26 @@ if (catalog) {
   };
   setTimeout(() => void backfill(), 3 * 60_000).unref();
   setInterval(() => void backfill(), 30 * 60_000).unref();
+
+  // Song graph for our own recommendations: YouTube Music's "up next",
+  // "you might also like" and similar artists for every archived song.
+  const graph = new SongGraph({
+    catalog,
+    transport: async (path, body) => {
+      const r = await fetch(`https://music.youtube.com/youtubei/v1/${path}?prettyPrint=false`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: "https://music.youtube.com" },
+        body: JSON.stringify({ context: { client: { clientName: "WEB_REMIX", clientVersion: "1.20250101.01.00", hl: "en" } }, ...body }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!r.ok) throw new Error(`ytmusic ${path}: HTTP ${r.status}`);
+      return r.json();
+    },
+  });
+  if (process.env.GRAPH !== "0") {
+    setTimeout(() => void graph.tick(), 4 * 60_000).unref();
+    setInterval(() => void graph.tick(), (Number(process.env.GRAPH_EVERY_S) || 90) * 1000).unref();
+  }
 }
 
 let dashboardHtml = null;
@@ -674,7 +696,7 @@ function dashboardData(days) {
     feedback,
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
     backup: backupStatus(),
-    archive: catalog ? catalog.stats(days) : null,
+    archive: catalog ? { ...catalog.stats(days), graph: catalog.graphStats ? catalog.graphStats() : null } : null,
   };
   dataCache.set(days, { at: Date.now(), data });
   return data;
@@ -2768,6 +2790,19 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/admin/api/graph") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const id = String(url.searchParams.get("id") || "");
+      if (!catalog || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+      }
+      sendJson(res, 200, { song: catalog.lookup(id), ...catalog.neighbors(id, 30) });
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/admin/api/archive-retry") {
       if (!isMasterToken(req)) {
         sendJson(res, 401, { error: "unauthorized" });
@@ -3354,11 +3389,14 @@ const server = http.createServer(async (req, res) => {
       globalThis.__clips = (globalThis.__clips || 0) + 1;
       let made = null;
       try {
+        const localFile = archive ? await archive.localFile(p.id).catch(() => null) : null;
         made = await makeClip(p, {
           ytdlp: YTDLP_BIN,
           ffmpeg: FFMPEG_BIN,
           ytdlpArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+          localFile,
         });
+        res.setHeader("X-MP-Source", localFile ? `archive:${archive.serverId}` : "youtube");
         const size = statSync(made.file).size;
         res.writeHead(200, {
           "Content-Type": "audio/mpeg",

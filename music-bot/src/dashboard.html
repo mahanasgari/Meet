@@ -161,6 +161,22 @@ tr:last-child td{border-bottom:0}
 .modal .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:9px 16px;border-radius:9px;z-index:200;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw}
 #toast.on{opacity:1}
+.gtiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.gtile{background:var(--panel2);border-radius:10px;padding:10px 12px;min-width:0}
+.gtile .label{font-size:12px;color:var(--muted)}
+.gtile .val{font-size:22px;font-weight:700;line-height:1.2;margin-top:2px}
+.gtile .sub{font-size:12px;color:var(--muted)}
+.modal.wide{max-width:860px}
+.gcols{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:14px}
+.gcols h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
+.gli{display:flex;gap:8px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);min-width:0}
+.gli:last-child{border-bottom:0}
+.gli .rk{color:var(--muted);font-variant-numeric:tabular-nums;min-width:22px;text-align:right;flex:none}
+.gli .tx{min-width:0;flex:1}
+.gli .tt{overflow-wrap:anywhere}
+.gli .ar{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.gpills{display:flex;flex-wrap:wrap;gap:6px}
+@media (max-width:760px){.gcols{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -778,6 +794,30 @@ function arcRecentRows() {
   if (!state.arcKind) return rows;
   return rows.filter(function (r) { return state.arcKind === "ytm" ? isYtm(r.sourceKind) : r.sourceKind === "youtube"; });
 }
+function graphBtn(id) { return id ? ' <button class="btn sm" data-act="graph" data-id="' + esc(id) + '">Links</button>' : ""; }
+function graphTiles(G) {
+  if (!G || typeof G !== "object") return empty("Song graph not collected on this server yet");
+  var E = G.edges || {};
+  var tile = function (label, val, sub) { return '<div class="gtile"><div class="label">' + esc(label) + '</div><div class="val">' + val + '</div><div class="sub">' + sub + "</div></div>"; };
+  return '<div class="gtiles">' +
+    tile("Songs mapped", fmt(G.crawled), fmt(G.pending || 0) + " waiting · " + fmt(G.failed || 0) + " failed") +
+    tile("Song links", fmt((E.next || 0) + (E.related || 0)), "up next " + fmt(E.next || 0) + " · also-like " + fmt(E.related || 0)) +
+    tile("Songs known", fmt(G.tracks), "beyond the archive") +
+    tile("Artists", fmt(G.artists), fmt(G.artistLinks || 0) + " similar-artist links · " + fmt(G.albums || 0) + " albums") +
+    "</div>" +
+    '<div class="note" style="margin-top:8px">Collected from YouTube Music for every archived song — the base for our own recommendations.</div>';
+}
+function subsF(n) {
+  if (!isNum(n)) return "";
+  var a = Math.abs(n);
+  if (a >= 1e6) return fmt1(n / 1e6, 1) + "M";
+  if (a >= 1e3) return fmt1(n / 1e3, 1) + "K";
+  return fmt(n);
+}
+function findArchRow(id) {
+  var A = D().archive || {};
+  return arr(A.recent).concat(arr(A.top)).filter(function (r) { return r && r.videoId === id; })[0] || null;
+}
 function pageArchive() {
   var d = D(), A = d.archive;
   if (!A || !A.totals) return card("Archive", empty("Archive not set up yet"));
@@ -822,6 +862,8 @@ function pageArchive() {
 
   h += '<div style="height:12px"></div>' + card("Audio quality", arr(A.byQuality).length ? hbars(arr(A.byQuality).map(function (x) { return { label: x.label, value: x.count || 0 }; })) : empty("No quality data yet"));
 
+  h += '<div style="height:12px"></div>' + card("Song graph", graphTiles(A.graph));
+
   h += '<div style="height:12px"></div>' + card("Servers", table("arc-srv", [
     { k: "label", label: "Server", v: function (s) { return (s.label || s.id || "").toLowerCase(); }, h: function (s) { return "<b>" + esc(s.label || s.id) + "</b>"; } },
     { k: "status", label: "Status", h: function (s) { return archStatus(s.archive); } },
@@ -844,7 +886,7 @@ function pageArchive() {
   ], srvs, { sort: { k: "label", dir: "asc" }, empty: "No server reports archive status yet" }));
 
   h += '<div style="height:12px"></div>' + card("Recently archived", '<div class="toolbar" id="arcChips">' + arcChips() + "</div>" + table("arc-recent", [
-    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title); } },
+    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title) + graphBtn(r.videoId); } },
     { k: "type", label: "Type", v: function (r) { return r.sourceKind || ""; }, h: function (r) { return srcKindBadge(r.sourceKind); } },
     { k: "artist", label: "Artist", v: function (r) { return (r.artist || "").toLowerCase(); }, h: function (r) { return esc(r.artist || "–"); } },
     { k: "dur", label: "Length", r: 1, v: function (r) { return r.durationS || 0; }, h: function (r) { return mss(r.durationS); } },
@@ -858,7 +900,7 @@ function pageArchive() {
   ], arcRecentRows(), { sort: { k: "at", dir: "desc" }, empty: state.arcKind ? "Nothing matches this filter" : "Nothing archived yet" }));
 
   h += '<div style="height:12px"></div>' + card("Most played (range)", table("arc-top", [
-    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title); } },
+    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title) + graphBtn(r.videoId); } },
     { k: "type", label: "Type", v: function (r) { return r.sourceKind || ""; }, h: function (r) { return srcKindBadge(r.sourceKind); } },
     { k: "artist", label: "Artist", v: function (r) { return (r.artist || "").toLowerCase(); }, h: function (r) { return esc(r.artist || "–"); } },
     { k: "plays", label: "Plays", r: 1, v: function (r) { return r.plays || 0; }, h: function (r) { return fmt(r.plays); } }
@@ -979,6 +1021,39 @@ function pageAlerts() {
 }
 
 /* ========================= actions ========================= */
+var graphSeq = 0;
+function graphCol(title, list) {
+  return "<div><h4>" + esc(title) + "</h4>" + (list.length ? list.map(function (r, i) {
+    var names = arr(r.artists).map(function (a) { return a && a.name; }).filter(Boolean).join(", ");
+    return '<div class="gli"><span class="rk">' + esc(isNum(r.rank) ? r.rank : i + 1) + '</span><div class="tx"><div class="tt">' +
+      ytLink(r.videoId, r.title) + (r.archived ? ' <span class="badge good">archived</span>' : "") + "</div>" +
+      (names ? '<div class="ar">' + esc(names) + "</div>" : "") + "</div></div>";
+  }).join("") : '<div class="muted" style="font-size:13px">None yet</div>') + "</div>";
+}
+function graphBody(g, row) {
+  var song = g.song || {}, artist = song.artist || (row && row.artist) || "";
+  var sim = arr(g.similarArtists), next = arr(g.next), also = arr(g.related);
+  var h = artist ? '<div class="muted">By ' + esc(artist) + "</div>" : "";
+  h += '<div style="margin-top:12px"><div class="sub-h">Similar artists</div>' + (sim.length ? '<div class="gpills">' + sim.map(function (a) {
+    return '<span class="chip">' + esc(a.name) + (isNum(a.subscribers) ? ' <span class="muted">' + esc(subsF(a.subscribers)) + "</span>" : "") + "</span>";
+  }).join("") + "</div>" : '<div class="muted" style="font-size:13px">None yet</div>') + "</div>";
+  if (!next.length && !also.length) h += '<div class="empty">Not mapped yet &mdash; it will be within a few hours.</div>';
+  else h += '<div class="gcols">' + graphCol("Up next (YouTube Music radio)", next) + graphCol("You might also like", also) + "</div>";
+  return h;
+}
+function openGraph(id) {
+  var seq = ++graphSeq, row = findArchRow(id);
+  var m = modal('<h3>' + esc((row && (row.title || row.videoId)) || id) + '</h3><div id="graphBody" style="overflow:auto;min-height:0"><div class="empty">Loading...</div></div><div class="row"><button class="btn primary" data-act="close">Close</button></div>');
+  m.classList.add("wide");
+  api("api/graph?id=" + encodeURIComponent(id)).then(function (g) {
+    var b = $("graphBody"); if (!b || seq !== graphSeq) return;
+    if (!row && g && g.song && g.song.title) m.querySelector("h3").textContent = g.song.title;
+    b.innerHTML = graphBody(g || {}, row);
+  }).catch(function (e) {
+    var b = $("graphBody"); if (!b || seq !== graphSeq) return;
+    b.innerHTML = '<div class="empty bad">Could not load links (' + esc(e.message) + ").</div>";
+  });
+}
 function handleAct(a) {
   var act = a.getAttribute("data-act");
   if (act === "invite") {
@@ -1006,6 +1081,7 @@ function handleAct(a) {
     modal("<h3>Feedback log</h3><pre id=\"logPre\">Loading...</pre><div class=\"row\"><button class=\"btn\" data-act=\"copylog\">Copy</button><button class=\"btn primary\" data-act=\"close\">Close</button></div>");
     api("feedback/log?file=" + encodeURIComponent(file), { text: true }).then(function (t) { var p = $("logPre"); if (p) p.textContent = t || "(empty)"; }).catch(function (e) { var p = $("logPre"); if (p) p.textContent = "Failed: " + e.message; });
   } else if (act === "copylog") { var pr = $("logPre"); if (pr) copyText(pr.textContent); }
+  else if (act === "graph") openGraph(a.getAttribute("data-id"));
   else if (act === "tglink") {
     api("api/telegram-link", { body: {} }).then(function (r) {
       if (r && r.url) { window.open(r.url, "_blank", "noopener"); toast("Press Start in Telegram to connect"); }

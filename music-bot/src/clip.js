@@ -54,30 +54,37 @@ function run(bin, args, timeoutMs) {
   });
 }
 
+/** The whole song via yt-dlp into [dir]; returns its path. */
+async function downloadSource(p, dir, ytdlp, ytdlpArgs) {
+  // yt-dlp honours --proxy; a section download hands the fetch to ffmpeg,
+  // which bypasses the proxy and gets 403s.
+  await run(
+    ytdlp,
+    [
+      "-f", "bestaudio/best",
+      "--no-playlist", "--no-warnings",
+      ...(p.full ? ["--match-filter", "duration < 1200"] : []),
+      ...ytdlpArgs,
+      "-o", join(dir, "src.%(ext)s"),
+      p.url,
+    ],
+    120_000,
+  );
+  const src = readdirSync(dir).find((f) => f.startsWith("src."));
+  // (A full song over 20 minutes is skipped by --match-filter: no file.)
+  if (!src) throw new Error(p.full ? "too_long_or_unavailable" : "no audio");
+  return join(dir, src);
+}
+
 /**
  * Builds the clip; returns { dir, file, name }. The caller removes `dir`.
  * @param {ReturnType<typeof clipParams>} p
  */
-export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
+export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [], localFile = null }) {
   const dir = mkdtempSync(join(tmpdir(), "mp-clip-"));
   try {
-    // The whole song via yt-dlp (it honours --proxy; a section download
-    // hands the fetch to ffmpeg, which bypasses the proxy and gets 403s).
-    await run(
-      ytdlp,
-      [
-        "-f", "bestaudio/best",
-        "--no-playlist", "--no-warnings",
-        ...(p.full ? ["--match-filter", "duration < 1200"] : []),
-        ...ytdlpArgs,
-        "-o", join(dir, "src.%(ext)s"),
-        p.url,
-      ],
-      120_000,
-    );
-    const src = readdirSync(dir).find((f) => f.startsWith("src."));
-    // (A full song over 20 minutes is skipped by --match-filter: no file.)
-    if (!src) throw new Error(p.full ? "too_long_or_unavailable" : "no audio");
+    // From the song archive when the server has the file (no YouTube request).
+    const src = localFile || (await downloadSource(p, dir, ytdlp, ytdlpArgs));
     // Cover art is optional: the clip still works without it.
     let cover = null;
     try {
@@ -98,7 +105,7 @@ export async function makeClip(p, { ytdlp, ffmpeg, ytdlpArgs = [] }) {
       [
         "-hide_banner", "-loglevel", "error", "-y",
         ...(p.full ? [] : ["-ss", String(p.start)]),
-        "-i", join(dir, src),
+        "-i", src,
         ...(cover ? ["-i", cover] : []),
         "-map", "0:a",
         ...(cover

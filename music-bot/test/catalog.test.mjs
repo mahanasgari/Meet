@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "2");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "3");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "2");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "3");
   c.close();
 });
 
@@ -375,5 +375,53 @@ test("stats: byKind, byQuality, kindPlays, recent and top kinds", () => {
   assert.equal(byId.c.sourceKind, null);
   assert.equal(byId.c.quality, null);
   assert.deepEqual(s.top[0], { videoId: "a", title: "A", artist: "X", plays: 2, sourceKind: "ytm_track" });
+  c.close();
+});
+
+test("v2 database upgrades to v3 in place and keeps data", () => {
+  const file = tmp();
+  mkdirSync(dirname(file), { recursive: true });
+  const c1 = new Catalog(file);
+  c1.stored("a", { title: "Keep" }, NOW);
+  c1.setRelated("a", [{ id: "b", kind: "next", rank: 0 }]);
+  c1.close();
+  const db = new DatabaseSync(file);
+  for (const t of ["tracks", "artists", "song_artists", "artist_related", "albums", "crawl"]) db.exec(`DROP TABLE ${t}`);
+  db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
+  db.close();
+  const c2 = new Catalog(file);
+  assert.equal(c2.lookup("a").title, "Keep");
+  assert.equal(c2.graphStats().edges.next, 1);
+  assert.equal(c2.graphStats().tracks, 0);
+  c2.close();
+});
+
+test("needsCrawl: never-crawled first, then stale by age", () => {
+  const c = open();
+  for (const id of ["a", "b", "c", "d", "e"]) c.stored(id, {}, NOW);
+  c.enqueue(["p"], "prefetch", NOW); // pending, never listed
+  c.markCrawl("a", true, null, NOW - 40 * DAY); // stale ok
+  c.markCrawl("b", true, null, NOW - 10 * DAY); // fresh
+  c.markCrawl("c", false, "err", NOW - 2 * DAY); // stale failure
+  c.markCrawl("d", false, "err", NOW - HOUR); // recent failure
+  assert.deepEqual(c.needsCrawl(10, NOW), ["e", "a", "c"]);
+  assert.deepEqual(c.needsCrawl(1, NOW), ["e"]);
+  assert.equal(c.graphStats().pending, 1);
+  c.close();
+});
+
+test("tracks upsert keeps old values and updates last_seen", () => {
+  const c = open();
+  c.stored("s", { title: "S" }, NOW);
+  const song = (o) => ({ videoId: "t", title: null, artists: [], album: null, ...o });
+  c.saveGraph("s", { upNext: [song({ title: "T", album: { name: "Alb", id: "MPREb_1" }, year: 2000, durationS: 100 })] }, NOW);
+  c.saveGraph("s", { upNext: [song({})] }, NOW + DAY);
+  const r = c.db.prepare("SELECT * FROM tracks WHERE video_id='t'").get();
+  assert.equal(r.title, "T");
+  assert.equal(r.album_id, "MPREb_1");
+  assert.equal(r.year, 2000);
+  assert.equal(r.first_seen, NOW);
+  assert.equal(r.last_seen, NOW + DAY);
+  assert.equal(c.neighbors("s").next[0].title, "T");
   c.close();
 });

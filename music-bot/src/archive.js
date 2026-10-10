@@ -427,6 +427,53 @@ export class Archive {
     });
   }
 
+  /**
+   * A local file for [id] for clips and "share as file": the disk cache,
+   * else fetched from the channel, else archived now (one YouTube request
+   * that also serves future plays). Null when another server is archiving
+   * it or it can't be had.
+   */
+  async localFile(id) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(id || "")) return null;
+    if (this.cache.has(id)) {
+      this.cache.touch(id);
+      this.counters.shareFromArchive = (this.counters.shareFromArchive || 0) + 1;
+      return this.cache.path(id);
+    }
+    let c = null;
+    try {
+      c = await this.home.claim(id, this.serverId);
+    } catch {
+      return null;
+    }
+    if (c?.action === "stored" && c.song?.msgId) {
+      const tmp = this.cache.tmpPath(id);
+      try {
+        if (!this.tg.ready) await this.tg.connect();
+        const f = await this.tg.open(c.song.msgId);
+        const out = createWriteStream(tmp);
+        for await (const chunk of f.read(0, f.size)) {
+          if (!out.write(chunk)) await once(out, "drain");
+        }
+        out.end();
+        await once(out, "finish");
+        if (statSync(tmp).size !== f.size) throw new Error("short read");
+        this.cache.commit(tmp, id);
+        this.counters.shareFromArchive = (this.counters.shareFromArchive || 0) + 1;
+        return this.cache.path(id);
+      } catch (e) {
+        this.cache.discard(tmp);
+        this.log.error("[archive] share fetch:", e.message);
+        return null;
+      }
+    }
+    if (c?.action === "download" && !this.inflight.has(id)) {
+      const ok = await this.download(id, `https://www.youtube.com/watch?v=${id}`);
+      return ok && this.cache.has(id) ? this.cache.path(id) : null;
+    }
+    return null;
+  }
+
   queueUpload(id, info) {
     writeFileSync(join(this.queueDir, `${id}.json`), JSON.stringify({ id, info, tries: 0, nextAt: 0 }));
   }

@@ -12,6 +12,7 @@ const EXCLUDE_MS = 24 * HOUR;
 const MAX_ATTEMPTS = 6;
 const BACKOFF = [2 * MIN, 10 * MIN, HOUR, 6 * HOUR, 24 * HOUR];
 const SOURCES = ["disk", "telegram", "youtube", "peer"];
+const KINDS = ["ytm_track", "ytm_video", "youtube"];
 
 // Ordered migrations; index + 1 is the schema version.
 const MIGRATIONS = [
@@ -46,6 +47,13 @@ const MIGRATIONS = [
   );
   CREATE INDEX plays_at ON plays(at);
   CREATE INDEX plays_video ON plays(video_id);`,
+  `ALTER TABLE songs ADD COLUMN source_kind TEXT;
+  ALTER TABLE songs ADD COLUMN quality_label TEXT;
+  ALTER TABLE songs ADD COLUMN sample_rate INTEGER;
+  ALTER TABLE songs ADD COLUMN channels INTEGER;
+  ALTER TABLE songs ADD COLUMN format_id TEXT;
+  ALTER TABLE songs ADD COLUMN container TEXT;
+  CREATE INDEX songs_source_kind ON songs(source_kind);`,
 ];
 
 const parse = (s, fallback = null) => {
@@ -54,6 +62,20 @@ const parse = (s, fallback = null) => {
 };
 const json = (v) => (v == null ? null : JSON.stringify(v));
 const dayKey = (ms) => new Date(ms).toISOString().slice(0, 10);
+const kindCounts = () => Object.fromEntries([...KINDS, "unknown"].map((k) => [k, 0]));
+
+// Short codec name for the quality breakdown.
+const codecShort = (codec) => {
+  if (!codec) return "Unknown";
+  if (codec === "mp4a.40.5") return "HE-AAC";
+  if (codec === "mp4a.40.2" || codec === "mp4a.40.02" || codec.startsWith("mp4a")) return "AAC";
+  if (codec === "opus") return "Opus";
+  return codec;
+};
+const qualityLabel = (codec, kbps) => {
+  const short = codecShort(codec);
+  return kbps > 0 ? `${short} ${Math.round(kbps / 16) * 16} kbps` : short;
+};
 
 export class Catalog {
   constructor(file) {
@@ -100,6 +122,12 @@ export class Catalog {
       ytChannel: row.yt_channel, thumbUrl: row.thumb_url, tags: parse(row.tags_json, []),
       categories: parse(row.categories_json, []), msgId: row.tg_msg_id, size: row.tg_size,
       mime: row.mime, codec: row.codec, bitrateKbps: row.bitrate_kbps,
+      sourceKind: row.source_kind,
+      quality: {
+        label: row.quality_label, codec: row.codec, bitrateKbps: row.bitrate_kbps,
+        sampleRate: row.sample_rate, channels: row.channels, formatId: row.format_id,
+        container: row.container,
+      },
       sourceServer: row.source_server, createdAt: row.created_at, storedAt: row.stored_at,
       plays: row.plays, lastPlayedAt: row.last_played_at, error: row.error,
       meta: parse(row.meta_json, {}),
@@ -108,6 +136,12 @@ export class Catalog {
 
   lookup(videoId) {
     return this.#song(this.#sql("SELECT * FROM songs WHERE video_id=?").get(videoId));
+  }
+
+  // Stored songs with no source kind yet, oldest first.
+  missingMeta(limit = 20) {
+    return this.#sql(`SELECT video_id FROM songs WHERE status='stored' AND source_kind IS NULL
+      ORDER BY stored_at, rowid LIMIT ?`).all(limit).map((r) => r.video_id);
   }
 
   // Jobs whose lease ran out go back to the queue.
@@ -147,6 +181,7 @@ export class Catalog {
   }
 
   stored(videoId, info = {}, now = Date.now()) {
+    const q = info.quality ?? {};
     return this.#tx(() => {
       this.#ensureSong(videoId, now);
       // COALESCE keeps existing values where info has none.
@@ -158,13 +193,17 @@ export class Catalog {
         categories_json=COALESCE(?,categories_json), tg_msg_id=COALESCE(?,tg_msg_id),
         tg_size=COALESCE(?,tg_size), mime=COALESCE(?,mime), codec=COALESCE(?,codec),
         bitrate_kbps=COALESCE(?,bitrate_kbps), source_server=COALESCE(?,source_server),
-        meta_json=COALESCE(?,meta_json)
+        meta_json=COALESCE(?,meta_json), source_kind=COALESCE(?,source_kind),
+        quality_label=COALESCE(?,quality_label), sample_rate=COALESCE(?,sample_rate),
+        channels=COALESCE(?,channels), format_id=COALESCE(?,format_id), container=COALESCE(?,container)
         WHERE video_id=?`).run(
         now, info.title ?? null, info.artist ?? null, json(info.artists), info.album ?? null,
         info.year ?? null, info.durationS ?? null, info.isrc ?? null, info.ytChannelId ?? null,
         info.ytChannel ?? null, info.thumbUrl ?? null, json(info.tags), json(info.categories),
-        info.msgId ?? null, info.size ?? null, info.mime ?? null, info.codec ?? null,
-        info.bitrateKbps ?? null, info.server ?? null, json(info.meta), videoId);
+        info.msgId ?? null, info.size ?? null, info.mime ?? null, q.codecRaw ?? info.codec ?? null,
+        q.bitrateKbps ?? info.bitrateKbps ?? null, info.server ?? null, json(info.meta),
+        info.sourceKind ?? null, q.label ?? null, q.sampleRate ?? null, q.channels ?? null,
+        q.formatId ?? null, q.container ?? null, videoId);
       this.#sql(`UPDATE jobs SET state='done', lease_until=NULL, error=NULL, updated_at=? WHERE video_id=?`)
         .run(now, videoId);
       return this.lookup(videoId);
@@ -301,6 +340,26 @@ export class Catalog {
       AND stored_at>=? AND stored_at<=? AND source_server IS NOT NULL GROUP BY s`, dayStart, now)) row(r.s).stored = r.n;
     for (const r of q(`SELECT server s, COUNT(*) n FROM plays WHERE at>=? AND at<=?
       AND server IS NOT NULL GROUP BY s`, dayStart, now)) row(r.s).plays = r.n;
+    // Stored songs per source kind (all time, like totals); unrecognised -> unknown.
+    const byKind = kindCounts();
+    for (const r of q(`SELECT source_kind k, COUNT(*) n FROM songs WHERE status='stored' GROUP BY k`)) {
+      byKind[Object.hasOwn(byKind, r.k) ? r.k : "unknown"] += r.n;
+    }
+    // Stored songs grouped by codec + bitrate, collapsed to a short label.
+    const qual = new Map();
+    for (const r of q(`SELECT codec, bitrate_kbps kbps, COUNT(*) n FROM songs WHERE status='stored'
+      GROUP BY codec, bitrate_kbps`)) {
+      const label = qualityLabel(r.codec, r.kbps);
+      qual.set(label, (qual.get(label) ?? 0) + r.n);
+    }
+    const byQuality = [...qual].map(([label, count]) => ({ label, count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+    // Plays in range by the song's source kind.
+    const kindPlays = kindCounts();
+    for (const r of q(`SELECT s.source_kind k, COUNT(*) n FROM plays p
+      LEFT JOIN songs s ON s.video_id=p.video_id WHERE p.at>=? AND p.at<=? GROUP BY k`, dayStart, now)) {
+      kindPlays[Object.hasOwn(kindPlays, r.k) ? r.k : "unknown"] += r.n;
+    }
     const jq = (s) => this.#sql("SELECT COUNT(*) n FROM jobs WHERE state=?").get(s).n;
     return {
       totals: {
@@ -310,16 +369,23 @@ export class Catalog {
       byDay,
       byServer: [...srv.values()].sort((a, b) => b.plays - a.plays || a.server.localeCompare(b.server)),
       sources,
+      byKind,
+      byQuality,
+      kindPlays,
       queue: { queued: jq("queued"), running: jq("running"), failed: jq("failed") },
       recent: q(`SELECT * FROM songs WHERE status='stored' ORDER BY stored_at DESC, rowid DESC LIMIT 20`)
         .map((r) => ({
           videoId: r.video_id, title: r.title, artist: r.artist, durationS: r.duration_s,
           size: r.tg_size, storedAt: r.stored_at, server: r.source_server, plays: r.plays,
+          sourceKind: r.source_kind ?? null, quality: r.quality_label ?? null,
         })),
-      top: q(`SELECT p.video_id, s.title, s.artist, COUNT(*) n FROM plays p
+      top: q(`SELECT p.video_id, s.title, s.artist, s.source_kind, COUNT(*) n FROM plays p
         LEFT JOIN songs s ON s.video_id=p.video_id WHERE p.at>=? AND p.at<=?
         GROUP BY p.video_id ORDER BY n DESC, p.video_id LIMIT 20`, dayStart, now)
-        .map((r) => ({ videoId: r.video_id, title: r.title, artist: r.artist, plays: r.n })),
+        .map((r) => ({
+          videoId: r.video_id, title: r.title, artist: r.artist, plays: r.n,
+          sourceKind: r.source_kind ?? null,
+        })),
       failedJobs: q(`SELECT j.*, s.title FROM jobs j LEFT JOIN songs s ON s.video_id=j.video_id
         WHERE j.state='failed' OR (j.state='queued' AND j.attempts>0)
         ORDER BY j.updated_at DESC, j.rowid DESC LIMIT 30`).map((r) => ({

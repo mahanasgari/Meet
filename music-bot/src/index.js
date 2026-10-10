@@ -33,7 +33,7 @@ import { Monitor, parseServices, slug } from "./monitor.js";
 import { TelegramBot, escHtml } from "./telegram_bot.js";
 import { updateYtdlp } from "./ytdlp_update.js";
 import { dailyReport, weeklyReport } from "./reports.js";
-import { Archive, HomeLink, handleHomeRoute } from "./archive.js";
+import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
@@ -542,6 +542,48 @@ if (catalog) {
   };
   setTimeout(snapshot, 15 * 60_000).unref();
   setInterval(snapshot, 6 * 3600_000).unref();
+
+  // Songs archived before type/quality were recorded: read their metadata
+  // again (no download) and refresh the catalog and the channel caption.
+  const metaOnly = (id) =>
+    new Promise((resolve) => {
+      const c = spawn(YTDLP_BIN, ["-J", "--skip-download", "--no-playlist", "--no-warnings", "-f", "bestaudio[ext=m4a]/bestaudio", ...ytdlpNetArgs(), ...ytdlpCookieArgs(), `https://www.youtube.com/watch?v=${id}`], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      let out = "";
+      const t = setTimeout(() => killChild(c), 60_000);
+      c.stdout.on("data", (d) => (out += d));
+      c.on("error", () => resolve(null));
+      c.on("close", () => {
+        clearTimeout(t);
+        try {
+          resolve(JSON.parse(out));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+  let backfilling = false;
+  const backfill = async () => {
+    if (backfilling || archive?.cooling() || !catalog.missingMeta) return;
+    backfilling = true;
+    try {
+      for (const id of catalog.missingMeta(10)) {
+        const j = await metaOnly(id);
+        if (!j) continue;
+        const info = songInfoFromYtdlp(j);
+        const song = catalog.stored(id, info);
+        if (song?.msgId && archive?.tg.ready) {
+          await archive.tg.editCaption(song.msgId, songCaption(id, { ...info, ...song, quality: info.quality, sourceKind: info.sourceKind })).catch((e) => console.error("[archive] caption:", e.message));
+        }
+        await new Promise((r) => setTimeout(r, 15_000));
+      }
+    } finally {
+      backfilling = false;
+    }
+  };
+  setTimeout(() => void backfill(), 3 * 60_000).unref();
+  setInterval(() => void backfill(), 30 * 60_000).unref();
 }
 
 let dashboardHtml = null;
@@ -3345,6 +3387,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (archive && (await archive.handleAudio(req, res, pageUrl, url.searchParams.get("q") || ""))) return;
+      res.setHeader("X-MP-Source", "youtube"); // not archived (or archiving elsewhere)
       pipeExtractorAudio(
         pageUrl,
         req,

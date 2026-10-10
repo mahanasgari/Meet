@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { Catalog } from "../src/catalog.js";
 
@@ -211,7 +212,7 @@ test("stats shape, zero-filled days, top, byServer", () => {
   assert.equal(s.recent[0].videoId, "a");
   assert.equal(s.recent.length, 3);
   assert.equal(s.recent[0].plays, 3);
-  assert.deepEqual(s.top[0], { videoId: "a", title: "A", artist: "X", plays: 2 });
+  assert.deepEqual(s.top[0], { videoId: "a", title: "A", artist: "X", plays: 2, sourceKind: null });
   assert.deepEqual(s.failedJobs, []);
   c.close();
 });
@@ -225,6 +226,154 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "1");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "2");
   d.close();
+});
+
+test("v1 database upgrades in place to v2 and keeps old rows", () => {
+  const file = tmp();
+  mkdirSync(dirname(file), { recursive: true });
+  const raw = new DatabaseSync(file);
+  raw.exec(`
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+    INSERT INTO meta(key,value) VALUES('schema_version','1');
+    CREATE TABLE songs (
+      video_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK (status IN ('pending','stored','failed','unavailable')),
+      title TEXT, artist TEXT, artists_json TEXT, album TEXT, year INTEGER,
+      duration_s REAL, isrc TEXT, yt_channel_id TEXT, yt_channel TEXT,
+      thumb_url TEXT, tags_json TEXT, categories_json TEXT,
+      tg_msg_id INTEGER, tg_size INTEGER, mime TEXT, codec TEXT, bitrate_kbps REAL,
+      source_server TEXT, created_at INTEGER, stored_at INTEGER,
+      plays INTEGER NOT NULL DEFAULT 0, last_played_at INTEGER,
+      error TEXT, meta_json TEXT
+    );
+    CREATE INDEX songs_status ON songs(status);
+    CREATE INDEX songs_stored_at ON songs(stored_at);
+    CREATE TABLE jobs (
+      video_id TEXT PRIMARY KEY REFERENCES songs(video_id),
+      state TEXT NOT NULL CHECK (state IN ('queued','running','done','failed')),
+      server TEXT, lease_until INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+      next_at INTEGER NOT NULL DEFAULT 0, excluded_json TEXT NOT NULL DEFAULT '[]',
+      reason TEXT, error TEXT, created_at INTEGER, updated_at INTEGER
+    );
+    CREATE INDEX jobs_state_next ON jobs(state, next_at);
+    CREATE TABLE related (
+      video_id TEXT NOT NULL, related_id TEXT NOT NULL, kind TEXT NOT NULL,
+      rank INTEGER, PRIMARY KEY (video_id, related_id, kind)
+    );
+    CREATE TABLE plays (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      video_id TEXT NOT NULL, at INTEGER NOT NULL, server TEXT, source TEXT, uid TEXT
+    );
+    CREATE INDEX plays_at ON plays(at);
+    CREATE INDEX plays_video ON plays(video_id);
+    INSERT INTO songs(video_id,status,title,codec,bitrate_kbps,tg_size,created_at,stored_at)
+      VALUES('old','stored','Old Song','opus',128,77,${NOW},${NOW});
+  `);
+  raw.close();
+
+  const c = new Catalog(file);
+  const cols = c.db.prepare("PRAGMA table_info(songs)").all().map((r) => r.name);
+  for (const n of ["source_kind", "quality_label", "sample_rate", "channels", "format_id", "container"]) {
+    assert.ok(cols.includes(n), `missing column ${n}`);
+  }
+  assert.ok(c.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='songs_source_kind'").get());
+  const s = c.lookup("old");
+  assert.equal(s.title, "Old Song");
+  assert.equal(s.codec, "opus");
+  assert.equal(s.bitrateKbps, 128);
+  assert.equal(s.size, 77);
+  assert.equal(s.sourceKind, null);
+  assert.equal(s.quality.label, null);
+  assert.deepEqual(c.missingMeta(), ["old"]);
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "2");
+  c.close();
+});
+
+test("stored round-trips sourceKind and quality; COALESCE keeps old quality", () => {
+  const c = open();
+  const s = c.stored("q", {
+    sourceKind: "ytm_track", codec: "ignored", bitrateKbps: 1,
+    quality: {
+      codec: "mp4a.40.2", codecRaw: "mp4a.40.2", bitrateKbps: 131.4, sampleRate: 44100,
+      channels: 2, formatId: "140", container: "m4a", label: "AAC 128 kbps",
+    },
+  }, NOW);
+  assert.equal(s.sourceKind, "ytm_track");
+  assert.equal(s.codec, "mp4a.40.2");
+  assert.equal(s.bitrateKbps, 131.4);
+  assert.deepEqual(s.quality, {
+    label: "AAC 128 kbps", codec: "mp4a.40.2", bitrateKbps: 131.4, sampleRate: 44100,
+    channels: 2, formatId: "140", container: "m4a",
+  });
+
+  c.stored("q", { title: "Later" }, NOW + 1);
+  let u = c.lookup("q");
+  assert.equal(u.title, "Later");
+  assert.equal(u.sourceKind, "ytm_track");
+  assert.equal(u.quality.label, "AAC 128 kbps");
+  assert.equal(u.quality.formatId, "140");
+  assert.equal(u.codec, "mp4a.40.2");
+
+  c.stored("q", { quality: { label: "AAC 160 kbps" } }, NOW + 2);
+  u = c.lookup("q");
+  assert.equal(u.quality.label, "AAC 160 kbps");
+  assert.equal(u.quality.sampleRate, 44100);
+  assert.equal(u.quality.container, "m4a");
+  assert.equal(u.codec, "mp4a.40.2");
+  assert.equal(u.sourceKind, "ytm_track");
+  c.close();
+});
+
+test("missingMeta: stored songs without source kind, oldest first", () => {
+  const c = open();
+  c.stored("m1", { title: "1" }, NOW);
+  c.stored("m2", { sourceKind: "youtube" }, NOW + 2);
+  c.stored("m3", {}, NOW + 1);
+  c.enqueue(["u"], "prefetch", NOW);
+  assert.deepEqual(c.missingMeta(), ["m1", "m3"]);
+  assert.deepEqual(c.missingMeta(1), ["m1"]);
+  c.stored("m1", { sourceKind: "ytm_track" }, NOW + 3);
+  assert.deepEqual(c.missingMeta(), ["m3"]);
+  c.close();
+});
+
+test("stats: byKind, byQuality, kindPlays, recent and top kinds", () => {
+  const c = open();
+  c.stored("a", {
+    sourceKind: "ytm_track", title: "A", artist: "X",
+    quality: { codecRaw: "mp4a.40.2", bitrateKbps: 130, label: "AAC 128 kbps" },
+  }, NOW);
+  c.stored("b", { sourceKind: "youtube", title: "B", codec: "opus", bitrateKbps: 125.7 }, NOW - DAY);
+  c.stored("c", { codec: "mp4a.40.5", bitrateKbps: 61 }, NOW - DAY);
+  c.stored("d", { sourceKind: "ytm_track", codec: "mp4a.40.2" }, NOW - 2 * DAY);
+  c.stored("e", { sourceKind: "ytm_video", codec: "mp4a.40.2", bitrateKbps: 130 }, NOW - 30 * DAY);
+  c.claim("p", "s1", NOW);
+  c.recordPlays([
+    { videoId: "a", at: NOW, source: "disk" },
+    { videoId: "a", at: NOW, source: "telegram" },
+    { videoId: "b", at: NOW - 2 * DAY, source: "youtube" },
+    { videoId: "c", at: NOW - DAY, source: "peer" },
+    { videoId: "zz", at: NOW, source: "youtube" },
+    { videoId: "e", at: NOW - 20 * DAY, source: "disk" },
+  ]);
+
+  const s = c.stats(7, NOW);
+  assert.deepEqual(s.byKind, { ytm_track: 2, ytm_video: 1, youtube: 1, unknown: 1 });
+  assert.deepEqual(s.byQuality, [
+    { label: "AAC 128 kbps", count: 2 },
+    { label: "AAC", count: 1 },
+    { label: "HE-AAC 64 kbps", count: 1 },
+    { label: "Opus 128 kbps", count: 1 },
+  ]);
+  assert.deepEqual(s.kindPlays, { ytm_track: 2, ytm_video: 0, youtube: 1, unknown: 2 });
+
+  const byId = Object.fromEntries(s.recent.map((r) => [r.videoId, r]));
+  assert.equal(byId.a.sourceKind, "ytm_track");
+  assert.equal(byId.a.quality, "AAC 128 kbps");
+  assert.equal(byId.c.sourceKind, null);
+  assert.equal(byId.c.quality, null);
+  assert.deepEqual(s.top[0], { videoId: "a", title: "A", artist: "X", plays: 2, sourceKind: "ytm_track" });
+  c.close();
 });

@@ -163,6 +163,13 @@ export class TgStore {
     return this._bigInt(n);
   }
 
+  /** Replaces an archived message's caption (e.g. to add quality details). */
+  async editCaption(msgId, caption) {
+    await this.connect();
+    await this._client.editMessage(this._peer, { message: Number(msgId), text: String(caption).slice(0, 1024) });
+    this._msgs.delete(Number(msgId));
+  }
+
   async open(msgId) {
     let msg = await this._getMsg(msgId);
     const doc = msg.media?.document || msg.document;

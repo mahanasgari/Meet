@@ -76,7 +76,7 @@ export class TgStore {
   connect() {
     if (this._ready) return Promise.resolve();
     if (this._connecting) return this._connecting;
-    if (this._lastFailAt !== null && this.now() - this._lastFailAt < CONNECT_RETRY_GAP_MS) {
+    if (this._lastFailAt !== null && this.now() - this._lastFailAt < (this._retryGapMs || CONNECT_RETRY_GAP_MS)) {
       return Promise.reject(new Error(`telegram unavailable, retrying soon (${this._lastFailMsg})`));
     }
     const p = this._doConnect().then(
@@ -84,6 +84,10 @@ export class TgStore {
       (e) => {
         this._lastFailAt = this.now();
         this._lastFailMsg = errText(e).slice(0, 120);
+        // Telegram asks bots to back off after too many logins (FLOOD_WAIT):
+        // wait as long as it says, or every retry extends the ban.
+        const wait = Number(e?.seconds) || Number(/FLOOD_WAIT_(\d+)/.exec(errText(e))?.[1]) || (/FLOOD/i.test(errText(e)) ? 600 : 0);
+        this._retryGapMs = Math.max(CONNECT_RETRY_GAP_MS, wait * 1000 + 5000);
         this._connecting = null;
         this._ready = false;
         throw new Error(`telegram connect failed: ${this._lastFailMsg}`);

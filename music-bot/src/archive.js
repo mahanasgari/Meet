@@ -354,7 +354,12 @@ export class Archive {
   }
 
   async uploadTick() {
-    if (this.uploading || !this.tg.ready) return;
+    if (!this.tg.ready) {
+      // Reconnect after a failed start (the store spaces out the attempts).
+      this.tg.connect().catch(() => undefined);
+      return;
+    }
+    if (this.uploading) return;
     let files = [];
     try {
       files = readdirSync(this.queueDir).filter((f) => f.endsWith(".json"));

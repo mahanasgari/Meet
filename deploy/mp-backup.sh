@@ -70,7 +70,7 @@ done
 # as we read it", which is fine for a nightly copy; only 2+ is a real error.
 rc=0
 tar -czf "$ARCH" --warning=no-file-changed --warning=no-file-removed \
-  --exclude='./app/files' --exclude='./art' --exclude='./lyrics' --exclude='*.tmp' \
+  --exclude='./app/files' --exclude='./archive' --exclude='./catalog/catalog.db-*' --exclude='./art' --exclude='./lyrics' --exclude='*.tmp' \
   --transform='s,^\.,shares,' \
   -C "$MP_BACKUP_VOLUME_DIR" . \
   -C "$STAGE" extra || rc=$?

@@ -33,6 +33,10 @@ import { Monitor, parseServices, slug } from "./monitor.js";
 import { TelegramBot, escHtml } from "./telegram_bot.js";
 import { updateYtdlp } from "./ytdlp_update.js";
 import { dailyReport, weeklyReport } from "./reports.js";
+import { Archive, HomeLink, handleHomeRoute } from "./archive.js";
+import { Catalog } from "./catalog.js";
+import { DiskCache } from "./disk_cache.js";
+import { TgStore } from "./tg_store.js";
 import {
   InviteStore,
   RateLimiter,
@@ -253,6 +257,7 @@ function serverStats() {
     },
     metrics: metrics.snapshot(),
     usage: usage.data,
+    archive: typeof archive !== "undefined" && archive ? archive.localStats() : null,
   };
 }
 
@@ -474,6 +479,71 @@ tgBot?.startReports({
   weekly: async () => weeklyReport(weeklyReportCtx()),
 });
 
+// --- Song archive (Telegram channel + catalog on the home server).
+const ARCHIVE_ON =
+  process.env.ARCHIVE !== "0" &&
+  Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_STORE_BOT_TOKEN && process.env.TG_STORE_CHANNEL);
+const catalog = ARCHIVE_ON && !HOME_URL ? new Catalog(joinPath(SHARES, "catalog", "catalog.db")) : null;
+/** Healthy music servers for peer hand-offs, best first (home only). */
+function healthyPeers() {
+  if (!monitor) return [];
+  return [...monitor.state.values()]
+    .filter((s) => (s.role === "worker" || s.role === "home") && !s.down && s.ok && s.raw?.metrics?.yt?.[0]?.ok !== false)
+    .filter((s) => !s.raw?.archive?.cooling)
+    .sort((a, b) => (a.ms ?? 9e9) - (b.ms ?? 9e9))
+    .map((s) => ({ id: s.id, url: s.url }));
+}
+const archive = ARCHIVE_ON
+  ? new Archive({
+      serverId: process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home"),
+      home: new HomeLink({ catalog, homeUrl: HOME_URL, token: MUSIC_API_TOKEN, peers: healthyPeers }),
+      tg: new TgStore({
+        apiId: Number(process.env.TG_API_ID),
+        apiHash: process.env.TG_API_HASH,
+        botToken: process.env.TG_STORE_BOT_TOKEN,
+        channelId: Number(process.env.TG_STORE_CHANNEL),
+        sessionFile: joinPath(SHARES, "archive", "tg.session"),
+      }),
+      cache: new DiskCache(joinPath(SHARES, "archive", "cache"), {
+        maxBytes: (Number(process.env.ARCHIVE_CACHE_GB) || 3) * 1024 ** 3,
+      }),
+      dir: joinPath(SHARES, "archive"),
+      token: MUSIC_API_TOKEN,
+      ytdlpBin: YTDLP_BIN,
+      ffmpegBin: FFMPEG_BIN,
+      ytdlpArgs: () => [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+      jobsPerHour: Number(process.env.ARCHIVE_JOBS_PER_HOUR) || 20,
+    })
+  : null;
+archive?.start();
+
+if (catalog) {
+  // Grow the archive from what friends already listen to (opt-in sync).
+  const seed = () => {
+    try {
+      const ids = listeningStats(joinPath(SHARES, "users"), 30).topSongs.map((t) => t.id).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id));
+      const n = catalog.enqueue(ids, "prefetch");
+      if (n) console.log(`[archive] queued ${n} songs from listening history`);
+    } catch (e) {
+      console.error("[archive] seed:", e.message);
+    }
+  };
+  setTimeout(seed, 10 * 60_000).unref();
+  setInterval(seed, 6 * 3600_000).unref();
+  // A consistent copy for the nightly backup (the live file is in WAL mode).
+  const snapshot = () => {
+    try {
+      const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
+      rmSync(out, { force: true });
+      catalog.db.exec(`VACUUM INTO '${out.replace(/'/g, "''")}'`);
+    } catch (e) {
+      console.error("[archive] snapshot:", e.message);
+    }
+  };
+  setTimeout(snapshot, 15 * 60_000).unref();
+  setInterval(snapshot, 6 * 3600_000).unref();
+}
+
 let dashboardHtml = null;
 function dashboardPage() {
   if (!dashboardHtml || process.env.DASHBOARD_DEV) {
@@ -518,6 +588,7 @@ function dashboardData(days) {
       uptime24h: up24[s.id] ?? null,
       uptime7d: up7[s.id] ?? null,
       stats: s.raw?.server || null,
+      archive: s.raw?.archive || null,
       yt: yt[0] || null,
     };
   });
@@ -561,6 +632,7 @@ function dashboardData(days) {
     feedback,
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
     backup: backupStatus(),
+    archive: catalog ? catalog.stats(days) : null,
   };
   dataCache.set(days, { at: Date.now(), data });
   return data;
@@ -2639,6 +2711,32 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- Song archive: what the other servers ask the home server.
+    if (req.method === "POST" && url.pathname.startsWith("/archive/")) {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!catalog) {
+        sendJson(res, 404, { error: "no_archive" });
+        return;
+      }
+      const body = await readBody(req, 200_000).catch(() => ({}));
+      const out = await handleHomeRoute(url.pathname, body, { catalog, peers: healthyPeers });
+      sendJson(res, out ? 200 : 404, out || { error: "not_found" });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/admin/api/archive-retry") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const body = await readBody(req, 2_000).catch(() => ({}));
+      dataCache.clear();
+      sendJson(res, 200, { ok: Boolean(catalog?.retry(String(body.id || ""))) });
+      return;
+    }
+
     // --- Admin dashboard (page is public; its data needs the server secret).
     if (req.method === "GET" && (url.pathname === "/admin" || url.pathname === "/admin/")) {
       if (url.pathname === "/admin") {
@@ -3246,6 +3344,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: "invalid_url" });
         return;
       }
+      if (archive && (await archive.handleAudio(req, res, pageUrl, url.searchParams.get("q") || ""))) return;
       pipeExtractorAudio(
         pageUrl,
         req,

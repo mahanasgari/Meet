@@ -208,7 +208,7 @@ var state = {
 };
 var PAGES = [
   ["overview", "Overview"], ["servers", "Servers"], ["users", "Users"], ["listening", "Listening"],
-  ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["alerts", "Alerts"]
+  ["archive", "Archive"], ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["alerts", "Alerts"]
 ];
 var charts = [], tables = {};
 
@@ -734,6 +734,112 @@ function pageListening() {
   return h + '<div class="note">From the opt-in listening sync; no personal ids. Skip rate = skips / (plays + skips).</div>';
 }
 
+/* ========================= archive ========================= */
+function mss(s) { if (!isNum(s)) return "–"; s = Math.round(s); return Math.floor(s / 60) + ":" + pad2(s % 60); }
+function mbF(b) { return isNum(b) ? fmt1(b / 1e6, 1) + " MB" : "–"; }
+function relMs(ms) { return isNum(ms) ? rel(new Date(ms).toISOString()) : "–"; }
+function untilMs(ms) {
+  if (!isNum(ms)) return "–";
+  var s = (ms - Date.now()) / 1000;
+  if (s <= 0) return "now";
+  if (s < 60) return "in <1 min";
+  if (s < 3600) return "in " + Math.floor(s / 60) + " min";
+  if (s < 86400) return "in " + Math.floor(s / 3600) + " h";
+  return "in " + Math.floor(s / 86400) + " d";
+}
+function hhmm(iso) { var d = new Date(iso); return isNaN(d) ? "" : pad2(d.getHours()) + ":" + pad2(d.getMinutes()); }
+function ytLink(id, text) {
+  if (!id) return esc(text || "–");
+  return '<a href="https://music.youtube.com/watch?v=' + encodeURIComponent(id) + '" target="_blank" rel="noopener">' + esc(text || id) + "</a>";
+}
+function archStatus(a) {
+  var cool = a.cooling ? new Date(a.cooling).getTime() : 0;
+  if (cool && cool > Date.now()) return '<span class="badge warn">Blocked &mdash; handing off until ' + esc(hhmm(a.cooling)) + "</span>";
+  return a.ready ? '<span class="badge good">Ready</span>' : '<span class="badge bad">Telegram not connected</span>';
+}
+function archCnt(s, k) { var a = s.archive || {}; return (a.counters && a.counters[k]) || 0; }
+function pageArchive() {
+  var d = D(), A = d.archive;
+  if (!A || !A.totals) return card("Archive", empty("Archive not set up yet"));
+  var T = A.totals || {}, src = A.sources || {}, q = A.queue || {}, byDay = arr(A.byDay);
+  var keys = dayKeys(state.days), m = byKey(byDay, "day");
+  var offYt = (src.disk || 0) + (src.telegram || 0), playsAll = offYt + (src.youtube || 0);
+  var srvs = arr(d.servers).filter(function (s) { return s && s.archive; });
+  var peerAny = sum(byDay, function (x) { return x.plays && x.plays.peer; }) > 0;
+  var srcDefs = [["disk", "Disk cache", COL[2]], ["telegram", "Telegram", COL[1]], ["youtube", "YouTube", COL[0]]];
+  if (peerAny) srcDefs.push(["peer", "Handed to another server", COL[3]]);
+  var playsOf = function (k, key) { return m[k] && m[k].plays ? m[k].plays[key] || 0 : 0; };
+
+  var h = '<div class="grid kpis">';
+  h += kpi("Songs archived", fmt(T.stored), fmt(T.pending || 0) + " pending · " + fmt(T.unavailable || 0) + " unavailable");
+  h += kpi("Archive size", bytes(T.bytes), isNum(T.durationS) ? fmt1(T.durationS / 3600, 1) + " h of audio" : "");
+  h += kpi("Served without YouTube", pct(offYt, playsAll), fmt(offYt) + " of " + fmt(playsAll) + " plays");
+  h += kpi("Queue", fmt((q.queued || 0) + (q.running || 0)), fmt(q.failed || 0) + " failed", q.failed ? "warn" : "");
+  h += "</div>";
+
+  h += '<div class="grid cols2">' + card("Plays by source per day", arr(byDay).length ? chart(function (w) {
+    return barChart(w, { labels: keys.map(dayLabel), series: srcDefs.map(function (s) {
+      return { name: s[1], color: s[2], values: keys.map(function (k) { return playsOf(k, s[0]); }) };
+    }) });
+  }) + legend(srcDefs.map(function (s) { return [s[1], s[2]]; })) : empty());
+  h += card("Songs archived per day", arr(byDay).length ? chart(function (w) {
+    return lineChart(w, { area: true, labels: keys.map(dayLabel), series: [{ name: "Archived", color: COL[2], values: keys.map(function (k) { return m[k] ? m[k].stored : 0; }) }] });
+  }) : empty()) + "</div>";
+
+  h += '<div style="height:12px"></div>' + card("Servers", table("arc-srv", [
+    { k: "label", label: "Server", v: function (s) { return (s.label || s.id || "").toLowerCase(); }, h: function (s) { return "<b>" + esc(s.label || s.id) + "</b>"; } },
+    { k: "status", label: "Status", h: function (s) { return archStatus(s.archive); } },
+    { k: "cache", label: "Cache", r: 1, v: function (s) { return (s.archive.cache && s.archive.cache.bytes) || 0; }, h: function (s) {
+      var c = s.archive.cache || {};
+      return fmt(c.files) + " files · " + bytes(c.bytes) + " / " + bytes(c.maxBytes);
+    } },
+    { k: "uq", label: "Upload queue", r: 1, v: function (s) { return s.archive.uploadQueue || 0; }, h: function (s) { return fmt(s.archive.uploadQueue || 0); } },
+    { k: "dl", label: "Downloads", r: 1, v: function (s) { return archCnt(s, "downloads"); }, h: function (s) {
+      var n = s.archive.downloading || 0;
+      return fmt(archCnt(s, "downloads")) + (n ? ' <span class="muted">(' + fmt(n) + " now)</span>" : "");
+    } },
+    { k: "ul", label: "Uploads", r: 1, v: function (s) { return archCnt(s, "uploads"); }, h: function (s) { return fmt(archCnt(s, "uploads")); } },
+    { k: "ue", label: "Upload errors", r: 1, v: function (s) { return archCnt(s, "uploadErrors"); }, h: function (s) {
+      var n = archCnt(s, "uploadErrors");
+      return n ? '<span class="bad">' + fmt(n) + "</span>" : fmt(n);
+    } },
+    { k: "bl", label: "Blocked", r: 1, v: function (s) { return archCnt(s, "blocked"); }, h: function (s) { return fmt(archCnt(s, "blocked")); } }
+  ], srvs, { sort: { k: "label", dir: "asc" }, empty: "No server reports archive status yet" }));
+
+  h += '<div style="height:12px"></div>' + card("Recently archived", table("arc-recent", [
+    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title); } },
+    { k: "artist", label: "Artist", v: function (r) { return (r.artist || "").toLowerCase(); }, h: function (r) { return esc(r.artist || "–"); } },
+    { k: "dur", label: "Length", r: 1, v: function (r) { return r.durationS || 0; }, h: function (r) { return mss(r.durationS); } },
+    { k: "size", label: "Size", r: 1, v: function (r) { return r.size || 0; }, h: function (r) { return mbF(r.size); } },
+    { k: "srv", label: "Server", v: function (r) { return r.server || ""; }, h: function (r) { return esc(r.server || "–"); } },
+    { k: "at", label: "Archived", v: function (r) { return r.storedAt || 0; }, h: function (r) {
+      return '<span title="' + esc(isNum(r.storedAt) ? fullTime(new Date(r.storedAt).toISOString()) : "") + '">' + esc(relMs(r.storedAt)) + "</span>";
+    } },
+    { k: "plays", label: "Plays", r: 1, v: function (r) { return r.plays || 0; }, h: function (r) { return fmt(r.plays); } }
+  ], arr(A.recent), { sort: { k: "at", dir: "desc" }, empty: "Nothing archived yet" }));
+
+  h += '<div style="height:12px"></div>' + card("Most played (range)", table("arc-top", [
+    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title); } },
+    { k: "artist", label: "Artist", v: function (r) { return (r.artist || "").toLowerCase(); }, h: function (r) { return esc(r.artist || "–"); } },
+    { k: "plays", label: "Plays", r: 1, v: function (r) { return r.plays || 0; }, h: function (r) { return fmt(r.plays); } }
+  ], arr(A.top), { sort: { k: "plays", dir: "desc" }, limit: 25, empty: "No plays in this range" }));
+
+  h += '<div style="height:12px"></div>' + card("Needs attention", table("arc-failed", [
+    { k: "title", label: "Song", v: function (j) { return (j.title || j.videoId || "").toLowerCase(); }, h: function (j) { return ytLink(j.videoId, j.title); } },
+    { k: "state", label: "State", h: function (j) { return '<span class="badge bad">' + esc(j.state || "failed") + "</span>"; } },
+    { k: "att", label: "Attempts", r: 1, v: function (j) { return j.attempts || 0; }, h: function (j) { return fmt(j.attempts); } },
+    { k: "err", label: "Error", h: function (j) {
+      var key = "arc|" + j.videoId;
+      return '<span class="errd ' + (state.errOpen[key] ? "open" : "") + '" data-act="errexp" data-key="' + esc(key) + '">' + esc(j.error || "") + "</span>";
+    } },
+    { k: "next", label: "Next try", v: function (j) { return j.nextAt || 0; }, h: function (j) { return esc(untilMs(j.nextAt)); } },
+    { k: "block", label: "Blocked on", h: function (j) { return esc(arr(j.excluded).join(", ") || "–"); } },
+    { k: "act", label: "", h: function (j) { return '<button class="btn sm" data-act="archiveretry" data-id="' + esc(j.videoId) + '">Retry</button>'; } }
+  ], arr(A.failedJobs), { sort: { k: "next", dir: "asc" }, empty: "Nothing failing" }));
+
+  return h + '<div class="note">Songs are stored once in the private Telegram channel; servers keep popular ones on disk.</div>';
+}
+
 function pageTraffic() {
   var T = D().traffic || {}, byDay = arr(T.byDay);
   if (!byDay.length && !arr(T.hourly).length && !arr(T.byRoute).length) return card("Traffic", empty());
@@ -866,6 +972,8 @@ function handleAct(a) {
     }).catch(function (e) { if (state.token) toast(e.message.indexOf("404") >= 0 ? "No bot on the server" : "Failed: " + e.message); });
   } else if (act === "alerttest") {
     api("api/alert-test", { body: {} }).then(function (r) { toast(r && r.sent ? "Test alert sent to Telegram" : "Recorded (Telegram not set up)"); load(); }).catch(function (e) { if (state.token) toast("Failed: " + e.message); });
+  } else if (act === "archiveretry") {
+    api("api/archive-retry", { body: { id: a.getAttribute("data-id") } }).then(function () { toast("Queued for retry"); load(); }).catch(function (e) { if (state.token) toast("Failed: " + e.message); });
   } else if (act === "errsrv") {
     state.errSrv = a.getAttribute("data-s");
     var cs = $("errChips"); if (cs) { var sv = []; arr(D().errors).forEach(function (e) { if (e.server && sv.indexOf(e.server) < 0) sv.push(e.server); }); cs.innerHTML = errChips(sv); }
@@ -884,7 +992,7 @@ document.addEventListener("keydown", function (e) {
 });
 
 /* ========================= router & render ========================= */
-var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, alerts: pageAlerts };
+var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, archive: pageArchive, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, alerts: pageAlerts };
 function route() {
   var p = (location.hash || "").replace("#", "");
   state.page = RENDER[p] ? p : "overview";

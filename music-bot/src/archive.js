@@ -1,0 +1,550 @@
+// Song archive: every song someone plays is downloaded once (by whichever
+// server the listener uses), uploaded to a private Telegram channel and
+// recorded in the home server's catalog. Later plays — by anyone, on any
+// server — come from the local disk cache or the channel instead of YouTube.
+// A server YouTube is blocking hands its listeners to a healthy peer.
+import { spawn } from "node:child_process";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { join } from "node:path";
+import { parseRange, serveFile } from "./disk_cache.js";
+
+const ARCHIVE_FORMAT = "bestaudio[ext=m4a]/bestaudio";
+const COOL_MS = 20 * 60_000;
+const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
+const UNAVAILABLE_RE = /video unavailable|private video|has been removed|is not available|copyright|members-only|age-restricted/i;
+
+/** YouTube / YouTube Music page URL → 11-char video id, or null. */
+export function videoIdFromUrl(pageUrl) {
+  let u;
+  try {
+    u = new URL(pageUrl);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.replace(/^(www|m|music)\./i, "");
+  let id = null;
+  if (host === "youtube.com") id = u.pathname === "/watch" ? u.searchParams.get("v") : (/^\/(shorts|embed|live)\/([^/]+)/.exec(u.pathname) || [])[2];
+  else if (host === "youtu.be") id = u.pathname.slice(1).split("/")[0];
+  return /^[A-Za-z0-9_-]{11}$/.test(id || "") ? id : null;
+}
+
+/** The fields worth keeping from yt-dlp's info JSON (catalog + future recommendations). */
+export function songInfoFromYtdlp(j) {
+  if (!j || typeof j !== "object") return {};
+  const clean = (s) => (typeof s === "string" ? s.replace(/\s+-\s+Topic$/i, "").trim() : undefined);
+  const artists = Array.isArray(j.artists) && j.artists.length ? j.artists : j.artist ? String(j.artist).split(/,\s*/) : [];
+  const artist = artists[0] || clean(j.creator) || clean(j.channel) || clean(j.uploader);
+  const year = j.release_year || (j.upload_date ? Number(String(j.upload_date).slice(0, 4)) : undefined);
+  return {
+    title: j.track || j.title,
+    artist,
+    artists: artists.length ? artists : artist ? [artist] : [],
+    album: j.album,
+    year: Number.isFinite(year) ? year : undefined,
+    durationS: j.duration,
+    isrc: j.isrc,
+    ytChannelId: j.channel_id,
+    ytChannel: clean(j.channel || j.uploader),
+    thumbUrl: j.thumbnail,
+    tags: Array.isArray(j.tags) ? j.tags.slice(0, 40) : [],
+    categories: Array.isArray(j.categories) ? j.categories : [],
+    codec: j.acodec,
+    bitrateKbps: j.abr,
+    meta: {
+      videoTitle: j.title,
+      ext: j.ext,
+      formatId: j.format_id,
+      uploadDate: j.upload_date,
+      views: j.view_count,
+      likes: j.like_count,
+      description: typeof j.description === "string" ? j.description.slice(0, 600) : undefined,
+    },
+  };
+}
+
+/** Talks to the catalog: directly on the home server, over HTTP elsewhere. */
+export class HomeLink {
+  constructor({ catalog = null, homeUrl = "", token = "", peers = () => [] }) {
+    this.catalog = catalog;
+    this.homeUrl = homeUrl.replace(/\/+$/, "");
+    this.token = token;
+    this.localPeers = peers;
+  }
+
+  async post(path, body, timeoutMs = 5000) {
+    const r = await fetch(`${this.homeUrl}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!r.ok) throw new Error(`home ${path}: HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async lookup(id) {
+    if (this.catalog) return this.catalog.lookup(id);
+    return (await this.post("/archive/lookup", { id }, 4000)).song || null;
+  }
+  claim(id, server) {
+    return this.catalog ? this.catalog.claim(id, server) : this.post("/archive/claim", { id, server }, 4000);
+  }
+  stored(id, info) {
+    return this.catalog ? this.catalog.stored(id, info) : this.post("/archive/stored", { id, info }, 15000);
+  }
+  failed(id, server, error, flags) {
+    return this.catalog ? this.catalog.failed(id, server, error, flags) : this.post("/archive/failed", { id, server, error, flags });
+  }
+  async nextJobs(server, limit) {
+    if (this.catalog) return this.catalog.nextJobs(server, limit);
+    return (await this.post("/archive/jobs", { server, limit })).ids || [];
+  }
+  plays(events) {
+    return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
+  }
+  async peers() {
+    if (this.catalog) return this.localPeers();
+    return (await this.post("/archive/peers", {}, 5000)).peers || [];
+  }
+}
+
+export class Archive {
+  /**
+   * @param {object} o
+   * @param {string} o.serverId      this server's id (matches the monitor's ids)
+   * @param {HomeLink} o.home
+   * @param {import("./tg_store.js").TgStore} o.tg
+   * @param {import("./disk_cache.js").DiskCache} o.cache
+   * @param {string} o.dir           upload queue folder
+   * @param {string} o.token         master token (for peer hops)
+   * @param {string} o.ytdlpBin
+   * @param {() => string[]} o.ytdlpArgs  network/cookie args shared with playback
+   * @param {number} [o.jobsPerHour] background downloads per hour on this server
+   */
+  constructor(o) {
+    Object.assign(this, o);
+    this.jobsPerHour ??= 20;
+    this.queueDir = join(o.dir, "uploads");
+    mkdirSync(this.queueDir, { recursive: true });
+    this.coolUntil = 0;
+    this.events = [];
+    this.inflight = new Set(); // video ids downloading here
+    this.jobTimes = [];
+    this.peerCache = { at: 0, list: [] };
+    this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0 };
+    this.log = o.log || console;
+  }
+
+  start() {
+    this.tg.connect().catch((e) => this.log.error("[archive] telegram connect:", e.message));
+    setInterval(() => void this.flushPlays(), 30_000).unref();
+    setInterval(() => void this.uploadTick(), 5_000).unref();
+    setInterval(() => void this.jobTick(), 60_000).unref();
+  }
+
+  cooling() {
+    return Date.now() < this.coolUntil;
+  }
+
+  play(id, source, req) {
+    this.counters[source] = (this.counters[source] || 0) + 1;
+    this.events.push({ videoId: id, at: Date.now(), server: this.serverId, source, uid: req?.mpUser || null });
+    if (this.events.length > 5000) this.events.splice(0, this.events.length - 5000);
+  }
+
+  async flushPlays() {
+    if (!this.events.length) return;
+    const batch = this.events.splice(0, 500);
+    try {
+      await this.home.plays(batch);
+    } catch {
+      this.events.unshift(...batch); // try again next time
+    }
+  }
+
+  /**
+   * Handles /audio for a YouTube URL. Returns false when the caller should
+   * stream from YouTube the old way (not YouTube, home unreachable, or another
+   * server is already archiving this song).
+   */
+  async handleAudio(req, res, pageUrl, quality) {
+    const id = videoIdFromUrl(pageUrl);
+    if (!id) return false;
+    const hop = req.headers["x-mp-hop"] === "1";
+
+    if (this.cache.has(id)) {
+      this.cache.touch(id);
+      serveFile(req, res, this.cache.path(id), { mime: "audio/mp4" });
+      this.play(id, "disk", req);
+      return true;
+    }
+
+    // Blocked here: archived songs still come from the channel; anything
+    // else goes to a healthy server (which archives it too).
+    if (this.cooling() && !hop) {
+      const song = await this.home.lookup(id).catch(() => null);
+      if (song?.status === "stored" && song.msgId && (await this.serveFromTelegram(req, res, id, song))) {
+        this.play(id, "telegram", req);
+        return true;
+      }
+      if (await this.proxyToPeer(req, res, pageUrl, quality)) return true;
+    }
+
+    let c = null;
+    try {
+      c = await this.home.claim(id, this.serverId);
+    } catch (e) {
+      this.log.error("[archive] claim:", e.message);
+    }
+    if (c?.action === "stored" && c.song?.msgId) {
+      if (await this.serveFromTelegram(req, res, id, c.song)) {
+        this.play(id, "telegram", req);
+        return true;
+      }
+    }
+    if (c?.action === "download" && !this.inflight.has(id)) {
+      this.download(id, pageUrl, { req, res });
+      return true;
+    }
+    this.play(id, "youtube", req);
+    return false;
+  }
+
+  /** Streams an archived song from the channel (Range-aware), filling the disk cache. */
+  async serveFromTelegram(req, res, id, song) {
+    let f;
+    try {
+      if (!this.tg.ready) await this.tg.connect();
+      f = await this.tg.open(song.msgId);
+    } catch (e) {
+      this.log.error("[archive] telegram open:", e.message);
+      return false;
+    }
+    const range = parseRange(req.headers.range, f.size);
+    if (range === "unsatisfiable") {
+      res.writeHead(416, { "Content-Range": `bytes */${f.size}` });
+      res.end();
+      return true;
+    }
+    const start = range ? range.start : 0;
+    const end = range ? range.end : f.size - 1;
+    const whole = start === 0 && end === f.size - 1;
+    res.writeHead(range ? 206 : 200, {
+      "Content-Type": f.mime || "audio/mp4",
+      "Content-Length": end - start + 1,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store",
+      ...(range ? { "Content-Range": `bytes ${start}-${end}/${f.size}` } : {}),
+    });
+    if (req.method === "HEAD") {
+      res.end();
+      return true;
+    }
+    // A full read also fills the disk cache, even if the listener leaves.
+    const tmp = whole ? this.cache.tmpPath(id) : null;
+    const file = tmp ? createWriteStream(tmp) : null;
+    let gone = false;
+    req.on("close", () => (gone = true));
+    try {
+      for await (const chunk of f.read(start, end - start + 1)) {
+        if (file) file.write(chunk);
+        if (!gone && !res.write(chunk)) await Promise.race([once(res, "drain"), once(res, "close")]);
+        if (gone && !file) break;
+      }
+      if (file) {
+        file.end();
+        await once(file, "finish");
+        if (statSync(tmp).size === f.size) this.cache.commit(tmp, id);
+        else this.cache.discard(tmp);
+      }
+      res.end();
+    } catch (e) {
+      this.log.error("[archive] telegram read:", e.message);
+      if (file) {
+        file.destroy();
+        this.cache.discard(tmp);
+      }
+      res.destroy();
+    }
+    return true;
+  }
+
+  /**
+   * Downloads [id] from YouTube to the cache (one request), streaming it to
+   * the listener when there is one, then queues the upload. The download
+   * finishes even if the listener skips.
+   */
+  download(id, pageUrl, { req = null, res = null } = {}) {
+    this.inflight.add(id);
+    const tmp = this.cache.tmpPath(id);
+    const metaFile = `${tmp}.json`;
+    const child = spawn(
+      this.ytdlpBin,
+      ["-f", ARCHIVE_FORMAT, "--no-playlist", "--no-warnings", "--print-to-file", "%()j", metaFile, ...this.ytdlpArgs(), "-o", "-", pageUrl],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const file = createWriteStream(tmp);
+    let stderr = "";
+    let sent = false;
+    let gone = !res;
+    req?.on("close", () => (gone = true));
+    const timer = setTimeout(() => child.kill("SIGKILL"), 10 * 60_000);
+    child.stderr.on("data", (d) => (stderr = (stderr + d).slice(-4000)));
+    child.stdout.on("data", (chunk) => {
+      file.write(chunk);
+      if (gone) return;
+      if (!sent) {
+        sent = true;
+        this.play(id, "youtube", req); // counted once bytes flow (a blocked try isn't a play)
+        res.writeHead(200, { "Content-Type": "application/octet-stream", "Cache-Control": "no-store", "Accept-Ranges": "none" });
+      }
+      res.write(chunk);
+    });
+    const done = new Promise((resolve) => {
+      child.on("error", (e) => {
+        stderr += String(e?.message || e);
+        resolve(-1);
+      });
+      child.on("close", (code) => resolve(code));
+    });
+    return done.then(async (code) => {
+      clearTimeout(timer);
+      file.end();
+      await once(file, "finish").catch(() => undefined);
+      if (sent && !gone) res.end();
+      const size = existsSync(tmp) ? statSync(tmp).size : 0;
+      let info = {};
+      try {
+        info = songInfoFromYtdlp(JSON.parse(readFileSync(metaFile, "utf8")));
+      } catch {
+        // no metadata
+      }
+      rmSync(metaFile, { force: true });
+      this.inflight.delete(id);
+      if (code === 0 && size > 50_000) {
+        this.cache.commit(tmp, id);
+        this.counters.downloads++;
+        this.queueUpload(id, info);
+        return true;
+      }
+      this.cache.discard(tmp);
+      const last = stderr.trim().split("\n").pop() || `yt-dlp exit ${code}`;
+      const blocked = BLOCKED_RE.test(stderr);
+      const unavailable = !blocked && UNAVAILABLE_RE.test(stderr);
+      if (blocked) {
+        this.coolUntil = Date.now() + COOL_MS;
+        this.counters.blocked++;
+        this.log.error(`[archive] YouTube is blocking ${this.serverId}; peers take over for 20 min`);
+      }
+      await Promise.resolve(this.home.failed(id, this.serverId, last.slice(0, 200), { blocked, unavailable })).catch(() => undefined);
+      if (res && !sent && !gone) {
+        const hopped = blocked && req.headers["x-mp-hop"] !== "1" && (await this.proxyToPeer(req, res, pageUrl, ""));
+        if (!hopped && !res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: last.slice(0, 200) }));
+        }
+      }
+      return false;
+    });
+  }
+
+  queueUpload(id, info) {
+    writeFileSync(join(this.queueDir, `${id}.json`), JSON.stringify({ id, info, tries: 0, nextAt: 0 }));
+  }
+
+  async uploadTick() {
+    if (this.uploading || !this.tg.ready) return;
+    let files = [];
+    try {
+      files = readdirSync(this.queueDir).filter((f) => f.endsWith(".json"));
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    for (const f of files) {
+      const p = join(this.queueDir, f);
+      let job;
+      try {
+        job = JSON.parse(readFileSync(p, "utf8"));
+      } catch {
+        rmSync(p, { force: true });
+        continue;
+      }
+      if (job.nextAt > now) continue;
+      this.uploading = true;
+      try {
+        await this.upload(job);
+        rmSync(p, { force: true });
+        this.counters.uploads++;
+      } catch (e) {
+        this.counters.uploadErrors++;
+        job.tries++;
+        job.nextAt = now + Math.min(6 * 3600_000, 60_000 * 2 ** job.tries);
+        this.log.error(`[archive] upload ${job.id} failed (${job.tries}):`, e.message);
+        if (job.tries >= 8 || e.message === "evicted") {
+          rmSync(p, { force: true });
+          await Promise.resolve(this.home.failed(job.id, this.serverId, `upload: ${e.message}`)).catch(() => undefined);
+        } else {
+          writeFileSync(p, JSON.stringify(job));
+        }
+      } finally {
+        this.uploading = false;
+      }
+      return; // one per tick; the store spaces uploads out anyway
+    }
+  }
+
+  async upload({ id, info }) {
+    if (!this.cache.has(id)) throw new Error("evicted");
+    const path = this.cache.path(id);
+    const thumb = await this.thumbnail(id, info.thumbUrl).catch(() => null);
+    const title = info.title || id;
+    const artist = info.artist || "";
+    try {
+      const r = await this.tg.uploadAudio(path, {
+        title,
+        artist,
+        durationS: info.durationS,
+        thumbPath: thumb,
+        caption: `${title}${artist ? ` — ${artist}` : ""}\nyoutu.be/${id}`,
+      });
+      await this.home.stored(id, { ...info, msgId: r.msgId, size: r.size, mime: r.mime, server: this.serverId });
+    } finally {
+      if (thumb) rmSync(thumb, { force: true });
+    }
+  }
+
+  /** Square 320 px JPEG cover for the Telegram message (best effort). */
+  async thumbnail(id, url) {
+    const src = url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+    const r = await fetch(src, { signal: AbortSignal.timeout(15_000) });
+    if (!r.ok) return null;
+    const raw = join(this.queueDir, `.${id}.src`);
+    const out = join(this.queueDir, `.${id}.jpg`);
+    writeFileSync(raw, Buffer.from(await r.arrayBuffer()));
+    const code = await new Promise((resolve) => {
+      const c = spawn(this.ffmpegBin || "ffmpeg", ["-loglevel", "error", "-y", "-i", raw, "-vf", "scale=320:320:force_original_aspect_ratio=increase,crop=320:320", "-q:v", "4", out], { stdio: "ignore" });
+      c.on("error", () => resolve(-1));
+      c.on("close", resolve);
+    });
+    rmSync(raw, { force: true });
+    return code === 0 && existsSync(out) ? out : null;
+  }
+
+  /** Background archiving: jobs the home server hands out (retries, prefetch). */
+  async jobTick() {
+    if (this.jobRunning || this.cooling() || !this.tg.ready) return;
+    const hourAgo = Date.now() - 3600_000;
+    this.jobTimes = this.jobTimes.filter((t) => t > hourAgo);
+    if (this.jobTimes.length >= this.jobsPerHour) return;
+    let ids = [];
+    try {
+      ids = await this.home.nextJobs(this.serverId, 1);
+    } catch {
+      return;
+    }
+    const id = ids[0];
+    if (!id || this.inflight.has(id) || this.cache.has(id)) return;
+    this.jobRunning = true;
+    this.jobTimes.push(Date.now());
+    try {
+      await this.download(id, `https://www.youtube.com/watch?v=${id}`);
+    } finally {
+      this.jobRunning = false;
+    }
+  }
+
+  /** Healthy peers, best first (from the home server's monitor). */
+  async peerList() {
+    if (Date.now() - this.peerCache.at < 120_000) return this.peerCache.list;
+    try {
+      const list = (await this.home.peers()).filter((p) => p.id !== this.serverId);
+      this.peerCache = { at: Date.now(), list };
+    } catch {
+      // keep the old list
+    }
+    return this.peerCache.list;
+  }
+
+  /** Streams /audio from a peer (which archives the song itself). */
+  async proxyToPeer(req, res, pageUrl, quality) {
+    for (const peer of (await this.peerList()).slice(0, 2)) {
+      try {
+        const u = `${peer.url}/audio?url=${encodeURIComponent(pageUrl)}${quality ? `&q=${encodeURIComponent(quality)}` : ""}`;
+        const ac = new AbortController();
+        req.on("close", () => ac.abort());
+        const r = await fetch(u, {
+          headers: { Authorization: `Bearer ${this.token}`, "X-MP-Hop": "1", ...(req.headers.range ? { Range: req.headers.range } : {}) },
+          signal: ac.signal,
+        });
+        if (!r.ok && r.status !== 206) {
+          await r.body?.cancel().catch(() => undefined);
+          continue;
+        }
+        const h = { "Cache-Control": "no-store" };
+        for (const k of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+          const v = r.headers.get(k);
+          if (v) h[k] = v;
+        }
+        res.writeHead(r.status, h);
+        this.counters.peer++;
+        for await (const chunk of r.body) {
+          if (!res.write(chunk)) await Promise.race([once(res, "drain"), once(res, "close")]);
+          if (res.destroyed) break;
+        }
+        res.end();
+        return true;
+      } catch (e) {
+        if (res.headersSent) {
+          res.destroy();
+          return true;
+        }
+        this.log.error(`[archive] peer ${peer.id}:`, e.message);
+      }
+    }
+    return false;
+  }
+
+  /** For /admin/stats. */
+  localStats() {
+    let queued = 0;
+    try {
+      queued = readdirSync(this.queueDir).filter((f) => f.endsWith(".json")).length;
+    } catch {
+      // none
+    }
+    return {
+      ready: this.tg.ready,
+      cooling: this.cooling() ? new Date(this.coolUntil).toISOString() : null,
+      cache: this.cache.stats(),
+      uploadQueue: queued,
+      downloading: this.inflight.size,
+      counters: this.counters,
+    };
+  }
+}
+
+/** Home-server routes the other servers call (master token checked by the caller). */
+export async function handleHomeRoute(path, body, { catalog, peers }) {
+  switch (path) {
+    case "/archive/lookup":
+      return { song: catalog.lookup(String(body.id)) };
+    case "/archive/claim":
+      return catalog.claim(String(body.id), String(body.server || "?"));
+    case "/archive/stored":
+      return { ok: true, song: catalog.stored(String(body.id), body.info || {}) };
+    case "/archive/failed":
+      catalog.failed(String(body.id), String(body.server || "?"), String(body.error || ""), body.flags || {});
+      return { ok: true };
+    case "/archive/jobs":
+      return { ids: catalog.nextJobs(String(body.server || "?"), Math.max(1, Math.min(Number(body.limit) || 1, 5))) };
+    case "/archive/plays":
+      catalog.recordPlays(Array.isArray(body.events) ? body.events.slice(0, 1000) : []);
+      return { ok: true };
+    case "/archive/peers":
+      return { peers: peers() };
+    default:
+      return null;
+  }
+}

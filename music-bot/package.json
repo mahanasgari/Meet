@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "@livekit/rtc-node": "^1.0.0",
-    "livekit-server-sdk": "^2.19.0"
+    "big-integer": "^1.6.52",
+    "livekit-server-sdk": "^2.19.0",
+    "telegram": "^2.26.22"
   }
 }

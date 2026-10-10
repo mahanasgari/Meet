@@ -95,6 +95,10 @@ services:
       # yt-dlp through Cloudflare WARP, e.g. socks5h://host.docker.internal:14000
       # (deploy/yt-guard.sh rotates the address when YouTube flags it).
       YTDLP_PROXY: ${YTDLP_PROXY:-}
+      # Admin bot + alerts (home server); MONITOR_SERVICES="Meet=https://host/api/health".
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      MONITOR_SERVICES: ${MONITOR_SERVICES:-}
       # Shared secret for MiniPlayer + Meet app search proxy.
       MUSIC_API_TOKEN: ${MUSIC_API_TOKEN:-}
     volumes:

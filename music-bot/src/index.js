@@ -29,7 +29,8 @@ import { clipParams, makeClip } from "./clip.js";
 import { renderDownloadPage } from "./download_page.js";
 import { Metrics, routeKey } from "./metrics.js";
 import { appStats, listeningStats, trafficStats, userStats } from "./analytics.js";
-import { Monitor, parseServices, slug, telegramNotifier } from "./monitor.js";
+import { Monitor, parseServices, slug } from "./monitor.js";
+import { TelegramBot, escHtml } from "./telegram_bot.js";
 import {
   InviteStore,
   RateLimiter,
@@ -234,14 +235,16 @@ function serverStats() {
 
 // The home server (no HOME_URL) watches all servers listed in servers.json.
 const PUBLIC_URL = (process.env.PUBLIC_URL || "https://music.cloudproducts.ir/extractor").replace(/\/+$/, "");
-const notifyTelegram = telegramNotifier(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID);
+/** @type {TelegramBot | null} set below on the home server */
+let tgBot = null;
+const notifyTelegram = (text) => (tgBot ? tgBot.notify(text) : Promise.resolve(false));
 const monitor =
   !HOME_URL && MUSIC_API_TOKEN && process.env.MONITOR !== "0"
     ? new Monitor({
         dir: joinPath(SHARES, "monitor"),
         token: MUSIC_API_TOKEN,
         localStats: serverStats,
-        notify: notifyTelegram || undefined,
+        notify: notifyTelegram,
         targets: () => {
           let list = [];
           try {
@@ -260,6 +263,92 @@ const monitor =
       })
     : null;
 monitor?.start();
+
+// --- Telegram admin bot (home server only).
+const ago = (iso) => {
+  if (!iso) return "never";
+  const m = Math.round((Date.now() - Date.parse(iso)) / 60_000);
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
+};
+const tehranTime = (iso) => new Date(Date.parse(iso) + 3.5 * 3600_000).toISOString().slice(5, 16).replace("T", " ");
+const botCommands = {
+  status() {
+    const d = dashboardData(7);
+    if (!d.servers.length) return "No checks yet — give it two minutes.";
+    const lines = d.servers.map((s) => {
+      const yt = s.yt ? (s.yt.ok ? ` · YouTube ✓ ${(s.yt.ms / 1000).toFixed(1)} s` : " · YouTube ✗") : "";
+      const up = s.uptime24h != null ? ` · ${(s.uptime24h * 100).toFixed(1)}% 24h` : "";
+      return s.up
+        ? `🟢 <b>${escHtml(s.label)}</b> ${s.ms ?? "?"} ms${yt}${up}`
+        : `🔴 <b>${escHtml(s.label)}</b> down ${s.downSince ? `since ${ago(s.downSince)}` : ""} (${escHtml(s.error || "no answer")})`;
+    });
+    const upN = d.servers.filter((s) => s.up).length;
+    return `<b>Servers ${upN}/${d.servers.length} up</b>\n${lines.join("\n")}`;
+  },
+  today() {
+    const d = dashboardData(7);
+    const last = (a) => (a && a.length ? a[a.length - 1] : {});
+    const u = last(d.usageByDay);
+    const l = last(d.listening.days);
+    const t = last(d.traffic.byDay);
+    const errPct = t.n ? ((t.err / t.n) * 100).toFixed(1) : "0";
+    return [
+      "<b>Today</b> (UTC day)",
+      `👥 Active friends: <b>${u.active ?? 0}</b> of ${d.users.length}`,
+      `🎵 Plays: <b>${l.plays ?? 0}</b> · skips ${l.skips ?? 0} · ${l.listeners ?? 0} listeners`,
+      `⏱ Listening: <b>${Math.round((l.minutes ?? 0) / 6) / 10} h</b>`,
+      `📡 Requests: <b>${t.n ?? 0}</b> · errors ${errPct}%${t.audioMs ? ` · songs start in ${(t.audioMs / 1000).toFixed(1)} s` : ""}`,
+      "",
+      `<b>Last 7 days</b>: ${d.listening.totals.plays} plays, ${Math.round(d.listening.totals.minutes / 60)} h, ${d.listening.totals.songs} songs`,
+    ].join("\n");
+  },
+  users() {
+    const d = dashboardData(7);
+    if (!d.users.length) return "No invites yet. /invite Name";
+    const rows = [...d.users]
+      .sort((a, b) => String(b.lastSeen || "").localeCompare(String(a.lastSeen || "")))
+      .map((u) => {
+        const icon = u.disabled ? "⛔" : !u.redeemed ? "⚪" : u.today ? "🟢" : "🔵";
+        return `${icon} <b>${escHtml(u.name)}</b> — ${ago(u.lastSeen)} · ${u.today} today · <code>${escHtml(u.code)}</code>`;
+      });
+    return `<b>Friends</b> (🟢 active today · 🔵 not today · ⚪ never used · ⛔ blocked)\n${rows.join("\n")}`;
+  },
+  alerts() {
+    const list = monitor ? monitor.alerts.slice(0, 10) : [];
+    if (!list.length) return "No alerts yet. All quiet. ✨";
+    const icon = { down: "🔴", up: "🟢", warn: "🟠", info: "ℹ️" };
+    return `<b>Latest alerts</b>\n${list.map((a) => `${icon[a.level] || ""} ${tehranTime(a.at)} — ${escHtml(a.text)}`).join("\n")}`;
+  },
+  feedback() {
+    const f = dashboardData(7).feedback.slice(0, 3);
+    if (!f.length) return "No feedback yet.";
+    return f
+      .map((e) => `💬 <b>${escHtml(e.from)}</b> · ${ago(e.at)} · ${escHtml(e.platform || "")} ${escHtml(e.version || "")}\n${escHtml(String(e.text).slice(0, 700))}`)
+      .join("\n\n");
+  },
+  invite(arg) {
+    const name = arg.trim().slice(0, 60);
+    if (!name) return "Send it with a name: <code>/invite Ali</code>";
+    const e = invites.create(name);
+    dataCache.clear();
+    return [
+      `✅ Invite for <b>${escHtml(e.name)}</b>: <code>${e.code}</code>`,
+      "",
+      "Forward this to them:",
+      `<code>MiniPlayer — download: ${PUBLIC_URL}/app/\nYour invite code: ${e.code}</code>`,
+    ].join("\n");
+  },
+};
+if (monitor && process.env.TELEGRAM_BOT_TOKEN) {
+  tgBot = new TelegramBot({
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    dir: joinPath(SHARES, "monitor"),
+    dashboardUrl: `${PUBLIC_URL}/admin/`,
+    commands: botCommands,
+    chatIds: String(process.env.TELEGRAM_CHAT_ID || "").split(",").map((x) => x.trim()).filter(Boolean),
+  });
+  tgBot.start();
+}
 
 let dashboardHtml = null;
 function dashboardPage() {
@@ -337,7 +426,7 @@ function dashboardData(days) {
   const data = {
     generatedAt: new Date().toISOString(),
     days,
-    telegram: { configured: Boolean(notifyTelegram) },
+    telegram: { configured: Boolean(tgBot?.linked), bot: tgBot ? tgBot.username : null },
     servers,
     history: monitor ? monitor.history(7) : {},
     ytHistory,
@@ -2465,8 +2554,20 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
-      const sent = monitor ? await monitor.alert("info", null, "Test alert from the dashboard") : false;
+      const sent = monitor ? await monitor.alert("info", null, "Test alert from the dashboard ✅") : false;
       sendJson(res, 200, { ok: true, sent: Boolean(sent) });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/admin/api/telegram-link") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!tgBot) {
+        sendJson(res, 404, { error: "no_bot" });
+        return;
+      }
+      sendJson(res, 200, { url: tgBot.linkUrl() });
       return;
     }
     if (req.method === "GET" && url.pathname === "/admin/feedback/log") {

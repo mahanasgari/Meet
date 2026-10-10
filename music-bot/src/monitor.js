@@ -227,17 +227,3 @@ export class Monitor {
     return Object.fromEntries(Object.entries(acc).map(([id, [u, n]]) => [id, n ? u / n : null]));
   }
 }
-
-/** Telegram sender, or null when not configured. */
-export function telegramNotifier(botToken, chatId) {
-  if (!botToken || !chatId) return null;
-  return async (text) => {
-    const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    return r.ok;
-  };
-}

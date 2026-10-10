@@ -799,8 +799,8 @@ function alertsTable(rows, id) {
   ], rows, { sort: { k: "at", dir: "desc" }, empty: "No alerts yet" });
 }
 function pageAlerts() {
-  var on = D().telegram && D().telegram.configured;
-  return '<div class="card" style="margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="dot ' + (on ? "up" : "") + '"></span><span style="flex:1 1 200px">Telegram alerts: <b>' + (on ? "on" : "off") + "</b>" + (on ? "" : ' <span class="muted">&mdash; ask the admin to add a bot</span>') + '</span><button class="btn" data-act="alerttest">Send test alert</button></div>' + card("Alert history", alertsTable(arr(D().alerts), "alerts"));
+  var tg = D().telegram || {}, on = tg.configured;
+  return '<div class="card" style="margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="dot ' + (on ? "up" : "") + '"></span><span style="flex:1 1 200px">Telegram alerts: <b>' + (on ? "on" : "off") + "</b>" + (on ? ' <span class="muted">&mdash; @' + esc(tg.bot || "miniplayer_robot") + '</span>' : ' <span class="muted">&mdash; connect your Telegram to get alerts</span>') + '</span><button class="btn' + (on ? "" : " primary") + '" data-act="tglink">' + (on ? "Connect another chat" : "Connect Telegram") + '</button><button class="btn" data-act="alerttest">Send test alert</button></div>' + card("Alert history", alertsTable(arr(D().alerts), "alerts"));
 }
 
 /* ========================= actions ========================= */
@@ -831,7 +831,11 @@ function handleAct(a) {
     modal("<h3>Feedback log</h3><pre id=\"logPre\">Loading...</pre><div class=\"row\"><button class=\"btn\" data-act=\"copylog\">Copy</button><button class=\"btn primary\" data-act=\"close\">Close</button></div>");
     api("feedback/log?file=" + encodeURIComponent(file), { text: true }).then(function (t) { var p = $("logPre"); if (p) p.textContent = t || "(empty)"; }).catch(function (e) { var p = $("logPre"); if (p) p.textContent = "Failed: " + e.message; });
   } else if (act === "copylog") { var pr = $("logPre"); if (pr) copyText(pr.textContent); }
-  else if (act === "alerttest") {
+  else if (act === "tglink") {
+    api("api/telegram-link", { body: {} }).then(function (r) {
+      if (r && r.url) { window.open(r.url, "_blank", "noopener"); toast("Press Start in Telegram to connect"); }
+    }).catch(function (e) { if (state.token) toast(e.message.indexOf("404") >= 0 ? "No bot on the server" : "Failed: " + e.message); });
+  } else if (act === "alerttest") {
     api("api/alert-test", { body: {} }).then(function (r) { toast(r && r.sent ? "Test alert sent to Telegram" : "Recorded (Telegram not set up)"); load(); }).catch(function (e) { if (state.token) toast("Failed: " + e.message); });
   } else if (act === "errsrv") {
     state.errSrv = a.getAttribute("data-s");

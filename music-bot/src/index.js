@@ -521,7 +521,7 @@ if (catalog) {
   // Grow the archive from what friends already listen to (opt-in sync).
   const seed = () => {
     try {
-      const ids = listeningStats(joinPath(SHARES, "users"), 30).topSongs.map((t) => t.id).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id));
+      const ids = listeningStats(joinPath(SHARES, "users"), 30).topSongs.map((t) => String(t.id).replace(/^yt_/, "")).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id));
       const n = catalog.enqueue(ids, "prefetch");
       if (n) console.log(`[archive] queued ${n} songs from listening history`);
     } catch (e) {

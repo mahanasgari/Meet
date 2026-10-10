@@ -72,7 +72,13 @@ const MUSIC_API_TOKEN = process.env.MUSIC_API_TOKEN || "";
  * whose own IP YouTube asks to sign in). */
 const YTDLP_PROXY = process.env.YTDLP_PROXY || "";
 function ytdlpNetArgs() {
-  return YTDLP_PROXY ? ["--proxy", YTDLP_PROXY] : [];
+  // Node (already in the image) as yt-dlp's JavaScript runtime: without one
+  // YouTube serves fewer formats and flags the server as a bot more often.
+  return [
+    "--js-runtimes",
+    "node",
+    ...(YTDLP_PROXY ? ["--proxy", YTDLP_PROXY] : []),
+  ];
 }
 
 function ytdlpCookieArgs() {

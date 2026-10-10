@@ -268,6 +268,9 @@ export class Archive {
         return true;
       }
     }
+    // Another server is archiving it right now and has (or will soon have)
+    // the file on disk: ask that server instead of YouTube.
+    if (c?.action === "wait" && c.server && !hop && (await this.proxyToPeer(req, res, pageUrl, quality, c.server))) return true;
     if (c?.action === "download" && !this.inflight.has(id)) {
       this.download(id, pageUrl, { req, res });
       return true;
@@ -409,11 +412,14 @@ export class Archive {
         this.counters.blocked++;
         this.log.error(`[archive] YouTube is blocking ${this.serverId}; peers take over for 20 min`);
       }
+      this.log.error(`[archive] download ${id} failed${blocked ? " (blocked)" : unavailable ? " (unavailable)" : ""}: ${last.slice(0, 200)}`);
       await Promise.resolve(this.home.failed(id, this.serverId, last.slice(0, 200), { blocked, unavailable })).catch(() => undefined);
       if (res && !sent && !gone) {
-        const hopped = blocked && req.headers["x-mp-hop"] !== "1" && (await this.proxyToPeer(req, res, pageUrl, ""));
+        // Anything but a removed video: let a healthy server try right away.
+        const hopped = !unavailable && req.headers["x-mp-hop"] !== "1" && (await this.proxyToPeer(req, res, pageUrl, ""));
         if (!hopped && !res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
+          res.mpError = last.slice(0, 200);
+          res.writeHead(502, { "Content-Type": "application/json", "X-MP-Source": `youtube:${this.serverId}:failed` });
           res.end(JSON.stringify({ error: last.slice(0, 200) }));
         }
       }
@@ -545,8 +551,9 @@ export class Archive {
   }
 
   /** Streams /audio from a peer (which archives the song itself). */
-  async proxyToPeer(req, res, pageUrl, quality) {
-    for (const peer of (await this.peerList()).slice(0, 2)) {
+  async proxyToPeer(req, res, pageUrl, quality, onlyId = null) {
+    const list = await this.peerList();
+    for (const peer of onlyId ? list.filter((p) => p.id === onlyId) : list.slice(0, 2)) {
       try {
         const u = `${peer.url}/audio?url=${encodeURIComponent(pageUrl)}${quality ? `&q=${encodeURIComponent(quality)}` : ""}`;
         const ac = new AbortController();

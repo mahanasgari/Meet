@@ -12,7 +12,11 @@ import { parseRange, serveFile } from "./disk_cache.js";
 const ARCHIVE_FORMAT = "bestaudio[ext=m4a]/bestaudio";
 const COOL_MS = 20 * 60_000;
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
-const UNAVAILABLE_RE = /video unavailable|private video|has been removed|is not available|copyright|members-only|age-restricted/i;
+// Gone for good. A bare "Video unavailable" is NOT here: YouTube also says
+// that to a server it distrusts (verified: such songs download fine from
+// another server), so that case is retried elsewhere instead.
+const UNAVAILABLE_RE = /private video|has been removed|account associated with this video has been terminated|copyright claim|members-only|no longer available because/i;
+const SERVER_REFUSED_RE = /video unavailable|this video is unavailable|not available in your country|uploader has not made this video available/i;
 
 /** YouTube / YouTube Music page URL → 11-char video id, or null. */
 export function videoIdFromUrl(pageUrl) {
@@ -407,13 +411,15 @@ export class Archive {
       const last = stderr.trim().split("\n").pop() || `yt-dlp exit ${code}`;
       const blocked = BLOCKED_RE.test(stderr);
       const unavailable = !blocked && UNAVAILABLE_RE.test(stderr);
+      // Refused on this server only: skip this server for the song, no cooldown.
+      const refusedHere = !blocked && !unavailable && SERVER_REFUSED_RE.test(stderr);
       if (blocked) {
         this.coolUntil = Date.now() + COOL_MS;
         this.counters.blocked++;
         this.log.error(`[archive] YouTube is blocking ${this.serverId}; peers take over for 20 min`);
       }
       this.log.error(`[archive] download ${id} failed${blocked ? " (blocked)" : unavailable ? " (unavailable)" : ""}: ${last.slice(0, 200)}`);
-      await Promise.resolve(this.home.failed(id, this.serverId, last.slice(0, 200), { blocked, unavailable })).catch(() => undefined);
+      await Promise.resolve(this.home.failed(id, this.serverId, last.slice(0, 200), { blocked: blocked || refusedHere, unavailable })).catch(() => undefined);
       if (res && !sent && !gone) {
         // Anything but a removed video: let a healthy server try right away.
         const hopped = !unavailable && req.headers["x-mp-hop"] !== "1" && (await this.proxyToPeer(req, res, pageUrl, ""));

@@ -17,8 +17,9 @@ import {
   statSync,
   createReadStream,
   readdirSync,
+  statfsSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpus, freemem, loadavg, tmpdir, totalmem, uptime as osUptime } from "node:os";
 import { join as joinPath } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
@@ -26,6 +27,9 @@ import { buildWeeklyChart } from "./charts.js";
 import { audioFormat } from "./quality.js";
 import { clipParams, makeClip } from "./clip.js";
 import { renderDownloadPage } from "./download_page.js";
+import { Metrics, routeKey } from "./metrics.js";
+import { appStats, listeningStats, trafficStats, userStats } from "./analytics.js";
+import { Monitor, parseServices, slug, telegramNotifier } from "./monitor.js";
 import {
   InviteStore,
   RateLimiter,
@@ -155,6 +159,198 @@ refreshBlocked();
 setInterval(refreshBlocked, 5 * 60_000).unref();
 const isBlocked = (uid) =>
   remoteBlocked.has(uid) || invites.disabledUids().includes(uid);
+
+// --- Admin dashboard: metrics on every server, monitor on the home one.
+const SHARES = process.env.SHARES_DIR || "/shares";
+const metrics = new Metrics(SHARES);
+setInterval(() => metrics.save(), 60_000).unref();
+
+let ytdlpVersion = null;
+function readYtdlpVersion() {
+  const c = spawn(YTDLP_BIN, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
+  let out = "";
+  c.stdout.on("data", (d) => (out += d));
+  c.on("close", () => (ytdlpVersion = out.trim() || ytdlpVersion));
+  c.on("error", () => undefined);
+}
+readYtdlpVersion();
+setInterval(readYtdlpVersion, 6 * 3600_000).unref();
+
+// YouTube self-test: can this server still get a song? (the same yt-dlp
+// options real playback uses, on a tiny public video)
+const YT_TEST_URL = process.env.YT_TEST_URL || "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+function ytSelfTest() {
+  const t0 = Date.now();
+  const c = spawn(
+    YTDLP_BIN,
+    ["-f", "bestaudio/best", "--no-playlist", "--no-warnings", "--get-url", ...ytdlpNetArgs(), ...ytdlpCookieArgs(), YT_TEST_URL],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let out = "";
+  let err = "";
+  c.stdout.on("data", (d) => (out += d));
+  c.stderr.on("data", (d) => (err = (err + d).slice(-2000)));
+  const timer = setTimeout(() => killChild(c), 90_000);
+  c.on("error", () => undefined);
+  c.on("close", (code) => {
+    clearTimeout(timer);
+    const ok = code === 0 && out.trim().startsWith("http");
+    metrics.ytTest(ok, Date.now() - t0, ok ? "" : err.trim().split("\n").pop() || `exit ${code}`);
+  });
+}
+if (MUSIC_API_TOKEN) {
+  setTimeout(ytSelfTest, 60_000).unref();
+  setInterval(ytSelfTest, 15 * 60_000).unref();
+}
+
+const startedAt = new Date().toISOString();
+/** This server's health and metrics for the dashboard (/admin/stats). */
+function serverStats() {
+  usage.save();
+  let disk = null;
+  try {
+    const f = statfsSync(SHARES);
+    disk = { total: f.blocks * f.bsize, free: f.bavail * f.bsize };
+  } catch {
+    // unsupported
+  }
+  return {
+    server: {
+      startedAt,
+      uptimeS: Math.round(process.uptime()),
+      hostUptimeS: Math.round(osUptime()),
+      node: process.version,
+      ytdlp: ytdlpVersion,
+      mem: { rss: process.memoryUsage().rss, total: totalmem(), free: freemem() },
+      load: loadavg().map((x) => Math.round(x * 100) / 100),
+      cpus: cpus().length,
+      jamRooms: jamSessions.size,
+      disk,
+    },
+    metrics: metrics.snapshot(),
+    usage: usage.data,
+  };
+}
+
+// The home server (no HOME_URL) watches all servers listed in servers.json.
+const PUBLIC_URL = (process.env.PUBLIC_URL || "https://music.cloudproducts.ir/extractor").replace(/\/+$/, "");
+const notifyTelegram = telegramNotifier(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID);
+const monitor =
+  !HOME_URL && MUSIC_API_TOKEN && process.env.MONITOR !== "0"
+    ? new Monitor({
+        dir: joinPath(SHARES, "monitor"),
+        token: MUSIC_API_TOKEN,
+        localStats: serverStats,
+        notify: notifyTelegram || undefined,
+        targets: () => {
+          let list = [];
+          try {
+            list = JSON.parse(readFileSync(joinPath(SHARES, "app", "servers.json"), "utf8")).servers || [];
+          } catch {
+            // none
+          }
+          return [
+            { id: "home", label: "Home", url: PUBLIC_URL, role: "home" },
+            ...list
+              .filter((s) => s.url && s.url.replace(/\/+$/, "") !== PUBLIC_URL)
+              .map((s) => ({ id: slug(s.label), label: s.label, url: s.url.replace(/\/+$/, ""), role: "worker" })),
+            ...parseServices(process.env.MONITOR_SERVICES),
+          ];
+        },
+      })
+    : null;
+monitor?.start();
+
+let dashboardHtml = null;
+function dashboardPage() {
+  if (!dashboardHtml || process.env.DASHBOARD_DEV) {
+    dashboardHtml = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  }
+  return dashboardHtml;
+}
+
+const dataCache = new Map();
+/** Everything the dashboard shows, for the last [days] days. */
+function dashboardData(days) {
+  const hit = dataCache.get(days);
+  if (hit && Date.now() - hit.at < 30_000) return hit.data;
+  const state = monitor ? [...monitor.state.values()] : [];
+  const snaps = {};
+  const usages = {};
+  for (const s of state) {
+    if (s.raw?.metrics) snaps[s.id] = s.raw.metrics;
+    if (s.raw?.usage) usages[s.id] = s.raw.usage;
+  }
+  if (!snaps.home) {
+    const local = serverStats();
+    snaps.home = local.metrics;
+    usages.home = local.usage;
+  }
+  const up24 = monitor?.uptime(24) || {};
+  const up7 = monitor?.uptime(24 * 7) || {};
+  const ytHistory = {};
+  const servers = state.map((s) => {
+    const yt = s.raw?.metrics?.yt || [];
+    if (yt.length) ytHistory[s.id] = yt.slice(0, 60);
+    return {
+      id: s.id,
+      label: s.label,
+      url: s.url,
+      role: s.role,
+      up: !s.down,
+      ms: s.ms,
+      checkedAt: s.checkedAt,
+      error: s.error,
+      downSince: s.downSince,
+      uptime24h: up24[s.id] ?? null,
+      uptime7d: up7[s.id] ?? null,
+      stats: s.raw?.server || null,
+      yt: yt[0] || null,
+    };
+  });
+  let latest = null;
+  try {
+    latest = JSON.parse(readFileSync(joinPath(SHARES, "app", "latest.json"), "utf8"));
+  } catch {
+    // nothing published
+  }
+  let feedback = [];
+  try {
+    const dir = joinPath(SHARES, "feedback");
+    feedback = readdirSync(dir)
+      .filter((f) => f.endsWith(".json"))
+      .sort()
+      .reverse()
+      .slice(0, 100)
+      .map((f) => {
+        try {
+          const e = JSON.parse(readFileSync(joinPath(dir, f), "utf8"));
+          return { file: f, at: e.at, from: e.from, text: e.text, version: e.version, platform: e.platform, hasLog: Boolean(e.log) };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    // none yet
+  }
+  const data = {
+    generatedAt: new Date().toISOString(),
+    days,
+    telegram: { configured: Boolean(notifyTelegram) },
+    servers,
+    history: monitor ? monitor.history(7) : {},
+    ytHistory,
+    ...trafficStats(snaps, days),
+    ...userStats(invites.list(), usages, days),
+    listening: listeningStats(joinPath(SHARES, "users"), days),
+    app: { latest, ...appStats(snaps, days) },
+    feedback,
+    alerts: monitor ? monitor.alerts.slice(0, 200) : [],
+  };
+  dataCache.set(days, { at: Date.now(), data });
+  return data;
+}
 
 /** True for the server's own secret (admin / owner). */
 function isMasterToken(req) {
@@ -1544,6 +1740,7 @@ function readBody(req, limit = 8_192) {
 }
 
 function sendJson(res, status, body) {
+  if (status >= 500) res.mpError = body?.error;
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -1943,9 +2140,32 @@ const LYRICS_CACHE_MAX = 500;
 /** @type {Map<string, {at: number, status: number, type: string, body: string}>} */
 const lyricsCache = new Map();
 
+/** Counts every request for the dashboard (time to first byte, errors). */
+function trackRequest(req, res, url) {
+  const route = routeKey(url.pathname);
+  const ip = String(req.headers["x-real-ip"] || req.socket.remoteAddress || "");
+  if (req.method === "GET" && route === "update-check") metrics.updateCheck(ip);
+  if (req.method === "GET" && route === "app-download" && !/^bytes=[1-9]/.test(req.headers.range || "")) {
+    metrics.download(url.pathname.slice("/app/files/".length).slice(0, 120), ip);
+  }
+  const t0 = Date.now();
+  let ttfb = null;
+  const writeHead = res.writeHead;
+  res.writeHead = function (...args) {
+    ttfb ??= Date.now() - t0;
+    return writeHead.apply(this, args);
+  };
+  res.once("close", () => {
+    const status = res.headersSent ? res.statusCode : 499;
+    metrics.record(route, status, ttfb ?? Date.now() - t0);
+    if (status >= 500) metrics.error(route, status, res.mpError || "");
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
+    trackRequest(req, res, url);
 
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, {
@@ -2205,6 +2425,73 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- Admin dashboard (page is public; its data needs the server secret).
+    if (req.method === "GET" && (url.pathname === "/admin" || url.pathname === "/admin/")) {
+      if (url.pathname === "/admin") {
+        res.writeHead(301, { Location: "admin/" });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+      });
+      res.end(dashboardPage());
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/admin/stats") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      sendJson(res, 200, serverStats());
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/admin/api/data") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const days = [7, 14, 30].includes(Number(url.searchParams.get("days")))
+        ? Number(url.searchParams.get("days"))
+        : 7;
+      sendJson(res, 200, dashboardData(days));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/admin/api/alert-test") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const sent = monitor ? await monitor.alert("info", null, "Test alert from the dashboard") : false;
+      sendJson(res, 200, { ok: true, sent: Boolean(sent) });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/admin/feedback/log") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const f = url.searchParams.get("file") || "";
+      let log = null;
+      if (/^[A-Za-z0-9._-]{1,120}\.json$/.test(f)) {
+        try {
+          log = JSON.parse(readFileSync(joinPath(SHARES, "feedback", f), "utf8")).log;
+        } catch {
+          // missing
+        }
+      }
+      if (typeof log !== "string") {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(log);
+      return;
+    }
+
     // --- Invite admin (the server secret only).
     if (url.pathname.startsWith("/admin/invites")) {
       if (!isMasterToken(req)) {
@@ -2220,17 +2507,20 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === "POST" && url.pathname === "/admin/invites") {
         const body = await readBody(req, 2_000).catch(() => ({}));
+        dataCache.clear();
         sendJson(res, 200, invites.create(body.name));
         return;
       }
       if (req.method === "POST" && url.pathname === "/admin/invites/delete") {
         const body = await readBody(req, 2_000).catch(() => ({}));
+        dataCache.clear();
         const e = invites.remove(body.id);
         sendJson(res, e ? 200 : 404, e || { error: "not_found" });
         return;
       }
       if (req.method === "POST" && url.pathname === "/admin/invites/block") {
         const body = await readBody(req, 2_000).catch(() => ({}));
+        dataCache.clear();
         const e = invites.setDisabled(body.id, body.blocked !== false);
         sendJson(res, e ? 200 : 404, e || { error: "not_found" });
         return;

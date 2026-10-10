@@ -8,10 +8,15 @@ RUN apt-get update && \
       ca-certificates \
       curl \
       python3 \
+    # yt-dlp lives in a folder the app user owns, so the server can keep it
+    # up to date by itself (see src/ytdlp_update.js).
+    && mkdir -p /opt/yt-dlp \
     && curl -fsSL \
       "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
-      -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp \
+      -o /opt/yt-dlp/yt-dlp \
+    && chmod a+rx /opt/yt-dlp/yt-dlp \
+    && chown -R node:node /opt/yt-dlp \
+    && ln -s /opt/yt-dlp/yt-dlp /usr/local/bin/yt-dlp \
     && yt-dlp --version \
     && rm -rf /var/lib/apt/lists/*
 

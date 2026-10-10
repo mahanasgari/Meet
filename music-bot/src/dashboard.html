@@ -571,6 +571,8 @@ function pageOverview() {
   h += kpi("Plays", fmt(T.plays), delta(T.plays, P.plays) + " vs previous");
   h += kpi("Listening hours", isNum(T.minutes) ? fmt1(T.minutes / 60, 1) : "–", delta(T.minutes, P.minutes) + " vs previous");
   h += kpi("Requests", fmt(req), req ? pct(err, req) + " errors" : "", req && err / req > 0.05 ? "bad" : "");
+  var bk = d.backup || null, bkFresh = bk ? backupFresh(bk) : false;
+  h += kpi("Backup", !bk ? "Missing" : !bk.ok ? "Failed" : bkFresh ? "OK" : "Overdue", bk ? esc(rel(bk.at)) + " · " + esc(backupMB(bk)) : "no backup yet", bkFresh ? "good" : "bad");
   h += kpi("Latest build", latest ? esc(latest.version) + "+" + esc(latest.build) : "–", "");
   h += "</div>";
   h += '<div class="strip">' + (srv.length ? srv.map(function (s) {
@@ -600,6 +602,12 @@ function reqChart() {
   }) + legend([["OK", COL[1]], ["Errors", "var(--bad)"]]);
 }
 
+function ytdlpHtml(st) {
+  var cur = st.ytdlp || null, latest = st.ytdlpLatest || null;
+  var h = esc(cur || "–");
+  if (latest) h += cur === latest ? ' <span class="badge good" style="display:inline-block">latest</span>' : ' <span class="badge warn" style="display:inline-block">update → ' + esc(latest) + "</span>";
+  return h;
+}
 function srvCard(s, data) {
   var st = s.stats, yt = s.yt, hist = (data.history || {})[s.id], yh = arr((data.ytHistory || {})[s.id]).slice().reverse();
   var h = '<div class="card srv"><div class="head"><span class="dot ' + (s.up ? "up" : "down") + '"></span><b>' + esc(s.label || s.id) + '</b><span class="badge">' + esc(s.role || "") + '</span>';
@@ -610,7 +618,7 @@ function srvCard(s, data) {
     h += "<div><span>YouTube test</span>" + (yt ? '<span class="' + (yt.ok ? "good" : "bad") + '">' + (yt.ok ? "OK" : "Failed") + "</span> &middot; " + esc(rel(yt.at)) + " &middot; " + msF(yt.ms) : "–") + "</div>";
   }
   if (st) {
-    h += "<div><span>Server uptime</span>" + dur(st.uptimeS) + "</div><div><span>Node</span>" + esc(st.node || "–") + "</div><div><span>yt-dlp</span>" + esc(st.ytdlp || "–") + "</div><div><span>Jam rooms</span>" + fmt(st.jamRooms) + "</div>";
+    h += "<div><span>Server uptime</span>" + dur(st.uptimeS) + "</div><div><span>Node</span>" + esc(st.node || "–") + "</div><div><span>yt-dlp</span>" + ytdlpHtml(st) + "</div><div><span>Jam rooms</span>" + fmt(st.jamRooms) + "</div>";
   }
   h += "</div>";
   if (yt && !yt.ok && yt.detail) h += '<div class="bad" style="font-size:12px;word-break:break-word">' + esc(yt.detail) + "</div>";
@@ -632,10 +640,31 @@ function srvCard(s, data) {
   if (yh.length) h += '<div><div class="sub-h">YouTube tests (newest right)</div><div class="dots">' + yh.map(function (y) { return '<i class="' + (y.ok ? "" : "f") + '"' + tipAttr(fullTime(y.at) + " &middot; " + (y.ok ? "OK" : "Failed") + " &middot; " + msF(y.ms) + (y.detail ? "<br>" + esc(y.detail).slice(0, 140) : "")) + "></i>"; }).join("") + "</div></div>";
   return h + "</div>";
 }
+/* backup: fresh = ok and newer than 26 h */
+function backupFresh(b) { var t = new Date(b.at).getTime(); return !!b.ok && isFinite(t) && Date.now() - t <= 26 * 3600 * 1000; }
+function backupMB(b) { if (!isNum(b.bytes)) return "–"; return b.bytes < 1e6 ? Math.max(1, Math.round(b.bytes / 1e3)) + " KB" : fmt1(b.bytes / 1e6, 1) + " MB"; }
+function backupCard(d) {
+  var b = d.backup || null, h;
+  if (!b) {
+    h = '<div style="display:flex;align-items:center;gap:8px"><span class="dot"></span><span class="muted">No backup yet</span></div>';
+  } else {
+    var fresh = backupFresh(b), at = new Date(b.at), exact = isNaN(at) ? "" : at.toLocaleString();
+    h = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="dot ' + (fresh ? "up" : "down") + '"></span>';
+    h += '<span>Last backup: <span title="' + esc(exact) + '">' + esc(rel(b.at)) + "</span></span>";
+    if (!b.ok) h += '<span class="badge bad">Failed</span>';
+    else if (!fresh) h += '<span class="badge bad">Overdue</span>';
+    h += "</div>";
+    var parts = [backupMB(b), "<code>" + esc(b.file || "–") + "</code>"];
+    if (isNum(b.kept)) parts.push("Keeping " + fmt(b.kept) + " copies on Germany");
+    h += '<div class="muted" style="margin-top:6px;font-size:13px">' + parts.join(" &middot; ") + "</div>";
+    if (!b.ok && b.detail) h += '<div class="bad" style="font-size:12px;margin-top:6px;word-break:break-word">' + esc(b.detail) + "</div>";
+  }
+  return '<div style="margin-bottom:12px">' + card("Backup", h) + "</div>";
+}
 function pageServers() {
   var d = D(), srv = arr(d.servers);
-  if (!srv.length) return card("Servers", empty());
-  return '<div class="grid cols2">' + srv.map(function (s) { return srvCard(s, d); }).join("") + "</div>";
+  if (!srv.length) return backupCard(d) + card("Servers", empty());
+  return backupCard(d) + '<div class="grid cols2">' + srv.map(function (s) { return srvCard(s, d); }).join("") + "</div>";
 }
 
 function userStatus(u) { return u.disabled ? "Blocked" : !u.redeemed ? "Never used" : "Active"; }

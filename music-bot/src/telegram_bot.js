@@ -24,6 +24,23 @@ export function parseCommand(text) {
   return m ? { cmd: m[1].toLowerCase(), arg: (m[2] || "").trim() } : null;
 }
 
+const TEHRAN_MS = 3.5 * 3600_000;
+
+/** Which scheduled reports are due at `nowMs` (Tehran = UTC+3:30, no DST). */
+export function dueReports(nowMs, state = {}) {
+  const t = new Date(nowMs + TEHRAN_MS);
+  const tehranDate = t.toISOString().slice(0, 10);
+  const h = t.getUTCHours();
+  const fresh = state.lastDaily !== tehranDate;
+  return {
+    daily: fresh && h >= 9 && h < 12,
+    weekly: state.lastWeekly !== tehranDate && t.getUTCDay() === 5 && h >= 20,
+    tehranDate,
+    // true when a daily is past its window and should just be marked done
+    skipDaily: fresh && h >= 12,
+  };
+}
+
 export class TelegramBot {
   /**
    * @param {object} o
@@ -48,6 +65,50 @@ export class TelegramBot {
     }
     for (const id of chatIds) if (id && !this.state.chats.includes(String(id))) this.state.chats.push(String(id));
     this.username = null;
+    this.reportFns = null;
+  }
+
+  /** Schedule daily/weekly digests; each is an async () => html. */
+  startReports({ daily, weekly }) {
+    this.reportFns = { daily, weekly };
+    const tick = async () => {
+      try {
+        const due = dueReports(Date.now(), this.state);
+        if (due.skipDaily) {
+          this.state.lastDaily = due.tehranDate;
+          this.save();
+        }
+        const enabled = this.state.reports !== false && this.linked;
+        if (due.daily) {
+          this.state.lastDaily = due.tehranDate;
+          this.save();
+          if (enabled) await this.broadcast(daily);
+        }
+        if (due.weekly) {
+          this.state.lastWeekly = due.tehranDate;
+          this.save();
+          if (enabled) await this.broadcast(weekly);
+        }
+      } catch (e) {
+        console.error("[telegram] report tick failed:", e.message);
+      }
+    };
+    const timer = setInterval(tick, 60_000);
+    timer.unref?.();
+    return tick;
+  }
+
+  /** Build a report and send it to every linked chat (never throws). */
+  async broadcast(fn) {
+    let html;
+    try {
+      html = await fn();
+    } catch (e) {
+      console.error("[telegram] report failed:", e.message);
+      return false;
+    }
+    const res = await Promise.allSettled(this.state.chats.map((c) => this.send(c, html)));
+    return res.some((r) => r.status === "fulfilled");
   }
 
   save() {
@@ -157,6 +218,9 @@ export class TelegramBot {
           "/alerts — latest alerts",
           "/feedback — latest feedback",
           "/invite Name — new invite code",
+          "/report — yesterday's digest now",
+          "/week — weekly digest now",
+          "/reports off · /reports on — daily and weekly digests",
           "/mute 2h · /mute off — pause alerts",
           "/dashboard — open the dashboard",
           "/unlink — stop alerts in this chat",
@@ -184,6 +248,31 @@ export class TelegramBot {
       this.save();
       const until = new Date(this.state.muteUntil + 3.5 * 3600_000).toISOString().slice(11, 16);
       await this.send(chat, `🔕 Alerts paused until ${until} (Tehran). /mute off to resume.`);
+      return;
+    }
+    if (c.cmd === "report" || c.cmd === "week") {
+      const fn = this.reportFns?.[c.cmd === "report" ? "daily" : "weekly"];
+      if (!fn) {
+        await this.send(chat, "Reports aren't set up.");
+        return;
+      }
+      try {
+        await this.send(chat, await fn());
+      } catch (e) {
+        console.error("[telegram] report failed:", e.message);
+        await this.send(chat, "Couldn't build the report.");
+      }
+      return;
+    }
+    if (c.cmd === "reports") {
+      const on = /^on$/i.test(c.arg);
+      if (!on && !/^off$/i.test(c.arg)) {
+        await this.send(chat, `Reports are ${this.state.reports === false ? "off" : "on"}. Use /reports on or /reports off.`);
+        return;
+      }
+      this.state.reports = on;
+      this.save();
+      await this.send(chat, on ? "📰 Daily and weekly reports are on." : "🔕 Daily and weekly reports are off.");
       return;
     }
     if (c.cmd === "unlink") {

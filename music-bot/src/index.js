@@ -31,6 +31,8 @@ import { Metrics, routeKey } from "./metrics.js";
 import { appStats, listeningStats, trafficStats, userStats } from "./analytics.js";
 import { Monitor, parseServices, slug } from "./monitor.js";
 import { TelegramBot, escHtml } from "./telegram_bot.js";
+import { updateYtdlp } from "./ytdlp_update.js";
+import { dailyReport, weeklyReport } from "./reports.js";
 import {
   InviteStore,
   RateLimiter,
@@ -177,6 +179,25 @@ function readYtdlpVersion() {
 readYtdlpVersion();
 setInterval(readYtdlpVersion, 6 * 3600_000).unref();
 
+// Self-update yt-dlp (an old yt-dlp is the usual reason YouTube fails).
+const YTDLP_UPDATE_PATH = process.env.YTDLP_UPDATE_PATH || "/opt/yt-dlp/yt-dlp";
+let ytdlpLatest = null;
+let ytdlpUpdate = null;
+async function ytdlpSelfUpdate() {
+  if (process.env.YTDLP_AUTO_UPDATE === "0") return;
+  const r = await updateYtdlp(YTDLP_UPDATE_PATH, ytdlpVersion);
+  ytdlpLatest = r.latest || ytdlpLatest;
+  ytdlpUpdate = { at: new Date().toISOString(), ...r };
+  if (r.updated) {
+    console.log(`[music-bot] yt-dlp updated to ${r.installed}`);
+    ytdlpVersion = r.installed;
+  } else if (r.error && r.error !== "not writable") {
+    console.error("[music-bot] yt-dlp update failed:", r.error);
+  }
+}
+setTimeout(ytdlpSelfUpdate, 3 * 60_000).unref();
+setInterval(ytdlpSelfUpdate, 6 * 3600_000).unref();
+
 // YouTube self-test: can this server still get a song? (the same yt-dlp
 // options real playback uses, on a tiny public video)
 const YT_TEST_URL = process.env.YT_TEST_URL || "https://www.youtube.com/watch?v=jNQXAC9IVRw";
@@ -222,6 +243,8 @@ function serverStats() {
       hostUptimeS: Math.round(osUptime()),
       node: process.version,
       ytdlp: ytdlpVersion,
+      ytdlpLatest,
+      ytdlpUpdate,
       mem: { rss: process.memoryUsage().rss, total: totalmem(), free: freemem() },
       load: loadavg().map((x) => Math.round(x * 100) / 100),
       cpus: cpus().length,
@@ -350,6 +373,107 @@ if (monitor && process.env.TELEGRAM_BOT_TOKEN) {
   tgBot.start();
 }
 
+// --- Nightly backup status (written by deploy/mp-backup.sh on the host).
+function backupStatus() {
+  try {
+    return JSON.parse(readFileSync(joinPath(SHARES, "monitor", "backup.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+const BACKUP_STALE_MS = 26 * 3600_000;
+let backupAlerted = false;
+function checkBackup() {
+  if (!monitor) return;
+  const b = backupStatus();
+  if (!b) return; // backups not set up on this server
+  const bad = !b.ok || Date.now() - Date.parse(b.at) > BACKUP_STALE_MS;
+  if (bad && !backupAlerted) {
+    backupAlerted = true;
+    void monitor.alert("warn", null, b.ok ? `No backup since ${tehranTime(b.at)}` : `Backup failed: ${b.detail || "unknown error"}`);
+  } else if (!bad && backupAlerted) {
+    backupAlerted = false;
+    void monitor.alert("up", null, "Backups are working again");
+  }
+}
+setTimeout(checkBackup, 5 * 60_000).unref();
+setInterval(checkBackup, 30 * 60_000).unref();
+
+// --- Telegram reports: yesterday (daily) and the last 7 days (weekly).
+const DAY_MS = 864e5;
+const startOfUtcDay = (t = Date.now()) => Math.floor(t / DAY_MS) * DAY_MS;
+function dayTraffic(byDay, keys) {
+  const t = { n: 0, err: 0, audio: 0, audioErr: 0, audioMsSum: 0 };
+  for (const d of byDay) {
+    if (!keys.includes(d.day)) continue;
+    t.n += d.n;
+    t.err += d.err;
+    t.audio += d.audio;
+    t.audioErr += d.audioErr;
+    t.audioMsSum += (d.audioMs || 0) * d.audio;
+  }
+  return { n: t.n, err: t.err, audio: t.audio, audioErr: t.audioErr, audioMs: t.audio ? Math.round(t.audioMsSum / t.audio) : null };
+}
+function dailyReportCtx() {
+  const end = startOfUtcDay() - 1; // last millisecond of yesterday
+  const date = new Date(end).toISOString().slice(0, 10);
+  const d = dashboardData(7);
+  const since = Date.now() - DAY_MS;
+  return {
+    date,
+    listening: listeningStats(joinPath(SHARES, "users"), 1, end),
+    active: d.users
+      .filter((u) => u.days[date])
+      .map((u) => ({ name: u.name, requests: u.days[date] }))
+      .sort((a, b) => b.requests - a.requests),
+    invitesTotal: d.users.length,
+    traffic: dayTraffic(d.traffic.byDay, [date]),
+    servers: d.servers.map((s) => ({ label: s.label, up: s.up, uptime24h: s.uptime24h, yt: s.yt, role: s.role })),
+    alerts: d.alerts.filter((a) => Date.parse(a.at) >= since),
+    feedbackCount: d.feedback.filter((f) => String(f.at).slice(0, 10) === date).length,
+    backup: backupStatus(),
+  };
+}
+function weeklyReportCtx() {
+  const end = startOfUtcDay() - 1;
+  const keys = Array.from({ length: 7 }, (_, i) => new Date(end - (6 - i) * DAY_MS).toISOString().slice(0, 10));
+  const d = dashboardData(14);
+  const listening = listeningStats(joinPath(SHARES, "users"), 7, end);
+  const since = Date.now() - 7 * DAY_MS;
+  let peak = null;
+  const names = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+  listening.heat.forEach((row, wd) =>
+    row.forEach((n, h) => {
+      if (n > 0 && (!peak || n > peak.n)) peak = { n, weekday: names[wd], hour: h };
+    }),
+  );
+  const alertsCount = {};
+  for (const a of d.alerts) if (Date.parse(a.at) >= since) alertsCount[a.level] = (alertsCount[a.level] || 0) + 1;
+  return {
+    from: keys[0],
+    to: keys[6],
+    listening,
+    activeUsers: d.users
+      .map((u) => ({
+        name: u.name,
+        requests: keys.reduce((n, k) => n + (u.days[k] || 0), 0),
+        days: keys.filter((k) => u.days[k]).length,
+      }))
+      .filter((u) => u.requests > 0)
+      .sort((a, b) => b.days - a.days || b.requests - a.requests),
+    invitesTotal: d.users.length,
+    newInvites: d.users.filter((u) => Date.parse(u.created) >= since).length,
+    traffic: dayTraffic(d.traffic.byDay, keys),
+    uptime: d.servers.map((s) => ({ label: s.label, uptime7d: s.uptime7d })),
+    alertsCount,
+    heatPeak: peak ? { weekday: peak.weekday, hour: peak.hour } : null,
+  };
+}
+tgBot?.startReports({
+  daily: async () => dailyReport(dailyReportCtx()),
+  weekly: async () => weeklyReport(weeklyReportCtx()),
+});
+
 let dashboardHtml = null;
 function dashboardPage() {
   if (!dashboardHtml || process.env.DASHBOARD_DEV) {
@@ -436,6 +560,7 @@ function dashboardData(days) {
     app: { latest, ...appStats(snaps, days) },
     feedback,
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
+    backup: backupStatus(),
   };
   dataCache.set(days, { at: Date.now(), data });
   return data;

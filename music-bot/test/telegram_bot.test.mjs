@@ -241,3 +241,57 @@ test("state reloads from telegram.json in a new instance", async () => {
   assert.equal(reloaded.state.muteUntil, muteUntil);
   assert.equal(reloaded.linked, true);
 });
+
+import { dueReports } from "../src/telegram_bot.js";
+
+const utc = (s) => Date.parse(s);
+
+test("dueReports: daily from 09:00 Tehran, once per date, skipped after 12:00", () => {
+  assert.equal(dueReports(utc("2026-10-09T05:29:00Z"), {}).daily, false); // 08:59 Tehran
+  const d = dueReports(utc("2026-10-09T05:31:00Z"), {});
+  assert.equal(d.daily, true);
+  assert.equal(d.tehranDate, "2026-10-09");
+  assert.equal(dueReports(utc("2026-10-09T05:31:00Z"), { lastDaily: "2026-10-09" }).daily, false);
+  assert.equal(dueReports(utc("2026-10-09T09:00:00Z"), {}).daily, false); // 12:30 Tehran
+  assert.equal(dueReports(utc("2026-10-09T21:00:00Z"), {}).tehranDate, "2026-10-10"); // past Tehran midnight
+});
+
+test("dueReports: weekly on Friday from 20:00 Tehran", () => {
+  assert.equal(dueReports(utc("2026-10-09T16:31:00Z"), {}).weekly, true); // Fri 20:01
+  assert.equal(dueReports(utc("2026-10-09T16:31:00Z"), { lastWeekly: "2026-10-09" }).weekly, false);
+  assert.equal(dueReports(utc("2026-10-09T16:29:00Z"), {}).weekly, false); // 19:59
+  assert.equal(dueReports(utc("2026-10-10T16:31:00Z"), {}).weekly, false); // Saturday
+});
+
+test("report commands: /report, /week, /reports on|off", async () => {
+  const { bot, sent } = makeBot();
+  await link(bot, 7);
+  sent.length = 0;
+  await bot.handle(priv(7, "/report"));
+  assert.match(sent[0].body.text, /Reports aren't set up/);
+  bot.reportFns = { daily: async () => "DAILY", weekly: async () => "WEEKLY" };
+  await bot.handle(priv(7, "/report"));
+  await bot.handle(priv(7, "/week"));
+  assert.equal(sent[1].body.text, "DAILY");
+  assert.equal(sent[2].body.text, "WEEKLY");
+  await bot.handle(priv(7, "/reports off"));
+  assert.equal(bot.state.reports, false);
+  await bot.handle(priv(7, "/reports on"));
+  assert.equal(bot.state.reports, true);
+  bot.reportFns.daily = async () => {
+    throw new Error("boom");
+  };
+  const err = console.error;
+  console.error = () => {};
+  await bot.handle(priv(7, "/report"));
+  console.error = err;
+  await bot.handle(priv(7, "/help"));
+  assert.match(sent.at(-1).body.text, /\/report /);
+});
+
+test("report commands ignore unlinked chats", async () => {
+  const { bot, sent } = makeBot();
+  bot.reportFns = { daily: async () => "DAILY", weekly: async () => "W" };
+  await bot.handle(priv(9, "/report"));
+  assert.match(sent[0].body.text, /private/);
+});

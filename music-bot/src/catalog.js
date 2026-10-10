@@ -304,7 +304,7 @@ export class Catalog {
       this.#sql(`UPDATE jobs SET state='queued', next_at=?, attempts=0, excluded_json='[]',
         server=NULL, lease_until=NULL, reason='retry', error=NULL, updated_at=? WHERE video_id=?`)
         .run(now, now, videoId);
-      this.#sql("UPDATE songs SET status='pending', error=NULL WHERE video_id=? AND status IN ('failed','pending')")
+      this.#sql("UPDATE songs SET status='pending', error=NULL WHERE video_id=? AND status IN ('failed','pending','unavailable')")
         .run(videoId);
       return true;
     });

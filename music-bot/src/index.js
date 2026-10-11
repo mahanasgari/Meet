@@ -2809,6 +2809,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (url.pathname === "/admin/api/recommend/stats") {
+        recommender.build(); // cached; builds on first use
         sendJson(res, 200, recommender.stats());
         return;
       }

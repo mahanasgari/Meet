@@ -10,6 +10,7 @@ const PLATFORMS = [
   { key: "android-arm64", os: "android", label: "Android", note: "Most phones" },
   { key: "android-arm", os: "android", label: "Android (older phones)", note: "If the first one won’t install" },
   { key: "windows", os: "windows", label: "Windows", note: "Installer" },
+  { key: "windows-portable", os: "windows", label: "Windows (portable)", note: "No install — unzip and run mini_player.exe" },
   { key: "linux-deb", os: "linux", label: "Linux (.deb)", note: "Ubuntu, Debian, Mint" },
   { key: "linux", os: "linux", label: "Linux (portable)", note: "Unpack and run" },
 ];
@@ -77,7 +78,7 @@ export function renderDownloadPage(manifest) {
 
   <h2>Installing on Windows or Linux</h2>
   <ol>
-    <li>Windows: run the installer. If SmartScreen warns, choose <b>More info → Run anyway</b>.</li>
+    <li>Windows: run the installer, or unzip the portable version anywhere and run <code>mini_player.exe</code>. If SmartScreen warns, choose <b>More info → Run anyway</b>.</li>
     <li>Linux: open the <code>.deb</code>, or unpack the portable file and run <code>mini_player</code>.</li>
     <li>Open MiniPlayer and enter your invite code.</li>
   </ol>

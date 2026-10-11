@@ -787,25 +787,35 @@ async function handleVideo(req, res, id) {
   })();
 }
 
-// --- Backup: copy every archived song and video into a second private
-// channel (Telegram forwards server-side: no re-upload, nothing on disk).
+// --- Backups: copy every archived song and video into each backup channel
+// (Telegram forwards server-side: no re-upload, nothing on disk). Channels
+// come from TG_BACKUP_CHANNEL (comma-separated) and from the admin bot
+// (forward any post from a channel to it).
+const backupChannels = () => [
+  ...new Set([
+    ...String(process.env.TG_BACKUP_CHANNEL || "").split(",").map((x) => x.trim()).filter(Boolean),
+    ...(tgBot?.state.backupChannels || []),
+  ]),
+];
 const BACKUP_CHANNEL = process.env.TG_BACKUP_CHANNEL || "";
-if (catalog && archive && BACKUP_CHANNEL) {
+if (catalog && archive) {
   let backingUp = false;
   const backupTick = async () => {
-    if (backingUp || !archive.tg.ready) return;
+    const channels = backupChannels();
+    if (backingUp || !channels.length || !archive.tg.ready) return;
     backingUp = true;
     try {
-      for (const { videoId, msgId } of catalog.needsBackup(5)) {
-        const copy = await archive.tg.forwardTo(msgId, BACKUP_CHANNEL);
-        catalog.markBackup(videoId, copy);
+      for (const ch of channels) {
+        for (const item of catalog.needsBackupIn(ch, 3)) {
+          try {
+            const copy = await archive.tg.forwardTo(item.msgId, ch);
+            catalog.markBackupIn(item.kind, item.videoId, ch, copy);
+          } catch (e) {
+            console.error(`[backup] ${ch}:`, e.message);
+            break; // try this channel again next minute
+          }
+        }
       }
-      for (const v of catalog.videoNeedsBackup(2)) {
-        const copy = await archive.tg.forwardTo(v.msgId, BACKUP_CHANNEL);
-        catalog.videoMarkBackup(v.videoId, copy);
-      }
-    } catch (e) {
-      console.error("[backup]", e.message);
     } finally {
       backingUp = false;
     }
@@ -905,7 +915,13 @@ function dashboardData(days) {
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
     backup: backupStatus(),
     archive: catalog
-      ? { ...catalog.stats(days), graph: catalog.graphStats(), videos: catalog.videoStats(), backupChannel: Boolean(BACKUP_CHANNEL) }
+      ? {
+          ...catalog.stats(days),
+          graph: catalog.graphStats(),
+          videos: catalog.videoStats(),
+          backupChannel: backupChannels().length > 0,
+          backups: catalog.backupStats(backupChannels()),
+        }
       : null,
   };
   dataCache.set(days, { at: Date.now(), data });

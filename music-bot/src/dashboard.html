@@ -867,9 +867,13 @@ function tgBackupCard(A) {
     var p = total > 0 ? Math.min(100, done / total * 100) : 0;
     return '<div style="margin-top:12px"><div class="sub-h">' + esc(label) + '</div><div style="margin:4px 0">' + esc(fmt(done) + " of " + fmt(total)) + '</div><div class="bar"><i style="width:' + p.toFixed(1) + '%"></i></div></div>';
   }
-  var B = A.backup || {}, bDone = B.done || 0, bTotal = bDone + (B.pending || 0);
-  var body = prog("Songs backed up", bDone, bTotal);
-  if (A.videos && typeof A.videos === "object") body += prog("Videos backed up", A.videos.backedUp || 0, A.videos.stored || 0);
+  var BK = A.backups || {}, chans = arr(BK.channels), body = "";
+  if (!chans.length) return card("Telegram backup", '<div class="muted">' + esc("No backup channel yet — forward any post from a channel to the admin bot to add it.") + "</div>");
+  chans.forEach(function (c, i) {
+    body += '<div class="sub-h" style="margin-top:' + (i ? 18 : 0) + 'px">' + esc("Channel " + (i + 1) + " · " + c.channel) + "</div>";
+    body += prog("Songs copied", c.songs || 0, BK.songs || 0);
+    body += prog("Videos copied", c.videos || 0, BK.videos || 0);
+  });
   return card("Telegram backup", body);
 }
 function pageArchive() {

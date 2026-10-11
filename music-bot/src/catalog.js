@@ -96,6 +96,11 @@ const MIGRATIONS = [
   `CREATE TABLE video_map (
     video_id TEXT PRIMARY KEY, src_id TEXT, title TEXT, checked_at INTEGER NOT NULL
   );`,
+  // v6: copies in any number of backup channels.
+  `CREATE TABLE backups (
+    kind TEXT NOT NULL, video_id TEXT NOT NULL, channel TEXT NOT NULL, msg_id INTEGER, at INTEGER,
+    PRIMARY KEY (kind, video_id, channel)
+  );`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -422,6 +427,38 @@ export class Catalog {
 
   videoMarkBackup(videoId, backupMsgId, now = Date.now()) {
     this.#sql("UPDATE videos SET backup_msg_id=?, backup_at=? WHERE video_id=?").run(backupMsgId, now, videoId);
+  }
+
+  /** Archived songs/videos not yet copied to [channel]: [{kind, videoId, msgId}]. */
+  needsBackupIn(channel, limit = 5) {
+    const ch = String(channel);
+    const songs = this.#sql(`SELECT 'song' kind, video_id, tg_msg_id FROM songs s WHERE status='stored' AND tg_msg_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='song' AND b.video_id=s.video_id AND b.channel=?)
+      ORDER BY stored_at, rowid LIMIT ?`).all(ch, limit);
+    const vids = this.#sql(`SELECT 'video' kind, video_id, tg_msg_id FROM videos v WHERE status='stored' AND tg_msg_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='video' AND b.video_id=v.video_id AND b.channel=?)
+      ORDER BY stored_at, rowid LIMIT ?`).all(ch, limit);
+    return [...songs, ...vids].slice(0, limit).map((r) => ({ kind: r.kind, videoId: r.video_id, msgId: r.tg_msg_id }));
+  }
+
+  markBackupIn(kind, videoId, channel, msgId, now = Date.now()) {
+    this.#sql(`INSERT OR REPLACE INTO backups(kind, video_id, channel, msg_id, at) VALUES(?,?,?,?,?)`)
+      .run(kind, videoId, String(channel), msgId, now);
+  }
+
+  /** Per channel: {channel, songs, videos} copied, plus totals to copy. */
+  backupStats(channels) {
+    const songs = this.#sql("SELECT COUNT(*) n FROM songs WHERE status='stored' AND tg_msg_id IS NOT NULL").get().n;
+    const videos = this.#sql("SELECT COUNT(*) n FROM videos WHERE status='stored' AND tg_msg_id IS NOT NULL").get().n;
+    return {
+      songs,
+      videos,
+      channels: channels.map((c) => ({
+        channel: String(c),
+        songs: this.#sql("SELECT COUNT(*) n FROM backups WHERE kind='song' AND channel=?").get(String(c)).n,
+        videos: this.#sql("SELECT COUNT(*) n FROM backups WHERE kind='video' AND channel=?").get(String(c)).n,
+      })),
+    };
   }
 
   /** The matched music video for an audio track: {srcId|null, title, checkedAt} or null (never checked). */

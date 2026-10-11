@@ -190,8 +190,26 @@ export class TelegramBot {
   }
 
   async handle(msg) {
-    if (!msg?.text || msg.chat?.type !== "private") return;
+    if (!msg || msg.chat?.type !== "private") return;
     const chat = String(msg.chat.id);
+    // A post forwarded from a channel: register it as a backup channel.
+    const fwd = msg.forward_origin?.chat || msg.forward_from_chat;
+    if (fwd && this.state.chats.includes(chat)) {
+      if (fwd.type !== "channel") {
+        await this.send(chat, "That isn't a channel.");
+        return;
+      }
+      const id = String(fwd.id);
+      this.state.backupChannels ||= [];
+      if (!this.state.backupChannels.includes(id)) this.state.backupChannels.push(id);
+      this.save();
+      await this.send(
+        chat,
+        `💾 <b>${escHtml(fwd.title || "Channel")}</b> (<code>${id}</code>) is now a backup channel. Every archived song and video will be copied there.\n\nMake sure the storage bot is an admin there. /backups lists them, /backup_remove ${id} stops it.`,
+      );
+      return;
+    }
+    if (!msg.text) return;
     const c = parseCommand(msg.text);
     if (c?.cmd === "start" && c.arg) {
       const exp = this.codes.get(c.arg);
@@ -273,6 +291,17 @@ export class TelegramBot {
       this.state.reports = on;
       this.save();
       await this.send(chat, on ? "📰 Daily and weekly reports are on." : "🔕 Daily and weekly reports are off.");
+      return;
+    }
+    if (c.cmd === "backups") {
+      const list = this.state.backupChannels || [];
+      await this.send(chat, list.length ? `💾 Backup channels:\n${list.map((x) => `<code>${x}</code>`).join("\n")}` : "No backup channels. Forward any post from a channel here to add it.");
+      return;
+    }
+    if (c.cmd === "backup_remove") {
+      this.state.backupChannels = (this.state.backupChannels || []).filter((x) => x !== c.arg.trim());
+      this.save();
+      await this.send(chat, "Removed.");
       return;
     }
     if (c.cmd === "unlink") {

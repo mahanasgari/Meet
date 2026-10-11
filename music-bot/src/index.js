@@ -2799,6 +2799,41 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    // --- In-house suggestions for the app (home server; friends' tokens).
+    // Items look like /charts/weekly's so the app parses them the same way.
+    if (req.method === "GET" && (url.pathname === "/recommend" || url.pathname === "/recommend/similar")) {
+      if (!requireApiToken(req, res)) return;
+      if (!recommender) {
+        sendJson(res, 404, { error: "no_recommender" });
+        return;
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 50);
+      const toItem = (x) => ({
+        id: `yt_${x.videoId}`,
+        title: x.title,
+        artist: x.artist || "",
+        reason: (x.reasons || [])[0] || "",
+        archived: Boolean(x.archived),
+      });
+      try {
+        if (url.pathname === "/recommend/similar") {
+          const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+          const items = /^[A-Za-z0-9_-]{11}$/.test(id) ? recommender.similarTo(id, { limit }) : [];
+          sendJson(res, 200, { items: items.filter((x) => x.title).map(toItem) });
+          return;
+        }
+        // A friend gets their own picks; the owner's secret may ask for anyone.
+        // (The owner's PC uses the secret: default to the heaviest listener.)
+        let uid = req.mpUser || (isMasterToken(req) ? String(url.searchParams.get("uid") || "") : "");
+        if (!uid && isMasterToken(req)) uid = [...recommender.users()].sort((a, b) => b.plays - a.plays)[0]?.uid || "";
+        const r = recommender.forUser(uid, { limit });
+        sendJson(res, 200, { items: r.items.filter((x) => x.title).map(toItem) });
+      } catch (e) {
+        console.error("[recommend]", e.message);
+        sendJson(res, 500, { error: "recommend_failed" });
+      }
+      return;
+    }
     if (req.method === "GET" && url.pathname.startsWith("/admin/api/") && /^\/admin\/api\/(recommend(\/users|\/stats)?|similar)$/.test(url.pathname)) {
       if (!isMasterToken(req)) {
         sendJson(res, 401, { error: "unauthorized" });

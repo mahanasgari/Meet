@@ -195,20 +195,22 @@ test("forwardTo copies without author, caches the peer, retries flood waits, spa
   const fake = makeFake();
   const fwd = [];
   const fails = [Object.assign(new Error("x"), { seconds: 0 })];
-  fake.forwardMessages = async (peer, o) => {
-    fwd.push({ t: Date.now(), peer, o });
+  // Raw messages.ForwardMessages via invoke(); the new id comes back in updates.
+  fake.invoke = async (req) => {
+    fwd.push({ t: Date.now(), req });
     if (fails.length) throw fails.shift();
-    return [{ id: 900 + fwd.length }];
+    return { updates: [{ className: "UpdateMessageID", id: 900 + fwd.length, randomId: req.randomId[0] }] };
   };
-  const { s } = store(fake);
+  const Api = { messages: { ForwardMessages: class { constructor(o) { Object.assign(this, o); } } } };
+  const { s } = store(fake, { Api });
   const a = await s.forwardTo(7, "-1002");
   assert.equal(a, 902);
   const b = await s.forwardTo(8, "-1002");
   assert.equal(b, 903);
-  assert.equal(fwd[0].o.dropAuthor, true);
-  assert.deepEqual(fwd[0].o.messages, [7]);
-  assert.equal(fwd[0].o.fromPeer.id, -1001);
-  assert.equal(fwd[0].peer.id, -1002);
+  assert.equal(fwd[0].req.dropAuthor, true);
+  assert.deepEqual(fwd[0].req.id, [7]);
+  assert.equal(fwd[0].req.fromPeer.id, -1001);
+  assert.equal(fwd[0].req.toPeer.id, -1002);
   assert.equal(fake.calls.getEntity, 2); // source channel + target, cached afterwards
   assert.ok(fwd[2].t - fwd[1].t >= 40);
 });

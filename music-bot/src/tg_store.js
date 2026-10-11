@@ -198,12 +198,20 @@ export class TgStore {
         peer = await this._client.getEntity(/^-?\d+$/.test(key) ? Number(key) : key);
         this._targets.set(key, peer);
       }
-      const res = await this._client.forwardMessages(peer, {
-        messages: [Number(msgId)], fromPeer: this._peer, dropAuthor: true,
-      });
-      const m = Array.isArray(res) ? res[0] : res;
-      if (!m?.id) throw new Error("no forwarded message");
-      return m.id;
+      // Raw request: GramJS's forwardMessages() can't map channel results
+      // back to messages, so read the new id from Telegram's updates.
+      const Api = this._Api || (await import("telegram")).Api;
+      const bigInt = await this._big(0).then(() => this._bigInt);
+      const randomId = bigInt(Math.floor(Math.random() * 2 ** 52));
+      const res = await this._client.invoke(
+        new Api.messages.ForwardMessages({ fromPeer: this._peer, id: [Number(msgId)], randomId: [randomId], toPeer: peer, dropAuthor: true }),
+      );
+      const ups = res?.updates || [];
+      const byRandom = ups.find((u) => u.className === "UpdateMessageID" && String(u.randomId) === String(randomId));
+      const created = ups.find((u) => (u.className === "UpdateNewChannelMessage" || u.className === "UpdateNewMessage") && u.message?.id);
+      const id = byRandom?.id || created?.message?.id;
+      if (!id) throw new Error("no forwarded message");
+      return id;
     });
   }
 

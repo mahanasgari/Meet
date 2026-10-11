@@ -15,6 +15,10 @@ if [ -f /root/music-bot.current.env ]; then
     sed -i "/^$k=/d" /root/music-bot.next.env; echo "$line" >> /root/music-bot.next.env
   done < /root/music-bot.current.env
 fi
+# Keys listed in /root/music-bot.unset (one per line) are removed for good.
+if [ -f /root/music-bot.unset ]; then
+  while IFS= read -r k; do [ -n "$k" ] && sed -i "/^$k=/d" /root/music-bot.next.env; done < /root/music-bot.unset
+fi
 mv /root/music-bot.next.env /root/music-bot.current.env
 sed -i '/^HOME_URL=/d' /root/music-bot.current.env; echo 'HOME_URL=https://music.cloudproducts.ir/extractor' >> /root/music-bot.current.env
 docker rm -f music-bot >/dev/null

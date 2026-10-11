@@ -83,6 +83,8 @@ const MUSIC_API_TOKEN = process.env.MUSIC_API_TOKEN || "";
 /** Optional outbound proxy for yt-dlp (e.g. Cloudflare WARP on a worker
  * whose own IP YouTube asks to sign in). */
 const YTDLP_PROXY = process.env.YTDLP_PROXY || "";
+/** Optional: relay YouTube Music API calls (/search, /ytm/*) to this server. */
+const YTM_RELAY = (process.env.YTM_RELAY || "").replace(/\/+$/, "");
 function ytdlpNetArgs() {
   // Node (already in the image) as yt-dlp's JavaScript runtime: without one
   // YouTube serves fewer formats and flags the server as a bot more often.
@@ -3054,6 +3056,39 @@ const server = http.createServer(async (req, res) => {
     }
 
     // --- continue with existing search / playlist / meta / audio / LiveKit rooms ---
+
+    // A server whose address YouTube Music answers with cut-down results
+    // (empty artist pages, short search/up-next) relays these calls to a
+    // healthy server (YTM_RELAY=https://other/extractor). Streams still
+    // come from this server.
+    if (
+      YTM_RELAY &&
+      req.headers["x-mp-hop"] !== "1" &&
+      (url.pathname === "/search" || url.pathname.startsWith("/ytm/")) &&
+      url.pathname !== "/ytm/ping"
+    ) {
+      if (!requireApiToken(req, res)) return;
+      try {
+        const headers = { Authorization: `Bearer ${MUSIC_API_TOKEN}`, "X-MP-Hop": "1" };
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (/^(x-yt-|x-goog-|x-youtube-|content-type$|accept-encoding$)/i.test(k) && typeof v === "string") headers[k] = v;
+        }
+        const body = req.method === "POST" ? await readBody(req, 64_000).then((b) => JSON.stringify(b)) : undefined;
+        const r = await fetch(`${YTM_RELAY}${url.pathname}${url.search}`, {
+          method: req.method,
+          headers,
+          body,
+          signal: AbortSignal.timeout(35_000),
+        });
+        const out = Buffer.from(await r.arrayBuffer());
+        const h = { "Content-Type": r.headers.get("content-type") || "application/json", "X-MP-Relay": YTM_RELAY.replace(/^https?:\/\//, "") };
+        res.writeHead(r.status, h);
+        res.end(out);
+      } catch {
+        sendJson(res, 502, { error: "ytm_relay_failed" });
+      }
+      return;
+    }
 
     if (req.method === "GET" && url.pathname === "/search") {
       if (!requireApiToken(req, res, { optional: true })) return;

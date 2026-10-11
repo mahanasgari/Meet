@@ -86,3 +86,19 @@ test("serveVideoFromTelegram: client abort stops reading", async () => {
     assert.ok(at < 2000);
   });
 });
+
+test("pickOfficialVideo finds the official video and rejects other songs", async () => {
+  const { pickOfficialVideo } = await import("../src/video.js");
+  const eshghe = [
+    { videoId: "j3vAlrgBvoE", title: "Sami Beigi - In Eshghe I Official Video ( سامی بیگی - این عشقه )", subtitle: "Sami Beigi • 1.2M views • 3:52", durationS: 232 },
+    { videoId: "kdSdnuGqaUc", title: "Sami Beigi - In Eshghe I Lyric Video", subtitle: "Sami Beigi • 21K views • 3:45", durationS: 225 },
+  ];
+  assert.equal(pickOfficialVideo(eshghe, { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 })?.videoId, "j3vAlrgBvoE");
+  const maleTo = [
+    { videoId: "lr_a6NjkTL4", title: "Kamran & Hooman - Male To OFFICIAL VIDEO HD", subtitle: "Avang Music • 1.2M views • 4:25", durationS: 265 },
+    { videoId: "Thu_s-vuBgM", title: "Kamran & Hooman - Man Ageh Nabasham Music Video", subtitle: "My College • 34 views • 4:53", durationS: 293 },
+  ];
+  assert.equal(pickOfficialVideo(maleTo, { title: "Male To", artist: "Kamran & Hooman", durationS: 227 })?.videoId, "lr_a6NjkTL4");
+  assert.equal(pickOfficialVideo([{ videoId: "S59SaU-RDD4", title: "Chi Mishe Badet", subtitle: "Kiyarash", durationS: 192 }], { title: "Oftadi Mese Ashk", artist: "Kiyarash", durationS: 196 }), null);
+  assert.equal(pickOfficialVideo([{ videoId: "j3vAlrgBvoE", title: "Sami Beigi - In Eshghe Official Video", subtitle: "x", durationS: 600 }], { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 }), null, "length far off");
+});

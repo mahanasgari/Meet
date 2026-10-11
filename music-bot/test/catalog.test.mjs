@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "4");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "5");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "4");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "5");
   c.close();
 });
 
@@ -387,7 +387,7 @@ test("v2 database upgrades to v3 in place and keeps data", () => {
   c1.close();
   const db = new DatabaseSync(file);
   for (const t of ["tracks", "artists", "song_artists", "artist_related", "albums", "crawl"]) db.exec(`DROP TABLE ${t}`);
-  db.exec("DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
+  db.exec("DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
   db.close();
   const c2 = new Catalog(file);
@@ -435,7 +435,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   c0.close();
   // Roll the schema back to v3 by dropping the v4 additions.
   const db = new DatabaseSync(file);
-  db.exec("DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
+  db.exec("DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
   db.close();
   const c = new Catalog(file);

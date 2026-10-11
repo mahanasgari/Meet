@@ -37,7 +37,7 @@ import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } fr
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
 import { Recommender } from "./recommend.js";
-import { downloadVideo, needsVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
+import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
 import {
@@ -643,6 +643,68 @@ if (recommender) {
   setTimeout(seedFromGraph, 20 * 60_000).unref();
   setInterval(seedFromGraph, 3 * 3600_000).unref();
 }
+
+// --- Which video to play for a song (home only). Official audio tracks
+// ("art tracks", a still image) are matched once to the song's real music
+// video via YouTube Music's video search; the answer is remembered.
+const YTM_VIDEOS_PARAMS = decodeURIComponent("EgWKAQIQAWoKEAMQBBAJEAoQBQ%3D%3D");
+async function searchYtmVideos(query) {
+  const r = await fetch("https://music.youtube.com/youtubei/v1/search?prettyPrint=false", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://music.youtube.com" },
+    body: JSON.stringify({ context: { client: { clientName: "WEB_REMIX", clientVersion: "1.20250101.01.00", hl: "en" } }, query, params: YTM_VIDEOS_PARAMS }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!r.ok) throw new Error(`video search HTTP ${r.status}`);
+  const rows = [];
+  const text = (c) => (c?.text?.runs || []).map((x) => x.text).join("");
+  const walk = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (n.musicResponsiveListItemRenderer) {
+      const m = n.musicResponsiveListItemRenderer;
+      const cols = (m.flexColumns || []).map((c) => text(c.musicResponsiveListItemFlexColumnRenderer));
+      const sub = cols.slice(1).join(" • ");
+      const d = /(?:^|\D)(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/.exec(sub);
+      const durationS = d ? (d[3] ? Number(d[1]) * 3600 + Number(d[2]) * 60 + Number(d[3]) : Number(d[1]) * 60 + Number(d[2])) : null;
+      rows.push({ videoId: m.playlistItemData?.videoId, title: cols[0] || "", subtitle: sub, durationS });
+      return;
+    }
+    for (const v of Object.values(n)) walk(v);
+  };
+  walk(await r.json());
+  return rows;
+}
+const videoMapInflight = new Map();
+async function resolveVideo(id) {
+  if (!catalog) return { srcId: id };
+  const song = catalog.lookup(id);
+  if (!song || song.sourceKind !== "ytm_track") return { srcId: id };
+  const known = catalog.videoMapGet(id);
+  // A miss is re-checked after a week (the video may be uploaded later).
+  if (known && (known.srcId || Date.now() - known.checkedAt < 7 * 864e5)) return { srcId: known.srcId };
+  if (!videoMapInflight.has(id)) {
+    videoMapInflight.set(
+      id,
+      (async () => {
+        try {
+          const artist = (song.artists && song.artists.length ? song.artists : [song.artist]).filter(Boolean).join(", ");
+          const rows = await searchYtmVideos(`${song.title} ${artist}`.trim());
+          const pick = pickOfficialVideo(rows, { title: song.title, artist, durationS: song.durationS });
+          catalog.videoMapSet(id, pick?.videoId || null, pick?.title || null);
+          if (pick) console.log(`[video] ${song.title} → ${pick.videoId} (${pick.title})`);
+          return { srcId: pick?.videoId || null };
+        } catch (e) {
+          console.error("[video] match:", e.message);
+          return { srcId: null };
+        } finally {
+          videoMapInflight.delete(id);
+        }
+      })(),
+    );
+  }
+  return videoMapInflight.get(id);
+}
+if (archive && catalog) archive.home.resolveVideo = resolveVideo;
 
 // --- Music video requests.
 let videoJobs = 0;
@@ -2939,7 +3001,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const body = await readBody(req, 200_000).catch(() => ({}));
-      const out = await handleHomeRoute(url.pathname, body, { catalog, peers: healthyPeers });
+      const out = await handleHomeRoute(url.pathname, body, { catalog, peers: healthyPeers, resolveVideo });
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
@@ -3677,16 +3739,27 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, archive ? 400 : 404, { error: archive ? "invalid_id" : "no_archive" });
         return;
       }
+      // Official audio tracks play their matched music video instead.
+      const map = await archive.home.videoMap(id).catch(() => ({ srcId: id }));
+      const src = map?.srcId || null;
       if (url.pathname === "/video/info") {
+        if (!src) {
+          sendJson(res, 200, { hasVideo: false, stored: false, width: null, height: null });
+          return;
+        }
         const [song, video] = await Promise.all([
-          archive.home.lookup(id).catch(() => null),
-          archive.home.videoLookup(id).catch(() => null),
+          src === id ? archive.home.lookup(id).catch(() => null) : null,
+          archive.home.videoLookup(src).catch(() => null),
         ]);
-        const hasVideo = video ? video.status !== "none" : needsVideo(song);
+        const hasVideo = video ? video.status !== "none" : src !== id || needsVideo(song);
         sendJson(res, 200, { hasVideo, stored: video?.status === "stored", width: video?.width || null, height: video?.height || null });
         return;
       }
-      await handleVideo(req, res, id);
+      if (!src) {
+        sendJson(res, 404, { error: "no_video" });
+        return;
+      }
+      await handleVideo(req, res, src);
       return;
     }
 

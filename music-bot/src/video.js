@@ -188,3 +188,42 @@ export async function serveVideoFromTelegram(req, res, tg, msgId, { size, mime =
 export function serveFileRange(req, res, path, { mime = "video/mp4", source } = {}) {
   serveFile(req, res, path, { mime, extraHeaders: source ? { "X-MP-Source": source } : {} });
 }
+
+const norm = (x) =>
+  String(x || "")
+    .toLowerCase()
+    .replace(/\(.*?\)|\[.*?\]/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+
+/**
+ * Picks the official music video for an audio track from YouTube Music
+ * video-search rows [{videoId, title, subtitle, durationS}], or null.
+ * The title must contain the song title and name the artist (in the title
+ * or the channel line), the length must be close, and "official video"
+ * beats plain uploads; lyric videos and covers are skipped.
+ */
+export function pickOfficialVideo(rows, { title, artist, durationS }) {
+  const t = norm(title);
+  const artists = String(artist || "")
+    .split(/,|&| and | feat\.? | ft\.? /i)
+    .map(norm)
+    .filter((a) => a.length >= 2);
+  if (!t) return null;
+  let best = null;
+  for (const r of rows || []) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(r.videoId || "")) continue;
+    const rt = norm(r.title);
+    const rs = norm(r.subtitle);
+    if (!rt.includes(t)) continue;
+    if (artists.length && !artists.some((a) => rt.includes(a) || rs.includes(a))) continue;
+    if (/\b(lyric|lyrics|cover|karaoke|instrumental|remix|live|reaction|slowed|8d)\b/i.test(r.title || "")) continue;
+    if (durationS && r.durationS && (r.durationS < durationS * 0.75 || r.durationS > durationS * 1.7)) continue;
+    let score = 1;
+    if (/official\s*(music\s*)?video|music\s*video|\bmv\b|video\s*clip/i.test(r.title || "")) score += 2;
+    if (/official\s*(audio|visuali[sz]er)/i.test(r.title || "")) score -= 0.5;
+    if (durationS && r.durationS) score -= Math.abs(r.durationS - durationS) / durationS;
+    if (!best || score > best.score) best = { videoId: r.videoId, title: r.title, score };
+  }
+  return best ? { videoId: best.videoId, title: best.title } : null;
+}

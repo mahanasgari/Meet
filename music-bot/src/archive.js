@@ -177,6 +177,11 @@ export class HomeLink {
     if (this.catalog) return this.catalog.videoLookup(id);
     return (await this.post("/archive/video-lookup", { id }, 4000)).video || null;
   }
+  /** {srcId} — the video to play for [id] (an audio track's official video, or itself); srcId null = none. */
+  async videoMap(id) {
+    if (this.resolveVideo) return this.resolveVideo(id);
+    return this.post("/archive/video-map", { id }, 15000);
+  }
   videoClaim(id, server) {
     return this.catalog ? this.catalog.videoClaim(id, server) : this.post("/archive/video-claim", { id, server }, 4000);
   }
@@ -692,7 +697,7 @@ export class Archive {
 }
 
 /** Home-server routes the other servers call (master token checked by the caller). */
-export async function handleHomeRoute(path, body, { catalog, peers }) {
+export async function handleHomeRoute(path, body, { catalog, peers, resolveVideo = null }) {
   switch (path) {
     case "/archive/lookup":
       return { song: catalog.lookup(String(body.id)) };
@@ -708,6 +713,8 @@ export async function handleHomeRoute(path, body, { catalog, peers }) {
     case "/archive/plays":
       catalog.recordPlays(Array.isArray(body.events) ? body.events.slice(0, 1000) : []);
       return { ok: true };
+    case "/archive/video-map":
+      return resolveVideo ? resolveVideo(String(body.id)) : { srcId: String(body.id) };
     case "/archive/video-lookup":
       return { video: catalog.videoLookup(String(body.id)) };
     case "/archive/video-claim":

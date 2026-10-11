@@ -91,6 +91,11 @@ const MIGRATIONS = [
     plays INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX videos_status ON videos(status);`,
+  // v5: official audio tracks (YouTube Music "art tracks") map to the
+  // song's real music video, which has a different video id.
+  `CREATE TABLE video_map (
+    video_id TEXT PRIMARY KEY, src_id TEXT, title TEXT, checked_at INTEGER NOT NULL
+  );`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -417,6 +422,18 @@ export class Catalog {
 
   videoMarkBackup(videoId, backupMsgId, now = Date.now()) {
     this.#sql("UPDATE videos SET backup_msg_id=?, backup_at=? WHERE video_id=?").run(backupMsgId, now, videoId);
+  }
+
+  /** The matched music video for an audio track: {srcId|null, title, checkedAt} or null (never checked). */
+  videoMapGet(videoId) {
+    const r = this.#sql("SELECT src_id, title, checked_at FROM video_map WHERE video_id=?").get(videoId);
+    return r ? { srcId: r.src_id, title: r.title, checkedAt: r.checked_at } : null;
+  }
+
+  videoMapSet(videoId, srcId, title = null, now = Date.now()) {
+    this.#sql(`INSERT INTO video_map(video_id, src_id, title, checked_at) VALUES(?,?,?,?)
+      ON CONFLICT(video_id) DO UPDATE SET src_id=excluded.src_id, title=excluded.title, checked_at=excluded.checked_at`)
+      .run(videoId, srcId, title, now);
   }
 
   videoStats() {

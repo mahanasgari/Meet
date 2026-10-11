@@ -1,0 +1,378 @@
+// In-house music recommender, version 1. No external calls: everything comes
+// from the catalog (plays, YouTube Music song graph, similar artists) and the
+// opt-in listening sync files (users/*.jsonl).
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+const MIN = 6e4;
+const DAY = 864e5;
+const CACHE_MS = 30 * MIN;
+const SESSION_GAP_MS = 30 * MIN;
+const HISTORY_DAYS = 90;
+const WINDOW = 5; // positions looked ahead when counting co-occurrence
+const MAX_NEIGHBORS = 50;
+const HALF_LIFE_DAYS = 14;
+const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+
+const parse = (s, fallback = null) => {
+  if (s == null) return fallback;
+  try { return JSON.parse(s); } catch { return fallback; }
+};
+
+export class Recommender {
+  #catalog;
+  #usersDir;
+  #now;
+  #m = null; // built model, see build()
+  #sql = new Map();
+
+  constructor({ catalog, usersDir, now = () => Date.now() }) {
+    this.#catalog = catalog;
+    this.#usersDir = usersDir;
+    this.#now = now;
+  }
+
+  #q(text) {
+    let s = this.#sql.get(text);
+    if (!s) this.#sql.set(text, (s = this.#catalog.db.prepare(text)));
+    return s;
+  }
+
+  // ---------------------------------------------------------------- model
+
+  /** Read plays of every listener (catalog + sync files) in the last 90 days. */
+  #loadListeners(now) {
+    const from = now - HISTORY_DAYS * DAY;
+    const listeners = new Map(); // id -> [{ id: videoId, at }]
+    const titles = new Map(); // videoId -> { title, artist } from sync files
+    const add = (who, id, at) => {
+      let list = listeners.get(who);
+      if (!list) listeners.set(who, (list = []));
+      list.push({ id, at });
+    };
+    // 'peer' rows are copies of plays another server already recorded.
+    for (const r of this.#q(`SELECT video_id, at, uid FROM plays
+      WHERE uid IS NOT NULL AND (source IS NULL OR source != 'peer') AND at >= ? AND at <= ?`).all(from, now)) {
+      add(r.uid, r.video_id, r.at);
+    }
+    let files = [];
+    try { files = readdirSync(this.#usersDir).filter((f) => f.endsWith(".jsonl")); } catch { /* no sync yet */ }
+    for (const f of files) {
+      const path = join(this.#usersDir, f);
+      let text;
+      try {
+        if (statSync(path).mtimeMs < from) continue;
+        text = readFileSync(path, "utf8");
+      } catch { continue; }
+      const who = f.slice(0, -6);
+      for (const line of text.split("\n")) {
+        if (!line) continue;
+        const e = parse(line);
+        if (!e || e.t !== "play") continue;
+        const ts = Number(e.ts);
+        if (!(ts >= from && ts <= now)) continue;
+        const id = typeof e.id === "string" ? e.id.replace(/^yt_/, "") : "";
+        if (!YT_ID.test(id)) continue;
+        add(who, id, ts);
+        if (e.ti && !titles.has(id)) titles.set(id, { title: e.ti, artist: e.a ?? null });
+      }
+    }
+    for (const list of listeners.values()) list.sort((a, b) => a.at - b.at);
+    return { listeners, titles };
+  }
+
+  /**
+   * (Re)build the co-listening model. Cached for 30 minutes unless force.
+   * Returns the model's stats().
+   */
+  build({ force = false } = {}) {
+    const now = this.#now();
+    if (!force && this.#m && now - this.#m.builtAt < CACHE_MS) return this.stats();
+    const { listeners, titles } = this.#loadListeners(now);
+
+    const co = new Map(); // a -> Map(b -> weighted co-occurrence), kept symmetric
+    const n = new Map(); // song -> number of sessions containing it
+    let sessionCount = 0;
+    const bump = (a, b, w) => {
+      let m = co.get(a);
+      if (!m) co.set(a, (m = new Map()));
+      m.set(b, (m.get(b) ?? 0) + w);
+    };
+    const flush = (session) => {
+      if (!session.length) return;
+      sessionCount++;
+      for (const id of new Set(session)) n.set(id, (n.get(id) ?? 0) + 1);
+      for (let i = 0; i < session.length; i++) {
+        for (let d = 1; d <= WINDOW && i + d < session.length; d++) {
+          const a = session[i], b = session[i + d];
+          if (a === b) continue;
+          bump(a, b, 1 / d);
+          bump(b, a, 1 / d);
+        }
+      }
+    };
+    for (const list of listeners.values()) {
+      let session = [];
+      let last = null;
+      for (const p of list) {
+        if (last != null && p.at - last > SESSION_GAP_MS) { flush(session); session = []; }
+        session.push(p.id);
+        last = p.at;
+      }
+      flush(session);
+    }
+
+    // sim(a,b) = co / sqrt(n(a) n(b)); top 50 neighbours per song.
+    const neighbors = new Map();
+    let pairs = 0;
+    for (const [a, m] of co) {
+      const list = [];
+      for (const [b, c] of m) list.push({ id: b, sim: c / Math.sqrt(n.get(a) * n.get(b)) });
+      list.sort((x, y) => y.sim - x.sim || (x.id < y.id ? -1 : 1));
+      pairs += list.length;
+      neighbors.set(a, list.slice(0, MAX_NEIGHBORS));
+    }
+
+    // Per-listener recency-weighted play counts.
+    const perUser = new Map();
+    for (const [who, list] of listeners) {
+      const songs = new Map(); // id -> { weight, count, last }
+      for (const p of list) {
+        const w = Math.pow(0.5, Math.max(0, now - p.at) / DAY / HALF_LIFE_DAYS);
+        const s = songs.get(p.id) ?? { weight: 0, count: 0, last: 0 };
+        s.weight += w;
+        s.count++;
+        s.last = Math.max(s.last, p.at);
+        songs.set(p.id, s);
+      }
+      perUser.set(who, songs);
+    }
+
+    this.#m = {
+      builtAt: now, neighbors, perUser, titles,
+      listeners: listeners.size, sessions: sessionCount, pairs: pairs / 2,
+      // plays of everyone in the last 14 days, for popularity
+      recent: this.#recentCounts(listeners, now - 14 * DAY),
+    };
+    return this.stats();
+  }
+
+  #recentCounts(listeners, from) {
+    const counts = new Map();
+    for (const list of listeners.values()) {
+      for (const p of list) if (p.at >= from) counts.set(p.id, (counts.get(p.id) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  #model() {
+    this.build();
+    return this.#m;
+  }
+
+  stats() {
+    const m = this.#m;
+    if (!m) return { listeners: 0, sessions: 0, songsWithNeighbors: 0, pairs: 0, builtAt: null };
+    return {
+      listeners: m.listeners, sessions: m.sessions, songsWithNeighbors: m.neighbors.size,
+      pairs: m.pairs, builtAt: m.builtAt,
+    };
+  }
+
+  /** Listeners seen in the catalog plays table, most active first. */
+  users() {
+    return this.#q(`SELECT uid, COUNT(*) plays, MAX(at) lastPlayed FROM plays
+      WHERE uid IS NOT NULL GROUP BY uid ORDER BY plays DESC, uid`).all()
+      .map((r) => ({ uid: r.uid, plays: r.plays, lastPlayed: r.lastPlayed }));
+  }
+
+  // ------------------------------------------------------------- metadata
+
+  /** Title, artist and status for a song: songs row first, then crawled tracks, then sync files. */
+  #meta(id) {
+    const m = this.#m;
+    const s = this.#q("SELECT title, artist, artists_json, status FROM songs WHERE video_id=?").get(id);
+    const t = this.#q("SELECT title, artists_json FROM tracks WHERE video_id=?").get(id);
+    const names = (json) => parse(json, []).map((a) => a?.name).filter(Boolean);
+    const sync = m?.titles.get(id);
+    const trackArtist = names(t?.artists_json).join(", ");
+    const songArtist = s?.artist ?? (names(s?.artists_json).join(", ") || null);
+    return {
+      title: s?.title ?? t?.title ?? sync?.title ?? null,
+      artist: songArtist ?? (trackArtist || null) ?? sync?.artist ?? null,
+      archived: s?.status === "stored",
+      unavailable: s?.status === "unavailable",
+    };
+  }
+
+  /** Artists of a song: ids (from song_artists) and names (from every source). */
+  #artistsOf(id) {
+    const rows = this.#q(`SELECT sa.artist_id id, a.name FROM song_artists sa
+      LEFT JOIN artists a ON a.id=sa.artist_id WHERE sa.video_id=? ORDER BY sa.position`).all(id);
+    const ids = rows.map((r) => r.id);
+    const names = new Set(rows.map((r) => r.name).filter(Boolean));
+    const song = this.#q("SELECT artist, artists_json FROM songs WHERE video_id=?").get(id);
+    if (song?.artist) names.add(song.artist);
+    for (const a of parse(song?.artists_json, [])) if (a?.name) names.add(a.name);
+    return { ids, names: [...names] };
+  }
+
+  // ------------------------------------------------------------ similarTo
+
+  /** Raw (un-normalised) candidate scores for one seed: Map(id -> { score, reasons: Map(text -> weight) }). */
+  #candidates(seed) {
+    const m = this.#model();
+    const cands = new Map();
+    const add = (id, w, reason) => {
+      if (id === seed || !YT_ID.test(id)) return;
+      let c = cands.get(id);
+      if (!c) cands.set(id, (c = { score: 0, reasons: new Map() }));
+      c.score += w;
+      c.reasons.set(reason, (c.reasons.get(reason) ?? 0) + w);
+    };
+    const seedTitle = this.#meta(seed).title ?? "this song";
+
+    // 1. YouTube Music graph.
+    for (const r of this.#q("SELECT related_id id, kind, rank FROM related WHERE video_id=?").all(seed)) {
+      const decay = 1 / (1 + (r.rank ?? 0) / 10);
+      if (r.kind === "related") add(r.id, 1.0 * decay, `Related to ${seedTitle} on YouTube Music`);
+      else if (r.kind === "next") add(r.id, 0.7 * decay, `Up next after ${seedTitle} on YouTube Music`);
+    }
+
+    // 2. Co-listening.
+    for (const nb of m.neighbors.get(seed) ?? []) {
+      add(nb.id, 1.5 * nb.sim, `Friends who play ${seedTitle} also play this`);
+    }
+
+    // 3. Same artist and similar artists.
+    const { ids, names } = this.#artistsOf(seed);
+    const label = names[0] ?? "this artist";
+    const byArtist = (artistIds, artistName, limit) => {
+      const out = new Set();
+      for (const aid of artistIds) {
+        for (const r of this.#q("SELECT video_id FROM song_artists WHERE artist_id=? LIMIT ?").all(aid, limit)) out.add(r.video_id);
+      }
+      if (artistName) {
+        for (const r of this.#q("SELECT video_id FROM songs WHERE artist=? LIMIT ?").all(artistName, limit)) out.add(r.video_id);
+      }
+      return out;
+    };
+    const same = byArtist(ids, null, 40);
+    for (const name of names) for (const id of byArtist([], name, 40)) same.add(id);
+    for (const id of same) add(id, 0.3, `Also by ${label}`);
+    const seenArtists = new Set(ids);
+    for (const aid of ids) {
+      for (const r of this.#q(`SELECT ar.related_id id, ar.rank, a.name FROM artist_related ar
+        LEFT JOIN artists a ON a.id=ar.related_id WHERE ar.artist_id=? ORDER BY ar.rank LIMIT 20`).all(aid)) {
+        if (seenArtists.has(r.id)) continue;
+        seenArtists.add(r.id);
+        const w = 0.4 / (1 + (r.rank ?? 0) / 5);
+        for (const id of byArtist([r.id], r.name, 10)) {
+          add(id, w, r.name ? `By ${r.name}, similar to ${label}` : `Similar to ${label}`);
+        }
+      }
+    }
+    return cands;
+  }
+
+  /** Songs like this one: graph edges, co-listening and artist links merged into a 0..1 score. */
+  similarTo(videoId, { limit = 20 } = {}) {
+    const cands = this.#candidates(videoId);
+    let top = 0;
+    for (const c of cands.values()) top = Math.max(top, c.score);
+    const out = [];
+    for (const [id, c] of cands) {
+      const meta = this.#meta(id);
+      out.push({
+        videoId: id, title: meta.title, artist: meta.artist, score: top > 0 ? c.score / top : 0,
+        reasons: [...c.reasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([t]) => t),
+        archived: meta.archived,
+      });
+    }
+    return out.sort((a, b) => b.score - a.score || (a.videoId < b.videoId ? -1 : 1)).slice(0, limit);
+  }
+
+  // -------------------------------------------------------------- forUser
+
+  /** Per-friend suggestions with reasons. */
+  forUser(uid, { limit = 30 } = {}) {
+    const m = this.#model();
+    const now = this.#now();
+    const mine = m.perUser.get(uid);
+    const popMax = Math.max(1, ...m.recent.values());
+    const pop = (id) => (m.recent.get(id) ?? 0) / popMax;
+
+    // Final pass shared by both paths: drop unavailable, cap two per artist.
+    const finish = (list) => {
+      const perArtist = new Map();
+      const items = [];
+      for (const c of list) {
+        const meta = this.#meta(c.videoId);
+        if (meta.unavailable) continue;
+        const key = (meta.artist ?? "").split(",")[0].trim().toLowerCase();
+        if (key) {
+          const k = perArtist.get(key) ?? 0;
+          if (k >= 2) continue;
+          perArtist.set(key, k + 1);
+        }
+        items.push({
+          videoId: c.videoId, title: meta.title, artist: meta.artist, score: c.score,
+          reasons: c.reasons.slice(0, 2), archived: meta.archived,
+        });
+        if (items.length >= limit) break;
+      }
+      const top = items[0]?.score || 0;
+      for (const it of items) it.score = top > 0 ? it.score / top : 0;
+      return items;
+    };
+    const popular = (known = new Map()) => [...m.recent].filter(([id]) => !known.has(id))
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+      .map(([id, c]) => ({ videoId: id, score: c, reasons: ["Popular with friends"] }));
+
+    // Cold start: nothing known about this listener.
+    if (!mine || !mine.size) return { uid, seeds: [], items: finish(popular()) };
+
+    const seeds = [...mine].sort((a, b) => b[1].weight - a[1].weight || (a[0] < b[0] ? -1 : 1))
+      .slice(0, 15).map(([id, s]) => ({ videoId: id, title: this.#meta(id).title, weight: s.weight }));
+
+    // Candidates: similarTo of each seed weighted by seed weight, plus a popularity prior.
+    // id -> { score, seeds: Map(seed title -> weight), signals: Map(reason -> weight) }
+    const cands = new Map();
+    const touch = (id) => cands.get(id) ?? cands.set(id, { score: 0, seeds: new Map(), signals: new Map() }).get(id);
+    const inc = (map, k, w) => map.set(k, (map.get(k) ?? 0) + w);
+    for (const seed of seeds) {
+      const seedTitle = seed.title ?? "a song you played";
+      for (const s of this.similarTo(seed.videoId, { limit: 50 })) {
+        const w = s.score * seed.weight;
+        const c = touch(s.videoId);
+        c.score += w;
+        inc(c.seeds, seedTitle, w);
+        if (s.reasons[0]) inc(c.signals, s.reasons[0], w);
+      }
+    }
+    for (const [id] of m.recent) {
+      const c = touch(id);
+      const w = 0.1 * pop(id);
+      c.score += w;
+      inc(c.signals, "Popular with friends", w);
+    }
+
+    // Songs the listener already knows are not suggestions.
+    const known = (id) => {
+      const s = mine.get(id);
+      return s && (now - s.last < 7 * DAY || s.count > 3);
+    };
+    const list = [...cands]
+      .filter(([id]) => !known(id))
+      .map(([id, c]) => {
+        const top = (map) => [...map].sort((a, b) => b[1] - a[1]).map(([t]) => t);
+        // Best seed first, then the strongest signal (or the next seed).
+        const seedReasons = top(c.seeds).map((t) => `Because you played ${t}`);
+        const reasons = seedReasons.slice(0, 1).concat(top(c.signals).slice(0, 1));
+        if (reasons.length < 2) reasons.push(...seedReasons.slice(1, 2));
+        return { videoId: id, score: c.score, reasons };
+      })
+      .sort((a, b) => b.score - a.score || (a.videoId < b.videoId ? -1 : 1));
+    return { uid, seeds: seeds.slice(0, 10), items: finish(list) };
+  }
+}

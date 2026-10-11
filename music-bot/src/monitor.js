@@ -4,6 +4,7 @@
 // sent to Telegram when a bot is configured).
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { runProbes } from "./probes.js";
 
 const CHECK_MS = 2 * 60_000;
 const KEEP_DAYS = 30;
@@ -49,6 +50,29 @@ export function nextAlerts(prev, cur, label) {
   return out;
 }
 
+const PROBE_NAMES = { search: "Search", artist: "Artist pages", next: "Suggestions", audio: "Audio" };
+
+/**
+ * Probe alert decisions (pure). prevFails: {kind: consecutive failures}.
+ * Returns { fails, alerts }: warn on the 2nd failure in a row, up on recovery.
+ */
+export function probeAlerts(prevFails, result, label) {
+  const fails = {};
+  const alerts = [];
+  for (const [k, name] of Object.entries(PROBE_NAMES)) {
+    const p = result?.[k];
+    if (!p) {
+      fails[k] = prevFails?.[k] || 0;
+      continue;
+    }
+    const before = prevFails?.[k] || 0;
+    fails[k] = p.ok ? 0 : before + 1;
+    if (!p.ok && fails[k] === 2) alerts.push({ level: "warn", text: `${name} broken on ${label}: ${p.detail}` });
+    else if (p.ok && before >= 2) alerts.push({ level: "up", text: `${name} works again on ${label}` });
+  }
+  return { fails, alerts };
+}
+
 export class Monitor {
   /**
    * @param {object} o
@@ -57,8 +81,20 @@ export class Monitor {
    * @param {() => object[]} o.targets  [{id,label,url,role}] (role home|worker|service)
    * @param {() => object} o.localStats  this server's stats (for role "home")
    * @param {(text: string) => Promise<boolean>} [o.notify]
+   * @param {boolean} [o.probes]        run app-like probes (default true)
+   * @param {number} [o.probeEveryMs]   per-target probe interval (default 10 min)
+   * @param {object} [o.probeOpts]      overrides for PROBE_DEFAULTS
+   * @param {Function} [o.runProbesImpl] test hook
+   * @param {() => number} [o.now]      clock
    */
-  constructor({ dir, token, targets, localStats, notify }) {
+  constructor({ dir, token, targets, localStats, notify, probes = true, probeEveryMs = 10 * 60_000, probeOpts, runProbesImpl, now }) {
+    this.probes = probes;
+    this.probeEveryMs = probeEveryMs;
+    this.probeOpts = probeOpts;
+    this.runProbesImpl = runProbesImpl || runProbes;
+    this.clock = now || Date.now;
+    this.probeLast = new Map();
+    this.probeBusy = new Set();
     this.dir = dir;
     this.token = token;
     this.targets = targets;
@@ -93,7 +129,15 @@ export class Monitor {
   async checkOne(t) {
     const now = Date.now();
     const prev = this.state.get(t.id) || { fails: 0, down: false, downSince: null };
-    const cur = { ...t, checkedAt: new Date(now).toISOString(), stats: prev.stats ?? null, raw: prev.raw ?? null };
+    const cur = {
+      ...t,
+      checkedAt: new Date(now).toISOString(),
+      stats: prev.stats ?? null,
+      raw: prev.raw ?? null,
+      probes: prev.probes ?? null,
+      probeHistory: prev.probeHistory ?? [],
+      probeFails: prev.probeFails ?? {},
+    };
     const healthUrl = t.role === "service" ? t.url : `${t.url}/health`;
     const t0 = Date.now();
     try {
@@ -132,6 +176,36 @@ export class Monitor {
     this.state.set(t.id, cur);
     appendFileSync(join(this.dir, `${dayKey(now)}.jsonl`), `${JSON.stringify([now, t.id, cur.ok ? 1 : 0, cur.ms])}\n`);
     for (const a of nextAlerts(prev, cur, t.label)) await this.alert(a.level, t.id, a.text);
+    this.maybeProbe(t, cur);
+  }
+
+  /** Fire-and-forget probe run, at most every probeEveryMs per target. */
+  maybeProbe(t, cur) {
+    if (!this.probes || !cur.ok || (t.role !== "home" && t.role !== "worker")) return false;
+    if (this.probeBusy.has(t.id)) return false;
+    const now = this.clock();
+    const last = this.probeLast.get(t.id);
+    if (last !== undefined && now - last < this.probeEveryMs) return false;
+    this.probeLast.set(t.id, now);
+    this.probeBusy.add(t.id);
+    const p = (async () => {
+      try {
+        const res = await this.runProbesImpl(t.url, { token: this.token, opts: this.probeOpts });
+        // The state object may have been replaced by a later check; update the newest.
+        const st = this.state.get(t.id) || cur;
+        const { fails, alerts } = probeAlerts(st.probeFails, res, t.label);
+        st.probes = res;
+        st.probeFails = fails;
+        st.probeHistory = [...(st.probeHistory || []), res].slice(-20);
+        for (const a of alerts) await this.alert(a.level, t.id, a.text);
+      } catch {
+        // probes never break the monitor
+      } finally {
+        this.probeBusy.delete(t.id);
+      }
+    })();
+    this.lastProbeRun = p;
+    return true;
   }
 
   async alert(level, server, text) {

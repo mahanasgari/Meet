@@ -177,6 +177,14 @@ tr:last-child td{border-bottom:0}
 .gli .ar{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
 .gpills{display:flex;flex-wrap:wrap;gap:6px}
 @media (max-width:760px){.gcols{grid-template-columns:1fr}}
+.pchips{display:flex;gap:6px;flex-wrap:wrap}
+.pstrip{display:flex;align-items:center;gap:8px;font-size:12px;margin-top:4px;flex-wrap:wrap}
+.pstrip>span:first-child{min-width:96px}
+.dots.sq i{width:8px;height:8px;border-radius:2px}
+.dots i.na{background:var(--line)}
+.pwarn{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border:1px solid currentColor;border-radius:50%;font-size:11px;line-height:1;font-weight:700;color:var(--warn);cursor:help}
+.scorebar{display:inline-block;vertical-align:middle;width:80px;height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
+.scorebar i{display:block;height:100%;background:var(--c3)}
 </style>
 </head>
 <body>
@@ -220,11 +228,12 @@ tr:last-child td{border-bottom:0}
 var TOKEN_KEY = "mp-admin-token", THEME_KEY = "mp-admin-theme";
 var state = {
   token: "", days: 7, data: null, page: "overview", updated: null, err: "",
-  sort: {}, userQ: "", fbQ: "", errSrv: "", errOpen: {}, loading: false, arcKind: ""
+  sort: {}, userQ: "", fbQ: "", errSrv: "", errOpen: {}, loading: false, arcKind: "",
+  fyUid: "", fyUsers: null, fyUsersErr: "", fyUsersLoading: false, fyStats: null, fyStatsLoading: false, fyReq: null
 };
 var PAGES = [
   ["overview", "Overview"], ["servers", "Servers"], ["users", "Users"], ["listening", "Listening"],
-  ["archive", "Archive"], ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["alerts", "Alerts"]
+  ["archive", "Archive"], ["foryou", "For you"], ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["alerts", "Alerts"]
 ];
 var charts = [], tables = {};
 
@@ -583,7 +592,8 @@ function pageOverview() {
   var latest = d.app && d.app.latest;
   var activeToday = arr(d.users).filter(function (u) { return (u.today || 0) > 0; }).length;
   var h = '<div class="grid kpis">';
-  h += kpi("Servers up", up + "/" + srv.length, "", !srv.length ? "" : up === srv.length ? "good" : up === 0 ? "bad" : "warn");
+  var failN = sum(srv, function (s) { return probeFails(s).length; });
+  h += kpi("Servers up", up + "/" + srv.length, failN ? '<span class="warn">' + fmt(failN) + " app checks failing</span>" : "", !srv.length ? "" : up === srv.length ? "good" : up === 0 ? "bad" : "warn");
   h += kpi("Active users today", fmt(activeToday), "of " + fmt(arr(d.users).length) + " invites");
   h += kpi("Plays", fmt(T.plays), delta(T.plays, P.plays) + " vs previous");
   h += kpi("Listening hours", isNum(T.minutes) ? fmt1(T.minutes / 60, 1) : "–", delta(T.minutes, P.minutes) + " vs previous");
@@ -593,7 +603,9 @@ function pageOverview() {
   h += kpi("Latest build", latest ? esc(latest.version) + "+" + esc(latest.build) : "–", "");
   h += "</div>";
   h += '<div class="strip">' + (srv.length ? srv.map(function (s) {
-    return '<span class="chip"><span class="dot ' + (s.up ? "up" : "down") + '"></span>' + esc(s.label || s.id) + ' <span class="muted">' + (s.up ? msF(s.ms) : "down") + "</span></span>";
+    var fails = probeFails(s);
+    return '<span class="chip"><span class="dot ' + (s.up ? "up" : "down") + '"></span>' + esc(s.label || s.id) + ' <span class="muted">' + (s.up ? msF(s.ms) : "down") + "</span>" +
+      (fails.length ? ' <span class="pwarn"' + tipAttr("App checks failing:<br>" + fails.map(function (f) { return esc(f.label) + (f.p.detail ? " &mdash; " + esc(f.p.detail) : ""); }).join("<br>")) + ">!</span>" : "") + "</span>";
   }).join("") : '<span class="muted">No servers reported yet</span>') + "</div>";
   h += '<div class="grid cols2">' + card("Plays and skips per day", playsChart()) + card("Requests per day", reqChart()) + "</div>";
   h += '<div class="grid cols2">' + card("Latest alerts", alertsTable(arr(d.alerts).slice(0, 5), "ov-alerts"), '<a href="#alerts">All</a>');
@@ -625,6 +637,33 @@ function ytdlpHtml(st) {
   if (latest) h += cur === latest ? ' <span class="badge good" style="display:inline-block">latest</span>' : ' <span class="badge warn" style="display:inline-block">update → ' + esc(latest) + "</span>";
   return h;
 }
+/* app checks: probes {at, search, artist, next, audio}; probeHistory newest last */
+var PROBE_KINDS = [["search", "Search"], ["artist", "Artist pages"], ["next", "Suggestions"], ["audio", "Audio"]];
+function probeFails(s) {
+  var p = (s && s.probes) || {}, out = [];
+  PROBE_KINDS.forEach(function (k) { var x = p[k[0]]; if (x && !x.ok) out.push({ label: k[1], p: x }); });
+  return out;
+}
+function probeChip(k, x) {
+  if (!x) return '<span class="chip"><span class="dot"></span>' + esc(k[1]) + ' <span class="muted">not run</span></span>';
+  if (x.ok) return '<span class="chip"><span class="dot up"></span>' + esc(k[1]) + (x.detail ? ' <span class="muted">' + esc(x.detail) + "</span>" : "") + (isNum(x.ms) ? ' <span class="muted">' + msF(x.ms) + "</span>" : "") + "</span>";
+  return '<span class="chip"><span class="dot down"></span>' + esc(k[1]) + ' <span class="bad">' + esc(x.detail || "failed") + "</span></span>";
+}
+function probesRow(s) {
+  var pr = s.probes;
+  if (!pr) return '<div><div class="sub-h">App checks</div><div class="muted" style="font-size:13px">App checks not run yet</div></div>';
+  var hist = arr(s.probeHistory).slice(-20);
+  var h = '<div><div class="sub-h">App checks</div><div class="pchips">' + PROBE_KINDS.map(function (k) { return probeChip(k, pr[k[0]]); }).join("") +
+    '<span class="muted" style="font-size:12px;align-self:center">checked ' + esc(rel(pr.at)) + "</span></div>";
+  if (hist.length) h += '<div style="margin-top:4px">' + PROBE_KINDS.map(function (k) {
+    return '<div class="pstrip"><span class="muted">' + esc(k[1]) + '</span><div class="dots sq">' + hist.map(function (p) {
+      var x = p && p[k[0]];
+      if (!x) return '<i class="na"></i>';
+      return '<i class="' + (x.ok ? "" : "f") + '"' + tipAttr(fullTime(p.at || pr.at) + " &middot; " + (x.ok ? "OK" : "Failed") + (isNum(x.ms) ? " &middot; " + msF(x.ms) : "") + (x.detail ? "<br>" + esc(x.detail).slice(0, 140) : "")) + "></i>";
+    }).join("") + "</div></div>";
+  }).join("") + "</div>";
+  return h + "</div>";
+}
 function srvCard(s, data) {
   var st = s.stats, yt = s.yt, hist = (data.history || {})[s.id], yh = arr((data.ytHistory || {})[s.id]).slice().reverse();
   var h = '<div class="card srv"><div class="head"><span class="dot ' + (s.up ? "up" : "down") + '"></span><b>' + esc(s.label || s.id) + '</b><span class="badge">' + esc(s.role || "") + '</span>';
@@ -638,7 +677,8 @@ function srvCard(s, data) {
     h += "<div><span>Server uptime</span>" + dur(st.uptimeS) + "</div><div><span>Node</span>" + esc(st.node || "–") + "</div><div><span>yt-dlp</span>" + ytdlpHtml(st) + "</div><div><span>Jam rooms</span>" + fmt(st.jamRooms) + "</div>";
   }
   h += "</div>";
-  if (yt && !yt.ok && yt.detail) h += '<div class="bad" style="font-size:12px;word-break:break-word">' + esc(yt.detail) + "</div>";
+  if (s.role === "home" || s.role === "worker") h += probesRow(s);
+  if (yt && !yt.ok && yt.detail) h +='<div class="bad" style="font-size:12px;word-break:break-word">' + esc(yt.detail) + "</div>";
   if (st) {
     var m = st.mem || {}, used = isNum(m.total) && isNum(m.free) ? m.total - m.free : null;
     h += '<div><div class="sub-h">Memory &mdash; this process ' + bytes(m.rss) + " &middot; system " + bytes(used) + " / " + bytes(m.total) + '</div><div class="bar ' + (used / m.total > 0.9 ? "badb" : "") + '"><i class="b2" style="width:' + Math.min(100, used / m.total * 100 || 0) + '%"></i><i style="width:' + Math.min(100, m.rss / m.total * 100 || 0) + '%"></i></div></div>';
@@ -1020,6 +1060,104 @@ function pageAlerts() {
   return '<div class="card" style="margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="dot ' + (on ? "up" : "") + '"></span><span style="flex:1 1 200px">Telegram alerts: <b>' + (on ? "on" : "off") + "</b>" + (on ? ' <span class="muted">&mdash; @' + esc(tg.bot || "miniplayer_robot") + '</span>' : ' <span class="muted">&mdash; connect your Telegram to get alerts</span>') + '</span><button class="btn' + (on ? "" : " primary") + '" data-act="tglink">' + (on ? "Connect another chat" : "Connect Telegram") + '</button><button class="btn" data-act="alerttest">Send test alert</button></div>' + card("Alert history", alertsTable(arr(D().alerts), "alerts"));
 }
 
+/* ========================= for you (recommender preview) ========================= */
+function scoreBar(v) {
+  if (!isNum(v)) return '<span class="muted">–</span>';
+  var p = Math.max(0, Math.min(1, v));
+  return '<span class="scorebar"><i style="width:' + (p * 100).toFixed(0) + '%"></i></span> <span class="muted">' + p.toFixed(2) + "</span>";
+}
+function recCols() {
+  return [
+    { k: "rank", label: "#", h: function (r, i) { return i + 1; } },
+    { k: "title", label: "Title", v: function (r) { return (r.title || r.videoId || "").toLowerCase(); }, h: function (r) { return ytLink(r.videoId, r.title); } },
+    { k: "artist", label: "Artist", v: function (r) { return (r.artist || "").toLowerCase(); }, h: function (r) { return esc(r.artist || "–"); } },
+    { k: "score", label: "Score", r: 1, v: function (r) { return isNum(r.score) ? r.score : 0; }, h: function (r) { return scoreBar(r.score); } },
+    { k: "reasons", label: "Why", wrap: true, h: function (r) { return '<span class="muted">' + arr(r.reasons).map(function (x) { return esc(x); }).join(" · ") + "</span>"; } },
+    { k: "arch", label: "Archive", h: function (r) { return r.archived ? '<span class="badge good">in archive</span>' : '<span class="badge">not yet</span>'; } },
+    { k: "more", label: "", h: function (r) { return r.videoId ? '<button class="btn sm" data-act="fysimilar" data-id="' + esc(r.videoId) + '" data-title="' + esc(r.title || r.videoId) + '">More like this</button>' : ""; } }
+  ];
+}
+var fySeq = 0, simSeq = 0;
+function fyRender() { if (state.page === "foryou") render(true); }
+function fyLoadRec(uid) {
+  var seq = ++fySeq;
+  state.fyReq = { uid: uid, loading: true };
+  api("api/recommend?uid=" + encodeURIComponent(uid)).then(function (r) {
+    if (seq !== fySeq) return;
+    state.fyReq = { uid: uid, data: r || {} };
+    fyRender();
+  }).catch(function (e) {
+    if (seq !== fySeq || !state.token) return;
+    state.fyReq = { uid: uid, err: e.message };
+    fyRender();
+  });
+}
+/* loads users, stats and the selected friend's recommendations once; never re-fetches on render */
+function fyEnsure() {
+  if (!state.token || state.page !== "foryou") return;
+  if (state.fyUsers === null && !state.fyUsersLoading) {
+    state.fyUsersLoading = true;
+    api("api/recommend/users").then(function (r) {
+      state.fyUsers = arr(r && r.users); state.fyUsersErr = "";
+      if (!state.fyUsers.some(function (u) { return u.uid === state.fyUid; })) state.fyUid = state.fyUsers.length ? state.fyUsers[0].uid : "";
+    }).catch(function (e) {
+      if (!state.token) return;
+      state.fyUsers = []; state.fyUsersErr = e.message;
+    }).then(function () { state.fyUsersLoading = false; fyRender(); });
+  }
+  if (state.fyStats === null && !state.fyStatsLoading) {
+    state.fyStatsLoading = true;
+    api("api/recommend/stats").then(function (r) { state.fyStats = r || {}; }).catch(function (e) {
+      if (!state.token) return;
+      state.fyStats = { err: e.message };
+    }).then(function () { state.fyStatsLoading = false; fyRender(); });
+  }
+  if (state.fyUid && !(state.fyReq && state.fyReq.uid === state.fyUid)) fyLoadRec(state.fyUid);
+}
+function pageForYou() {
+  var st = state.fyStats, us = state.fyUsers, rec = state.fyReq && state.fyReq.uid === state.fyUid ? state.fyReq : null;
+  var h = '<div class="upd" style="margin-bottom:12px">' + (!st ? "Loading stats..." : st.err ? "Stats unavailable" :
+    esc("Built from " + fmt(st.listeners) + " listeners · " + fmt(st.sessions) + " sessions · " + fmt(st.songsWithNeighbors) + " songs with neighbors · updated " + rel(st.builtAt))) + "</div>";
+  var pills;
+  if (us === null) pills = empty("Loading listeners...");
+  else if (state.fyUsersErr) pills = '<div class="empty bad">Could not load listeners (' + esc(state.fyUsersErr) + ").</div>";
+  else if (!us.length) pills = empty("No listeners yet");
+  else pills = '<div class="gpills">' + us.map(function (u) {
+    var on = u.uid === state.fyUid;
+    return '<button class="chip ' + (on ? "on" : "") + '" data-act="fyuser" data-uid="' + esc(u.uid) + '">' + esc(u.name || u.uid) + ' <span class="' + (on ? "" : "muted") + '">' + fmt(u.plays) + " plays</span></button>";
+  }).join("") + "</div>";
+  h += card("Friends", pills);
+  var seedBody, recBody;
+  if (!state.fyUid) {
+    var none = us === null ? "Loading..." : state.fyUsersErr ? "Listeners unavailable" : "No listeners yet";
+    seedBody = empty(none); recBody = empty(none);
+  } else if (!rec || rec.loading) {
+    seedBody = empty("Loading..."); recBody = empty("Loading recommendations...");
+  } else if (rec.err) {
+    seedBody = empty("Not available"); recBody = '<div class="empty bad">Could not load recommendations (' + esc(rec.err) + ").</div>";
+  } else {
+    var seeds = arr(rec.data.seeds);
+    seedBody = seeds.length ? '<div class="gpills">' + seeds.map(function (s) { return '<span class="chip">' + ytLink(s.videoId, s.title) + "</span>"; }).join("") + "</div>" : empty("Not enough listening yet");
+    recBody = table("fy-recs", recCols(), arr(rec.data.items), { sort: { k: "score", dir: "desc" }, empty: "No recommendations for this listener yet" });
+  }
+  h += card("Because you played", seedBody);
+  h += card("Recommendations", recBody);
+  return h + '<div class="note">Suggestions come from friends\' listening, the YouTube Music song graph and similar artists &mdash; no YouTube request is made.</div>';
+}
+function openSimilar(id, title) {
+  if (!id) return;
+  var seq = ++simSeq;
+  var m = modal('<h3>More like ' + esc(title || id) + '</h3><div id="simBody" style="overflow:auto;min-height:0"><div class="empty">Loading...</div></div><div class="row"><button class="btn primary" data-act="close">Close</button></div>');
+  m.classList.add("wide");
+  api("api/similar?id=" + encodeURIComponent(id)).then(function (r) {
+    var b = $("simBody"); if (!b || seq !== simSeq) return;
+    b.innerHTML = table("fy-sim", recCols(), arr(r && r.items), { sort: { k: "score", dir: "desc" }, empty: "No similar songs yet" });
+  }).catch(function (e) {
+    var b = $("simBody"); if (!b || seq !== simSeq || !state.token) return;
+    b.innerHTML = '<div class="empty bad">Could not load similar songs (' + esc(e.message) + ").</div>";
+  });
+}
+
 /* ========================= actions ========================= */
 var graphSeq = 0;
 function graphCol(title, list) {
@@ -1082,6 +1220,8 @@ function handleAct(a) {
     api("feedback/log?file=" + encodeURIComponent(file), { text: true }).then(function (t) { var p = $("logPre"); if (p) p.textContent = t || "(empty)"; }).catch(function (e) { var p = $("logPre"); if (p) p.textContent = "Failed: " + e.message; });
   } else if (act === "copylog") { var pr = $("logPre"); if (pr) copyText(pr.textContent); }
   else if (act === "graph") openGraph(a.getAttribute("data-id"));
+  else if (act === "fyuser") { state.fyUid = a.getAttribute("data-uid") || ""; state.fyReq = null; fyRender(); }
+  else if (act === "fysimilar") openSimilar(a.getAttribute("data-id"), a.getAttribute("data-title"));
   else if (act === "tglink") {
     api("api/telegram-link", { body: {} }).then(function (r) {
       if (r && r.url) { window.open(r.url, "_blank", "noopener"); toast("Press Start in Telegram to connect"); }
@@ -1112,7 +1252,7 @@ document.addEventListener("keydown", function (e) {
 });
 
 /* ========================= router & render ========================= */
-var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, archive: pageArchive, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, alerts: pageAlerts };
+var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, archive: pageArchive, foryou: pageForYou, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, alerts: pageAlerts };
 function route() {
   var p = (location.hash || "").replace("#", "");
   state.page = RENDER[p] ? p : "overview";
@@ -1132,12 +1272,13 @@ function render(keepScroll) {
   renderChrome();
   charts = []; tables = {};
   var pg = $("page");
-  if (!state.data) pg.innerHTML = empty("Loading...");
+  if (!state.data && state.page !== "foryou") pg.innerHTML = empty("Loading...");
   else {
     try { pg.innerHTML = RENDER[state.page](); } catch (e) { pg.innerHTML = '<div class="banner">Render error: ' + esc(e.message) + "</div>"; }
     drawCharts();
     if (focusId) { var el = $(focusId); if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) {} } }
   }
+  if (state.page === "foryou") fyEnsure();
   if (keepScroll !== true) window.scrollTo(0, y);
 }
 function showLogin(msg) {

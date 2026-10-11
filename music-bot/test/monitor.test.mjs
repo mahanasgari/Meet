@@ -1,9 +1,10 @@
 import { strict as assert } from "node:assert";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Monitor, nextAlerts, parseServices, slug } from "../src/monitor.js";
+import { Monitor, nextAlerts, parseServices, probeAlerts, slug } from "../src/monitor.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "mon-"));
 const DAY = 864e5;
@@ -107,4 +108,61 @@ test("alert keeps newest first, writes alerts.json, and reloads", async () => {
 
   const reloaded = newMonitor(dir);
   assert.deepEqual(reloaded.alerts.map((a) => a.text), ["second", "first"]);
+});
+
+const pr = (ok, detail = "x") => ({ ok, detail });
+const res = (o) => ({ search: pr(true), artist: pr(true), next: pr(true), audio: pr(true), ...o });
+
+test("probeAlerts: warns on 2nd consecutive failure once, then recovers", () => {
+  let r = probeAlerts({}, res({ artist: pr(false, "empty artist page") }), "Germany");
+  assert.deepEqual(r.alerts, []);
+  assert.equal(r.fails.artist, 1);
+  r = probeAlerts(r.fails, res({ artist: pr(false, "empty artist page") }), "Germany");
+  assert.deepEqual(r.alerts, [{ level: "warn", text: "Artist pages broken on Germany: empty artist page" }]);
+  r = probeAlerts(r.fails, res({ artist: pr(false, "empty artist page") }), "Germany");
+  assert.deepEqual(r.alerts, []);
+  r = probeAlerts(r.fails, res(), "Germany");
+  assert.deepEqual(r.alerts, [{ level: "up", text: "Artist pages works again on Germany" }]);
+  assert.equal(r.fails.artist, 0);
+});
+
+test("probeAlerts: a single blip is silent", () => {
+  let r = probeAlerts({}, res({ next: pr(false) }), "X");
+  r = probeAlerts(r.fails, res(), "X");
+  assert.deepEqual(r.alerts, []);
+});
+
+test("Monitor runs probes at most every probeEveryMs and stores results", async () => {
+  const server = createServer((_q, s) => s.end("ok"));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  let clock = 1000;
+  let calls = 0;
+  const m = new Monitor({
+    dir: tmp(),
+    token: "t",
+    targets: () => [],
+    localStats: () => ({}),
+    probeEveryMs: 600_000,
+    now: () => clock,
+    runProbesImpl: async () => {
+      calls++;
+      return { at: "x", ...res() };
+    },
+  });
+  const t = { id: "w", label: "W", url, role: "worker" };
+  await m.checkOne(t);
+  await m.lastProbeRun;
+  await m.checkOne(t);
+  assert.equal(calls, 1);
+  clock += 600_001;
+  await m.checkOne(t);
+  await m.lastProbeRun;
+  assert.equal(calls, 2);
+  const st = m.state.get("w");
+  assert.equal(st.probeHistory.length, 2);
+  assert.ok(st.probes.search.ok);
+  await m.checkOne({ id: "s", label: "S", url, role: "service" });
+  assert.equal(calls, 2);
+  server.close();
 });

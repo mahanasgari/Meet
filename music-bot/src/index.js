@@ -36,6 +36,7 @@ import { dailyReport, weeklyReport } from "./reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
+import { Recommender } from "./recommend.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
 import {
@@ -610,6 +611,10 @@ if (catalog) {
   }
 }
 
+// In-house recommender (home only): friends' plays + co-listening + the
+// YouTube Music song graph + similar artists. No YouTube requests.
+const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
+
 let dashboardHtml = null;
 function dashboardPage() {
   if (!dashboardHtml || process.env.DASHBOARD_DEV) {
@@ -655,6 +660,8 @@ function dashboardData(days) {
       uptime7d: up7[s.id] ?? null,
       stats: s.raw?.server || null,
       archive: s.raw?.archive || null,
+      probes: s.probes || null,
+      probeHistory: s.probeHistory || [],
       yt: yt[0] || null,
     };
   });
@@ -2790,6 +2797,32 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, 200_000).catch(() => ({}));
       const out = await handleHomeRoute(url.pathname, body, { catalog, peers: healthyPeers });
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/admin/api/") && /^\/admin\/api\/(recommend(\/users|\/stats)?|similar)$/.test(url.pathname)) {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!recommender) {
+        sendJson(res, 404, { error: "no_recommender" });
+        return;
+      }
+      if (url.pathname === "/admin/api/recommend/stats") {
+        sendJson(res, 200, recommender.stats());
+        return;
+      }
+      if (url.pathname === "/admin/api/recommend/users") {
+        const names = new Map(invites.list().map((e) => [e.uid, e.name]));
+        sendJson(res, 200, { users: recommender.users().map((u) => ({ ...u, name: names.get(u.uid) || u.uid })) });
+        return;
+      }
+      if (url.pathname === "/admin/api/similar") {
+        const id = String(url.searchParams.get("id") || "");
+        sendJson(res, 200, { items: /^[A-Za-z0-9_-]{11}$/.test(id) ? recommender.similarTo(id, { limit: 25 }) : [] });
+        return;
+      }
+      sendJson(res, 200, recommender.forUser(String(url.searchParams.get("uid") || ""), { limit: 30 }));
       return;
     }
     if (req.method === "GET" && url.pathname === "/admin/api/graph") {

@@ -37,6 +37,7 @@ import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } fr
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
 import { Recommender } from "./recommend.js";
+import { downloadVideo, needsVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
 import {
@@ -615,6 +616,142 @@ if (catalog) {
 // YouTube Music song graph + similar artists. No YouTube requests.
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
 
+// Archive ahead of time what we're about to suggest: each friend's picks
+// and the closest neighbours of the most-played songs. Queued as low-priority
+// "prefetch" jobs, so real plays always go first and the per-server hourly
+// download budget (ARCHIVE_JOBS_PER_HOUR) keeps YouTube happy.
+if (recommender) {
+  const seedFromGraph = () => {
+    try {
+      const want = new Set();
+      for (const u of recommender.users()) {
+        for (const x of recommender.forUser(u.uid, { limit: 25 }).items) if (!x.archived) want.add(x.videoId);
+      }
+      const top = catalog.db
+        .prepare("SELECT video_id FROM plays WHERE at > ? GROUP BY video_id ORDER BY COUNT(*) DESC LIMIT 30")
+        .all(Date.now() - 30 * 864e5);
+      for (const { video_id } of top) {
+        for (const x of recommender.similarTo(video_id, { limit: 10 })) if (!x.archived) want.add(x.videoId);
+      }
+      const ids = [...want].filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 300);
+      const n = catalog.enqueue(ids, "prefetch");
+      if (n) console.log(`[archive] queued ${n} songs from suggestions and the song graph`);
+    } catch (e) {
+      console.error("[archive] graph seed:", e.message);
+    }
+  };
+  setTimeout(seedFromGraph, 20 * 60_000).unref();
+  setInterval(seedFromGraph, 3 * 3600_000).unref();
+}
+
+// --- Music video requests.
+let videoJobs = 0;
+async function handleVideo(req, res, id) {
+  const home = archive.home;
+  const sid = archive.serverId;
+  // Someone else is downloading it: wait (up to ~90 s) until it's stored.
+  let c = await home.videoClaim(id, sid).catch(() => null);
+  for (let i = 0; c?.action === "wait" && i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (req.destroyed) return;
+    c = await home.videoClaim(id, sid).catch(() => null);
+  }
+  if (c?.action === "stored" && c.video?.msgId) {
+    try {
+      if (!archive.tg.ready) await archive.tg.connect();
+      await serveVideoFromTelegram(req, res, archive.tg, c.video.msgId, { size: c.video.size, source: `telegram:${sid}` });
+    } catch (e) {
+      console.error("[video] telegram:", e.message);
+      if (!res.headersSent) sendJson(res, 502, { error: "video_unavailable" });
+    }
+    return;
+  }
+  if (c?.action !== "download") {
+    sendJson(res, c?.action === "none" ? 404 : 503, { error: c?.action === "none" ? "no_video" : "video_busy" });
+    return;
+  }
+  if (videoJobs >= 2) {
+    await Promise.resolve(home.videoFailed(id, sid, "busy", {})).catch(() => undefined);
+    sendJson(res, 503, { error: "video_busy" });
+    return;
+  }
+  videoJobs++;
+  let v;
+  try {
+    v = await downloadVideo(id, {
+      ytdlpBin: YTDLP_BIN,
+      ffmpegBin: FFMPEG_BIN,
+      ytdlpArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+      tmpDir: tmpdir(),
+    });
+  } catch (e) {
+    videoJobs--;
+    console.error(`[video] ${id} download failed (${e.kind}):`, e.message);
+    await Promise.resolve(home.videoFailed(id, sid, String(e.message).slice(0, 200), { none: e.kind === "none" })).catch(() => undefined);
+    sendJson(res, e.kind === "none" ? 404 : 502, { error: e.kind === "none" ? "no_video" : "video_failed" });
+    return;
+  }
+  // Play it to this listener from the temp file while it uploads; the file
+  // is deleted once both are done.
+  let pending = 2;
+  const done = () => {
+    if (--pending > 0) return;
+    rmSync(v.path, { force: true });
+    if (v.thumbPath) rmSync(v.thumbPath, { force: true });
+  };
+  res.once("close", done);
+  serveFileRange(req, res, v.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
+  (async () => {
+    try {
+      if (!archive.tg.ready) await archive.tg.connect();
+      const r = await archive.tg.uploadVideo(v.path, {
+        title: v.title,
+        artist: v.artist,
+        durationS: v.durationS,
+        width: v.width,
+        height: v.height,
+        thumbPath: v.thumbPath,
+        caption: videoCaption(id, v),
+      });
+      await home.videoStored(id, { msgId: r.msgId, size: r.size, width: v.width, height: v.height, vcodec: v.vcodec, acodec: v.acodec, durationS: v.durationS, formatId: v.formatId, server: sid });
+      console.log(`[video] ${id} archived (${Math.round(r.size / 1048576)} MB)`);
+    } catch (e) {
+      console.error(`[video] ${id} upload failed:`, e.message);
+      await Promise.resolve(home.videoFailed(id, sid, `upload: ${e.message}`.slice(0, 200), {})).catch(() => undefined);
+    } finally {
+      videoJobs--;
+      done();
+    }
+  })();
+}
+
+// --- Backup: copy every archived song and video into a second private
+// channel (Telegram forwards server-side: no re-upload, nothing on disk).
+const BACKUP_CHANNEL = process.env.TG_BACKUP_CHANNEL || "";
+if (catalog && archive && BACKUP_CHANNEL) {
+  let backingUp = false;
+  const backupTick = async () => {
+    if (backingUp || !archive.tg.ready) return;
+    backingUp = true;
+    try {
+      for (const { videoId, msgId } of catalog.needsBackup(5)) {
+        const copy = await archive.tg.forwardTo(msgId, BACKUP_CHANNEL);
+        catalog.markBackup(videoId, copy);
+      }
+      for (const v of catalog.videoNeedsBackup(2)) {
+        const copy = await archive.tg.forwardTo(v.msgId, BACKUP_CHANNEL);
+        catalog.videoMarkBackup(v.videoId, copy);
+      }
+    } catch (e) {
+      console.error("[backup]", e.message);
+    } finally {
+      backingUp = false;
+    }
+  };
+  setTimeout(() => void backupTick(), 2 * 60_000).unref();
+  setInterval(() => void backupTick(), 60_000).unref();
+}
+
 let dashboardHtml = null;
 function dashboardPage() {
   if (!dashboardHtml || process.env.DASHBOARD_DEV) {
@@ -723,7 +860,12 @@ function isMasterToken(req) {
 function requireApiToken(req, res, { optional = false } = {}) {
   if (!MUSIC_API_TOKEN) return true;
   const got = extractBearerOrHeader(req);
-  if (got === MUSIC_API_TOKEN) return true;
+  if (got === MUSIC_API_TOKEN) {
+    // A peer server handing over a friend's request says whose it is.
+    const who = String(req.headers["x-mp-user"] || "");
+    if (/^[a-f0-9]{12}$/.test(who)) req.mpUser = who;
+    return true;
+  }
   if (optional && !got) return true;
   const uid = verifyUserToken(MUSIC_API_TOKEN, got);
   if (uid) {
@@ -3089,6 +3231,9 @@ const server = http.createServer(async (req, res) => {
               ti: str(e.ti, 200),
               a: str(e.a, 120),
               s: Number.isFinite(e.s) ? Math.max(0, Math.min(36000, Math.round(e.s))) : undefined,
+              // Where the play started (picks, morelike, autoplay, …) to
+              // measure how good our suggestions are.
+              ctx: typeof e.ctx === "string" && /^[a-z_]{1,20}$/.test(e.ctx) ? e.ctx : undefined,
               ts: Number.isFinite(e.ts) ? Math.round(e.ts) : Date.now(),
             }),
           );
@@ -3518,6 +3663,28 @@ const server = http.createServer(async (req, res) => {
       } finally {
         globalThis.__clips -= 1;
       }
+      return;
+    }
+
+    // --- Music videos (archived in the Telegram channel; servers keep only a
+    // temporary file while a video is being downloaded and uploaded).
+    if (req.method === "GET" && (url.pathname === "/video/info" || url.pathname === "/video")) {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!archive || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, archive ? 400 : 404, { error: archive ? "invalid_id" : "no_archive" });
+        return;
+      }
+      if (url.pathname === "/video/info") {
+        const [song, video] = await Promise.all([
+          archive.home.lookup(id).catch(() => null),
+          archive.home.videoLookup(id).catch(() => null),
+        ]);
+        const hasVideo = video ? video.status !== "none" : needsVideo(song);
+        sendJson(res, 200, { hasVideo, stored: video?.status === "stored", width: video?.width || null, height: video?.height || null });
+        return;
+      }
+      await handleVideo(req, res, id);
       return;
     }
 

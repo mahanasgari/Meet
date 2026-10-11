@@ -172,6 +172,20 @@ export class HomeLink {
   plays(events) {
     return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
   }
+  // Music videos: same pattern as songs, kept in the catalog's videos table.
+  async videoLookup(id) {
+    if (this.catalog) return this.catalog.videoLookup(id);
+    return (await this.post("/archive/video-lookup", { id }, 4000)).video || null;
+  }
+  videoClaim(id, server) {
+    return this.catalog ? this.catalog.videoClaim(id, server) : this.post("/archive/video-claim", { id, server }, 4000);
+  }
+  videoStored(id, info) {
+    return this.catalog ? this.catalog.videoStored(id, info) : this.post("/archive/video-stored", { id, info }, 15000);
+  }
+  videoFailed(id, server, error, flags) {
+    return this.catalog ? this.catalog.videoFailed(id, server, error, flags) : this.post("/archive/video-failed", { id, server, error, flags });
+  }
   async peers() {
     if (this.catalog) return this.localPeers();
     return (await this.post("/archive/peers", {}, 5000)).peers || [];
@@ -218,7 +232,15 @@ export class Archive {
 
   play(id, source, req) {
     this.counters[source] = (this.counters[source] || 0) + 1;
-    this.events.push({ videoId: id, at: Date.now(), server: this.serverId, source, uid: req?.mpUser || null });
+    const ctx = String(req?.headers?.["x-mp-context"] || "");
+    this.events.push({
+      videoId: id,
+      at: Date.now(),
+      server: this.serverId,
+      source,
+      uid: req?.mpUser || null,
+      ctx: /^[a-z_]{1,20}$/.test(ctx) ? ctx : null,
+    });
     if (this.events.length > 5000) this.events.splice(0, this.events.length - 5000);
   }
 
@@ -612,7 +634,13 @@ export class Archive {
         const ac = new AbortController();
         req.on("close", () => ac.abort());
         const r = await fetch(u, {
-          headers: { Authorization: `Bearer ${this.token}`, "X-MP-Hop": "1", ...(req.headers.range ? { Range: req.headers.range } : {}) },
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            "X-MP-Hop": "1",
+            ...(req.headers.range ? { Range: req.headers.range } : {}),
+            ...(req.headers["x-mp-context"] ? { "X-MP-Context": String(req.headers["x-mp-context"]) } : {}),
+            ...(req.mpUser ? { "X-MP-User": req.mpUser } : {}),
+          },
           signal: ac.signal,
         });
         if (!r.ok && r.status !== 206) {
@@ -679,6 +707,15 @@ export async function handleHomeRoute(path, body, { catalog, peers }) {
       return { ids: catalog.nextJobs(String(body.server || "?"), Math.max(1, Math.min(Number(body.limit) || 1, 5))) };
     case "/archive/plays":
       catalog.recordPlays(Array.isArray(body.events) ? body.events.slice(0, 1000) : []);
+      return { ok: true };
+    case "/archive/video-lookup":
+      return { video: catalog.videoLookup(String(body.id)) };
+    case "/archive/video-claim":
+      return catalog.videoClaim(String(body.id), String(body.server || "?"));
+    case "/archive/video-stored":
+      return { ok: true, video: catalog.videoStored(String(body.id), body.info || {}) };
+    case "/archive/video-failed":
+      catalog.videoFailed(String(body.id), String(body.server || "?"), String(body.error || ""), body.flags || {});
       return { ok: true };
     case "/archive/peers":
       return { peers: peers() };

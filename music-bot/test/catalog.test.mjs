@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "3");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "4");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "3");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "4");
   c.close();
 });
 
@@ -387,6 +387,7 @@ test("v2 database upgrades to v3 in place and keeps data", () => {
   c1.close();
   const db = new DatabaseSync(file);
   for (const t of ["tracks", "artists", "song_artists", "artist_related", "albums", "crawl"]) db.exec(`DROP TABLE ${t}`);
+  db.exec("DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
   db.close();
   const c2 = new Catalog(file);
@@ -423,5 +424,81 @@ test("tracks upsert keeps old values and updates last_seen", () => {
   assert.equal(r.first_seen, NOW);
   assert.equal(r.last_seen, NOW + DAY);
   assert.equal(c.neighbors("s").next[0].title, "T");
+  c.close();
+});
+
+test("migration v4: upgrades a v3 DB in place, data survives", async () => {
+  const file = tmp();
+  const c0 = new Catalog(file);
+  c0.stored("a", { title: "T", msgId: 5, size: 10 }, NOW);
+  c0.recordPlays([{ videoId: "a", at: NOW, source: "disk" }]);
+  c0.close();
+  // Roll the schema back to v3 by dropping the v4 additions.
+  const db = new DatabaseSync(file);
+  db.exec("DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
+  db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
+  db.close();
+  const c = new Catalog(file);
+  assert.equal(c.lookup("a").title, "T");
+  assert.equal(c.lookup("a").plays, 1);
+  assert.equal(c.videoStats().stored, 0);
+  c.recordPlays([{ videoId: "a", at: NOW, ctx: "picks" }]);
+  assert.deepEqual(c.needsBackup(), [{ videoId: "a", msgId: 5 }]);
+  c.close();
+});
+
+test("videoClaim: download, wait, stored, none, failed retry after 1h", () => {
+  const c = open();
+  assert.deepEqual(c.videoClaim("v", "s1", NOW), { action: "download" });
+  assert.deepEqual(c.videoClaim("v", "s2", NOW + MIN), { action: "wait", server: "s1" });
+  assert.equal(c.videoClaim("v", "s2", NOW + 11 * MIN).action, "download");
+  c.videoStored("v", { msgId: 9, size: 100, width: 1280, height: 720, vcodec: "h264", acodec: "aac", durationS: 200, formatId: "137+140", server: "s2" }, NOW + 12 * MIN);
+  const r = c.videoClaim("v", "s1", NOW + 13 * MIN);
+  assert.equal(r.action, "stored");
+  assert.equal(r.video.msgId, 9);
+  assert.equal(r.video.height, 720);
+  assert.equal(c.videoLookup("nope"), null);
+
+  c.videoFailed("n", "s1", "Requested format is not available", { none: true }, NOW);
+  assert.deepEqual(c.videoClaim("n", "s1", NOW + 99 * HOUR), { action: "none" });
+
+  assert.equal(c.videoClaim("f", "s1", NOW).action, "download");
+  c.videoFailed("f", "s1", "boom", {}, NOW);
+  assert.equal(c.videoClaim("f", "s2", NOW + 30 * MIN).action, "none");
+  assert.deepEqual(c.videoClaim("f", "s2", NOW + HOUR + MIN), { action: "download" });
+  c.close();
+});
+
+test("video plays, backup and stats", () => {
+  const c = open();
+  c.videoStored("a", { msgId: 1, size: 100 }, NOW);
+  c.videoStored("b", { msgId: 2, size: 50 }, NOW + 1);
+  c.videoFailed("f", "s", "x", {}, NOW);
+  c.videoFailed("n", "s", "x", { none: true }, NOW);
+  c.videoPlay("a"); c.videoPlay("a");
+  assert.deepEqual(c.videoNeedsBackup(), [{ videoId: "a", msgId: 1 }, { videoId: "b", msgId: 2 }]);
+  c.videoMarkBackup("a", 77, NOW);
+  assert.deepEqual(c.videoNeedsBackup(), [{ videoId: "b", msgId: 2 }]);
+  assert.deepEqual(c.videoStats(), { stored: 2, failed: 1, none: 1, bytes: 150, plays: 2, backedUp: 1 });
+  assert.equal(c.videoLookup("a").backupMsgId, 77);
+  c.close();
+});
+
+test("needsBackup / markBackup / stats backup + ctxPlays", () => {
+  const c = open();
+  c.stored("a", { msgId: 1 }, NOW);
+  c.stored("b", { msgId: 2 }, NOW + 1);
+  c.claim("p", "s", NOW);
+  assert.deepEqual(c.needsBackup(1), [{ videoId: "a", msgId: 1 }]);
+  c.markBackup("a", 50, NOW);
+  assert.deepEqual(c.needsBackup(), [{ videoId: "b", msgId: 2 }]);
+  c.recordPlays([
+    { videoId: "a", at: NOW, ctx: "picks" }, { videoId: "a", at: NOW, ctx: "picks" },
+    { videoId: "a", at: NOW, ctx: "Bad Ctx!" }, { videoId: "b", at: NOW, ctx: "autoplay" },
+    { videoId: "b", at: NOW },
+  ]);
+  const s = c.stats(7, NOW);
+  assert.deepEqual(s.backup, { done: 1, pending: 1 });
+  assert.deepEqual(s.ctxPlays, [{ ctx: "picks", plays: 2 }, { ctx: "autoplay", plays: 1 }]);
   c.close();
 });

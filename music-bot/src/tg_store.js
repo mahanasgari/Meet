@@ -147,6 +147,66 @@ export class TgStore {
     return p;
   }
 
+  // Serializes channel writes (uploads, forwards) with min spacing and FloodWait retries.
+  _queued(label, fn) {
+    const run = async () => {
+      await this.connect();
+      const wait = this._lastUploadStart + this.minUploadIntervalMs - Date.now();
+      if (wait > 0) await sleep(wait);
+      for (let attempt = 0; ; attempt++) {
+        this._lastUploadStart = Date.now();
+        try {
+          if (!this._Api) this._Api = (await import("telegram")).Api;
+          return await fn(this._Api);
+        } catch (e) {
+          const secs = floodSeconds(e);
+          if (secs === null || attempt >= MAX_FLOOD_RETRIES) throw new Error(`${label} failed: ${errText(e).slice(0, 120)}`);
+          this.log.warn?.(`tg flood wait ${secs}s (attempt ${attempt + 1})`);
+          await sleep(secs * 1000 + this.floodPadMs);
+        }
+      }
+    };
+    const p = this._uploadChain.then(run, run);
+    this._uploadChain = p.catch(() => {});
+    return p;
+  }
+
+  async uploadVideo(path, { title, artist, durationS, width, height, thumbPath, caption } = {}) {
+    return this._queued("upload", async (Api) => {
+      const msg = await this._client.sendFile(this._peer, {
+        file: path,
+        caption: caption || "",
+        forceDocument: false,
+        supportsStreaming: true,
+        attributes: [new Api.DocumentAttributeVideo({
+          duration: Math.round(durationS || 0), w: width || 0, h: height || 0, supportsStreaming: true,
+        })],
+        ...(thumbPath ? { thumb: thumbPath } : {}),
+      });
+      const doc = msg?.media?.document || msg?.document;
+      return { msgId: msg.id, size: Number(doc?.size ?? 0), mime: doc?.mimeType || "video/mp4" };
+    });
+  }
+
+  /** Copies a message into another channel (no author header); returns the new message id there. */
+  async forwardTo(msgId, toChannelId) {
+    return this._queued("forward", async () => {
+      const key = String(toChannelId);
+      this._targets ??= new Map();
+      let peer = this._targets.get(key);
+      if (!peer) {
+        peer = await this._client.getEntity(/^-?\d+$/.test(key) ? Number(key) : key);
+        this._targets.set(key, peer);
+      }
+      const res = await this._client.forwardMessages(peer, {
+        messages: [Number(msgId)], fromPeer: this._peer, dropAuthor: true,
+      });
+      const m = Array.isArray(res) ? res[0] : res;
+      if (!m?.id) throw new Error("no forwarded message");
+      return m.id;
+    });
+  }
+
   async _getMsg(msgId, force = false) {
     const hit = this._msgs.get(msgId);
     if (!force && hit && this.now() - hit.at < MSG_TTL_MS) return hit.msg;
@@ -224,7 +284,7 @@ export class TgStore {
 
   async close() {
     const c = this._client;
-    this._client = null; this._peer = null; this._ready = false;
+    this._client = null; this._peer = null; this._ready = false; this._targets = null;
     if (c) { try { await c.disconnect(); } catch {} }
   }
 }

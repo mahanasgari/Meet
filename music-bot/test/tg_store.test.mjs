@@ -176,3 +176,39 @@ test("connect failure: retry gated by 30s gap, token never in error", async () =
   assert.equal(fake.calls.start, 2);
   assert.equal(s.ready, true);
 });
+
+test("uploadVideo sends streaming video attributes", async () => {
+  const fake = makeFake();
+  Api.DocumentAttributeVideo = AudioAttr;
+  fake.sendFile = async (peer, o) => { fake.calls.sendFile.push({ t: Date.now(), o }); return { id: 43, media: { document: { size: 99, mimeType: "video/mp4" } } }; };
+  const { s } = store(fake);
+  const r = await s.uploadVideo("/x.mp4", { durationS: 247.4, width: 1280, height: 720, thumbPath: "/t.jpg", caption: "c" });
+  assert.deepEqual(r, { msgId: 43, size: 99, mime: "video/mp4" });
+  const o = fake.calls.sendFile[0].o;
+  assert.equal(o.supportsStreaming, true);
+  assert.equal(o.forceDocument, false);
+  assert.equal(o.thumb, "/t.jpg");
+  assert.deepEqual({ ...o.attributes[0] }, { duration: 247, w: 1280, h: 720, supportsStreaming: true });
+});
+
+test("forwardTo copies without author, caches the peer, retries flood waits, spaces calls", async () => {
+  const fake = makeFake();
+  const fwd = [];
+  const fails = [Object.assign(new Error("x"), { seconds: 0 })];
+  fake.forwardMessages = async (peer, o) => {
+    fwd.push({ t: Date.now(), peer, o });
+    if (fails.length) throw fails.shift();
+    return [{ id: 900 + fwd.length }];
+  };
+  const { s } = store(fake);
+  const a = await s.forwardTo(7, "-1002");
+  assert.equal(a, 902);
+  const b = await s.forwardTo(8, "-1002");
+  assert.equal(b, 903);
+  assert.equal(fwd[0].o.dropAuthor, true);
+  assert.deepEqual(fwd[0].o.messages, [7]);
+  assert.equal(fwd[0].o.fromPeer.id, -1001);
+  assert.equal(fwd[0].peer.id, -1002);
+  assert.equal(fake.calls.getEntity, 2); // source channel + target, cached afterwards
+  assert.ok(fwd[2].t - fwd[1].t >= 40);
+});

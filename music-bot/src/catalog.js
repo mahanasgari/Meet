@@ -79,7 +79,22 @@ const MIGRATIONS = [
     up_next INTEGER, related INTEGER
   );
   CREATE INDEX crawl_at ON crawl(crawled_at);`,
+  `ALTER TABLE plays ADD COLUMN ctx TEXT;
+  ALTER TABLE songs ADD COLUMN backup_msg_id INTEGER;
+  ALTER TABLE songs ADD COLUMN backup_at INTEGER;
+  CREATE TABLE videos (
+    video_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('stored','failed','none')),
+    tg_msg_id INTEGER, size INTEGER, width INTEGER, height INTEGER, vcodec TEXT, acodec TEXT,
+    duration_s REAL, format_id TEXT, source_server TEXT, stored_at INTEGER, error TEXT,
+    backup_msg_id INTEGER, backup_at INTEGER, lease_server TEXT, lease_until INTEGER,
+    plays INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX videos_status ON videos(status);`,
 ];
+const VIDEO_LEASE_MS = 10 * MIN;
+const VIDEO_RETRY_MS = HOUR;
+const CTX_RE = /^[a-z_]{1,20}$/;
 const CRAWL_OK_MS = 30 * DAY;
 const CRAWL_FAIL_MS = DAY;
 
@@ -314,12 +329,104 @@ export class Catalog {
     this.#tx(() => {
       for (const e of events) {
         const at = e.at ?? Date.now();
-        this.#sql("INSERT INTO plays(video_id,at,server,source,uid) VALUES(?,?,?,?,?)")
-          .run(e.videoId, at, e.server ?? null, e.source ?? null, e.uid ?? null);
+        const ctx = typeof e.ctx === "string" && CTX_RE.test(e.ctx) ? e.ctx : null;
+        this.#sql("INSERT INTO plays(video_id,at,server,source,uid,ctx) VALUES(?,?,?,?,?,?)")
+          .run(e.videoId, at, e.server ?? null, e.source ?? null, e.uid ?? null, ctx);
         this.#sql(`UPDATE songs SET plays=plays+1, last_played_at=MAX(COALESCE(last_played_at,0),?)
           WHERE video_id=?`).run(at, e.videoId);
       }
     });
+  }
+
+  // Stored songs not yet copied to the backup channel, oldest first.
+  needsBackup(limit = 5) {
+    return this.#sql(`SELECT video_id, tg_msg_id FROM songs WHERE status='stored' AND tg_msg_id IS NOT NULL
+      AND backup_msg_id IS NULL ORDER BY stored_at, rowid LIMIT ?`).all(limit)
+      .map((r) => ({ videoId: r.video_id, msgId: r.tg_msg_id }));
+  }
+
+  markBackup(videoId, backupMsgId, now = Date.now()) {
+    this.#sql("UPDATE songs SET backup_msg_id=?, backup_at=? WHERE video_id=?").run(backupMsgId, now, videoId);
+  }
+
+  #video(r) {
+    if (!r) return null;
+    return {
+      videoId: r.video_id, status: r.status, msgId: r.tg_msg_id, size: r.size, width: r.width,
+      height: r.height, vcodec: r.vcodec, acodec: r.acodec, durationS: r.duration_s,
+      formatId: r.format_id, sourceServer: r.source_server, storedAt: r.stored_at, error: r.error,
+      backupMsgId: r.backup_msg_id, backupAt: r.backup_at, leaseServer: r.lease_server,
+      leaseUntil: r.lease_until, plays: r.plays,
+    };
+  }
+
+  videoLookup(videoId) {
+    return this.#video(this.#sql("SELECT * FROM videos WHERE video_id=?").get(videoId));
+  }
+
+  // For status 'failed', stored_at holds the time of the failure (retry clock).
+  videoClaim(videoId, server, now = Date.now()) {
+    return this.#tx(() => {
+      const v = this.videoLookup(videoId);
+      if (v?.status === "stored") return { action: "stored", video: v };
+      if (v?.status === "none") return { action: "none" };
+      if (v?.status === "failed" && (v.storedAt ?? 0) > now - VIDEO_RETRY_MS) {
+        return { action: "none", failed: true, error: v.error, retryAt: v.storedAt + VIDEO_RETRY_MS };
+      }
+      if (v?.leaseServer && v.leaseUntil > now && v.leaseServer !== server) {
+        return { action: "wait", server: v.leaseServer };
+      }
+      this.#sql(`INSERT INTO videos(video_id,status,lease_server,lease_until) VALUES(?, 'failed', ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET lease_server=excluded.lease_server, lease_until=excluded.lease_until`)
+        .run(videoId, server, now + VIDEO_LEASE_MS);
+      return { action: "download" };
+    });
+  }
+
+  videoStored(videoId, info = {}, now = Date.now()) {
+    this.#sql(`INSERT INTO videos(video_id,status,tg_msg_id,size,width,height,vcodec,acodec,duration_s,
+        format_id,source_server,stored_at,error,lease_server,lease_until)
+      VALUES(?, 'stored', ?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)
+      ON CONFLICT(video_id) DO UPDATE SET status='stored', tg_msg_id=excluded.tg_msg_id, size=excluded.size,
+        width=excluded.width, height=excluded.height, vcodec=excluded.vcodec, acodec=excluded.acodec,
+        duration_s=excluded.duration_s, format_id=excluded.format_id, source_server=excluded.source_server,
+        stored_at=excluded.stored_at, error=NULL, lease_server=NULL, lease_until=NULL`)
+      .run(videoId, info.msgId ?? null, info.size ?? null, info.width ?? null, info.height ?? null,
+        info.vcodec ?? null, info.acodec ?? null, info.durationS ?? null, info.formatId ?? null,
+        info.server ?? null, now);
+    return this.videoLookup(videoId);
+  }
+
+  videoFailed(videoId, server, error, { none = false } = {}, now = Date.now()) {
+    const msg = error == null ? null : String(error);
+    this.#sql(`INSERT INTO videos(video_id,status,error,stored_at,source_server) VALUES(?,?,?,?,?)
+      ON CONFLICT(video_id) DO UPDATE SET status=excluded.status, error=excluded.error,
+        stored_at=excluded.stored_at, lease_server=NULL, lease_until=NULL`)
+      .run(videoId, none ? "none" : "failed", msg, now, server ?? null);
+  }
+
+  videoPlay(videoId) {
+    this.#sql("UPDATE videos SET plays=plays+1 WHERE video_id=?").run(videoId);
+  }
+
+  videoNeedsBackup(limit = 5) {
+    return this.#sql(`SELECT video_id, tg_msg_id FROM videos WHERE status='stored' AND tg_msg_id IS NOT NULL
+      AND backup_msg_id IS NULL ORDER BY stored_at, rowid LIMIT ?`).all(limit)
+      .map((r) => ({ videoId: r.video_id, msgId: r.tg_msg_id }));
+  }
+
+  videoMarkBackup(videoId, backupMsgId, now = Date.now()) {
+    this.#sql("UPDATE videos SET backup_msg_id=?, backup_at=? WHERE video_id=?").run(backupMsgId, now, videoId);
+  }
+
+  videoStats() {
+    const r = this.#sql(`SELECT
+      COALESCE(SUM(status='stored'),0) stored, COALESCE(SUM(status='failed'),0) failed,
+      COALESCE(SUM(status='none'),0) none,
+      COALESCE(SUM(CASE WHEN status='stored' THEN size END),0) bytes,
+      COALESCE(SUM(plays),0) plays,
+      COALESCE(SUM(status='stored' AND backup_msg_id IS NOT NULL),0) backedUp FROM videos`).get();
+    return { stored: r.stored, failed: r.failed, none: r.none, bytes: r.bytes, plays: r.plays, backedUp: r.backedUp };
   }
 
   // Replace the related rows of one video for each kind present in items.
@@ -507,6 +614,10 @@ export class Catalog {
       LEFT JOIN songs s ON s.video_id=p.video_id WHERE p.at>=? AND p.at<=? GROUP BY k`, dayStart, now)) {
       kindPlays[Object.hasOwn(kindPlays, r.k) ? r.k : "unknown"] += r.n;
     }
+    const ctxPlays = q(`SELECT ctx, COUNT(*) plays FROM plays WHERE at>=? AND at<=? AND ctx IS NOT NULL
+      GROUP BY ctx ORDER BY plays DESC, ctx`, dayStart, now).map((r) => ({ ctx: r.ctx, plays: r.plays }));
+    const backup = this.#sql(`SELECT COALESCE(SUM(backup_msg_id IS NOT NULL),0) done,
+      COALESCE(SUM(backup_msg_id IS NULL),0) pending FROM songs WHERE status='stored' AND tg_msg_id IS NOT NULL`).get();
     const jq = (s) => this.#sql("SELECT COUNT(*) n FROM jobs WHERE state=?").get(s).n;
     return {
       totals: {
@@ -519,6 +630,8 @@ export class Catalog {
       byKind,
       byQuality,
       kindPlays,
+      backup: { done: backup.done, pending: backup.pending },
+      ctxPlays,
       queue: { queued: jq("queued"), running: jq("running"), failed: jq("failed") },
       recent: q(`SELECT * FROM songs WHERE status='stored' ORDER BY stored_at DESC, rowid DESC LIMIT 20`)
         .map((r) => ({

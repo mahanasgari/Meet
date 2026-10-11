@@ -99,6 +99,14 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       MONITOR_SERVICES: ${MONITOR_SERVICES:-}
+      # Song archive (Telegram): storage bot + channel(s); see music-bot/src/archive.js.
+      TG_API_ID: ${TG_API_ID:-}
+      TG_API_HASH: ${TG_API_HASH:-}
+      TG_STORE_BOT_TOKEN: ${TG_STORE_BOT_TOKEN:-}
+      TG_STORE_CHANNEL: ${TG_STORE_CHANNEL:-}
+      TG_BACKUP_CHANNEL: ${TG_BACKUP_CHANNEL:-}
+      ARCHIVE_SERVER_ID: ${ARCHIVE_SERVER_ID:-}
+      ARCHIVE_CACHE_GB: ${ARCHIVE_CACHE_GB:-}
       # Shared secret for MiniPlayer + Meet app search proxy.
       MUSIC_API_TOKEN: ${MUSIC_API_TOKEN:-}
     volumes:

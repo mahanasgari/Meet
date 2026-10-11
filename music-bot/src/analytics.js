@@ -38,6 +38,7 @@ export function listeningStats(usersDir, days, now = Date.now()) {
   const heat = Array.from({ length: 7 }, () => Array(24).fill(0));
   const cur = { ...emptyTotals(), listeners: new Set(), songs: new Set(), artists: new Set() };
   const prev = { ...emptyTotals(), listeners: new Set(), songs: new Set(), artists: new Set() };
+  const ctxs = new Map(); // current period only, keyed by play source
 
   let files = [];
   try {
@@ -79,6 +80,23 @@ export function listeningStats(usersDir, days, now = Date.now()) {
         if (e.a) t.artists.add(e.a);
         const mins = Number(e.s) > 0 ? e.s / 60 : 0;
         t.minutes += mins;
+        if (t === cur) {
+          const sec = Number(e.s);
+          const hasS = e.s != null && Number.isFinite(sec);
+          const ctx = typeof e.ctx === "string" && e.ctx ? e.ctx : "other";
+          const c = ctxs.get(ctx) || { ctx, plays: 0, skips: 0, quickSkips: 0, secSum: 0, secN: 0, listeners: new Set() };
+          if (isPlay) c.plays++;
+          else {
+            c.skips++;
+            if (hasS && sec < 30) c.quickSkips++;
+          }
+          if (hasS) {
+            c.secSum += sec;
+            c.secN++;
+          }
+          c.listeners.add(who);
+          ctxs.set(ctx, c);
+        }
         if (t !== cur) continue;
         const d = perDay.get(dayKey(ts));
         if (d) {
@@ -121,9 +139,25 @@ export function listeningStats(usersDir, days, now = Date.now()) {
     songs: t.songs.size,
     artists: t.artists.size,
   });
+  const byCtx = [...ctxs.values()]
+    .sort((a, b) => b.plays + b.skips - (a.plays + a.skips))
+    .map((c) => {
+      const n = c.plays + c.skips;
+      return {
+        ctx: c.ctx,
+        plays: c.plays,
+        skips: c.skips,
+        skipRate: n ? c.skips / n : null,
+        quickSkips: c.quickSkips,
+        quickSkipRate: n ? c.quickSkips / n : null,
+        avgListenS: c.secN ? Math.round(c.secSum / c.secN) : null,
+        listeners: c.listeners.size,
+      };
+    });
   return {
     totals: fin(cur),
     prevTotals: fin(prev),
+    byCtx,
     days: [...perDay.values()].map((d) => ({ ...d, listeners: d.listeners.size, minutes: Math.round(d.minutes) })),
     topSongs: [...songs.values()]
       .filter((s) => s.plays > 0 && s.title)

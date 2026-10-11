@@ -124,6 +124,103 @@ test("listeningStats: missing dir gives zeros and does not throw", () => {
   assert.deepEqual(r.topArtists, []);
 });
 
+test("listeningStats byCtx: grouping, missing ctx -> other, rates, avg, current period only", () => {
+  const dir = tmp();
+  writeUser(dir, "abc", [
+    { t: "play", id: "s1", ti: "A", a: "X", s: 180, ts: NOW - H, ctx: "picks" },
+    { t: "play", id: "s1", ti: "A", a: "X", s: 120, ts: NOW - 2 * H, ctx: "picks" },
+    { t: "skip", id: "s1", ti: "A", a: "X", s: 10, ts: NOW - 3 * H, ctx: "picks" }, // quick skip
+    { t: "skip", id: "s1", ti: "A", a: "X", s: 60, ts: NOW - 4 * H, ctx: "picks" }, // not quick
+    { t: "play", id: "s2", ti: "B", a: "Y", s: 200, ts: NOW - 5 * H, ctx: "morelike" },
+    { t: "play", id: "s3", ti: "C", a: "Z", s: 100, ts: NOW - 6 * H }, // no ctx -> other
+    { t: "skip", id: "s3", ti: "C", a: "Z", ts: NOW - 7 * H }, // no ctx, no s -> other
+    { t: "like", id: "s1", ti: "A", a: "X", ts: NOW - 8 * H, ctx: "picks" }, // likes are not plays
+    { t: "play", id: "s4", ti: "D", a: "W", s: 90, ts: NOW - 10 * DAY, ctx: "autoplay" }, // previous period
+  ]);
+  writeUser(dir, "def", [{ t: "play", id: "s1", ti: "A", a: "X", s: 60, ts: NOW - H, ctx: "picks" }]);
+
+  const { byCtx } = listeningStats(dir, 7, NOW);
+  assert.deepEqual(byCtx, [
+    {
+      ctx: "picks",
+      plays: 3,
+      skips: 2,
+      skipRate: 0.4,
+      quickSkips: 1,
+      quickSkipRate: 0.2,
+      avgListenS: 86, // (180 + 120 + 10 + 60 + 60) / 5
+      listeners: 2,
+    },
+    {
+      ctx: "other",
+      plays: 1,
+      skips: 1,
+      skipRate: 0.5,
+      quickSkips: 0,
+      quickSkipRate: 0,
+      avgListenS: 100, // the skip has no s, so only the play counts
+      listeners: 1,
+    },
+    {
+      ctx: "morelike",
+      plays: 1,
+      skips: 0,
+      skipRate: 0,
+      quickSkips: 0,
+      quickSkipRate: 0,
+      avgListenS: 200,
+      listeners: 1,
+    },
+  ]);
+});
+
+test("listeningStats byCtx: avg is rounded, skip-only and empty ctx give null where undefined", () => {
+  const dir = tmp();
+  writeUser(dir, "abc", [
+    { t: "play", id: "s1", ti: "A", a: "X", s: 10, ts: NOW - H, ctx: "search" },
+    { t: "play", id: "s1", ti: "A", a: "X", s: 11, ts: NOW - 2 * H, ctx: "search" },
+    { t: "skip", id: "s2", ti: "B", a: "Y", s: 5, ts: NOW - 3 * H, ctx: "radio" }, // quick skip, only event
+    { t: "skip", id: "s3", ti: "C", a: "Z", ts: NOW - 4 * H, ctx: "upnext" }, // skip with no s
+  ]);
+  const { byCtx } = listeningStats(dir, 7, NOW);
+  const by = Object.fromEntries(byCtx.map((c) => [c.ctx, c]));
+  assert.deepEqual(by.search, {
+    ctx: "search",
+    plays: 2,
+    skips: 0,
+    skipRate: 0,
+    quickSkips: 0,
+    quickSkipRate: 0,
+    avgListenS: 11, // 10.5 rounds to 11
+    listeners: 1,
+  });
+  assert.deepEqual(by.radio, {
+    ctx: "radio",
+    plays: 0,
+    skips: 1,
+    skipRate: 1,
+    quickSkips: 1,
+    quickSkipRate: 1,
+    avgListenS: 5,
+    listeners: 1,
+  });
+  assert.deepEqual(by.upnext, {
+    ctx: "upnext",
+    plays: 0,
+    skips: 1,
+    skipRate: 1,
+    quickSkips: 0,
+    quickSkipRate: 0,
+    avgListenS: null,
+    listeners: 1,
+  });
+  assert.equal(byCtx.length, 3);
+});
+
+test("listeningStats byCtx: empty when no sync", () => {
+  assert.deepEqual(listeningStats(join(tmp(), "nope"), 7, NOW).byCtx, []);
+});
+
 test("dayRange ends today (UTC) and is oldest first", () => {
   assert.deepEqual(dayRange(3, NOW), ["2026-10-08", "2026-10-09", "2026-10-10"]);
 });

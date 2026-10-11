@@ -94,6 +94,7 @@ button.chip{cursor:pointer}
 .strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
 .empty{color:var(--muted);padding:18px 4px;text-align:center;font-size:13px}
 .note{color:var(--muted);font-size:12.5px;margin-top:14px}
+tr.hl td{background:var(--panel2)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:6px}
 .legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--lc);margin-right:5px;vertical-align:-1px}
 
@@ -567,7 +568,8 @@ function tableInner(id) {
     return "<th" + (c.v ? ' data-sort="' + c.k + '" data-tb="' + id + '"' : "") + (c.r ? ' class="r"' : "") + ">" + esc(c.label) + arrow + "</th>";
   }).join("") + "</tr></thead><tbody>";
   rows.forEach(function (r, i) {
-    h += "<tr>" + t.cols.map(function (c) { return "<td" + (c.r ? ' class="r"' : "") + (c.wrap ? ' class="wrap"' : "") + ">" + c.h(r, i) + "</td>"; }).join("") + "</tr>";
+    var rc = t.opts.rowCls ? t.opts.rowCls(r) : "";
+    h += "<tr" + (rc ? ' class="' + esc(rc) + '"' : "") + ">" + t.cols.map(function (c) { return "<td" + (c.r ? ' class="r"' : "") + (c.wrap ? ' class="wrap"' : "") + ">" + c.h(r, i) + "</td>"; }).join("") + "</tr>";
   });
   return h + "</tbody></table>";
 }
@@ -858,6 +860,18 @@ function findArchRow(id) {
   var A = D().archive || {};
   return arr(A.recent).concat(arr(A.top)).filter(function (r) { return r && r.videoId === id; })[0] || null;
 }
+/* Telegram backup: songs and videos copied to the private backup channel. */
+function tgBackupCard(A) {
+  if (A.backupChannel === false) return card("Telegram backup", '<div class="muted">' + esc("Backup channel not set up yet — create a private channel and add the storage bot as admin.") + "</div>");
+  function prog(label, done, total) {
+    var p = total > 0 ? Math.min(100, done / total * 100) : 0;
+    return '<div style="margin-top:12px"><div class="sub-h">' + esc(label) + '</div><div style="margin:4px 0">' + esc(fmt(done) + " of " + fmt(total)) + '</div><div class="bar"><i style="width:' + p.toFixed(1) + '%"></i></div></div>';
+  }
+  var B = A.backup || {}, bDone = B.done || 0, bTotal = bDone + (B.pending || 0);
+  var body = prog("Songs backed up", bDone, bTotal);
+  if (A.videos && typeof A.videos === "object") body += prog("Videos backed up", A.videos.backedUp || 0, A.videos.stored || 0);
+  return card("Telegram backup", body);
+}
 function pageArchive() {
   var d = D(), A = d.archive;
   if (!A || !A.totals) return card("Archive", empty("Archive not set up yet"));
@@ -880,10 +894,12 @@ function pageArchive() {
   var h = '<div class="grid kpis">';
   h += kpi("Songs archived", fmt(T.stored), fmt(T.pending || 0) + " pending · " + fmt(T.unavailable || 0) + " unavailable");
   h += kpi("Archive size", bytes(T.bytes), isNum(T.durationS) ? fmt1(T.durationS / 3600, 1) + " h of audio" : "");
+  if (A.videos && typeof A.videos === "object") h += kpi("Videos", fmt(A.videos.stored), bytes(A.videos.bytes) + " · " + fmt(A.videos.plays) + " plays");
   h += kpi("YouTube Music share", pct(ytmN, kindAll), fmt(bk.ytm_track) + " tracks · " + fmt(bk.ytm_video) + " videos · " + fmt(bk.youtube) + " plain YouTube");
   h += kpi("Served without YouTube", pct(offYt, playsAll), fmt(offYt) + " of " + fmt(playsAll) + " plays");
   h += kpi("Queue", fmt((q.queued || 0) + (q.running || 0)), fmt(q.failed || 0) + " failed", q.failed ? "warn" : "");
   h += "</div>";
+  if (A.backupChannel !== undefined) h += '<div style="height:12px"></div>' + tgBackupCard(A);
 
   h += '<div class="grid cols2">' + card("Plays by source per day", arr(byDay).length ? chart(function (w) {
     return barChart(w, { labels: keys.map(dayLabel), series: srcDefs.map(function (s) {
@@ -1114,9 +1130,30 @@ function fyEnsure() {
   }
   if (state.fyUid && !(state.fyReq && state.fyReq.uid === state.fyUid)) fyLoadRec(state.fyUid);
 }
+var CTX_NAMES = { picks: "Picked for you", morelike: "More like this", autoplay: "Autoplay", popular: "Popular", search: "Search", radio: "Radio", upnext: "Up next", other: "Other" };
+var CTX_HL = { picks: 1, morelike: 1, autoplay: 1 };
+function ctxName(c) { return Object.prototype.hasOwnProperty.call(CTX_NAMES, c) ? CTX_NAMES[c] : String(c || "other"); }
+/* "How suggestions do": listening split by where each play started (sync data, current range). */
+function suggestCard() {
+  var L = D().listening;
+  if (!L || !Array.isArray(L.byCtx)) return "";
+  var cols = [
+    { k: "ctx", label: "Source", v: function (c) { return ctxName(c.ctx).toLowerCase(); }, h: function (c) { return "<b>" + esc(ctxName(c.ctx)) + "</b>"; } },
+    { k: "plays", label: "Plays", r: 1, v: function (c) { return c.plays || 0; }, h: function (c) { return fmt(c.plays); } },
+    { k: "skip", label: "Skip rate", r: 1, v: function (c) { return c.skipRate || 0; }, h: function (c) { return pctF(c.skipRate); } },
+    { k: "qs", label: "Skipped < 30 s", r: 1, v: function (c) { return c.quickSkipRate || 0; }, h: function (c) { return pctF(c.quickSkipRate); } },
+    { k: "avg", label: "Avg listened", r: 1, v: function (c) { return c.avgListenS; }, h: function (c) { return mss(c.avgListenS); } },
+    { k: "lis", label: "Listeners", r: 1, v: function (c) { return c.listeners || 0; }, h: function (c) { return fmt(c.listeners); } }
+  ];
+  return card("How suggestions do", table("fy-ctx", cols, L.byCtx, {
+    sort: { k: "plays", dir: "desc" },
+    empty: "No play sources recorded in this range yet",
+    rowCls: function (c) { return CTX_HL[c.ctx] ? "hl" : ""; }
+  }) + '<div class="note">From the opt-in listening sync, for the selected range. Lower quick-skip = better suggestions.</div>');
+}
 function pageForYou() {
   var st = state.fyStats, us = state.fyUsers, rec = state.fyReq && state.fyReq.uid === state.fyUid ? state.fyReq : null;
-  var h = '<div class="upd" style="margin-bottom:12px">' + (!st ? "Loading stats..." : st.err ? "Stats unavailable" :
+  var h = suggestCard() + '<div class="upd" style="margin-bottom:12px">' + (!st ? "Loading stats..." : st.err ? "Stats unavailable" :
     esc("Built from " + fmt(st.listeners) + " listeners · " + fmt(st.sessions) + " sessions · " + fmt(st.songsWithNeighbors) + " songs with neighbors · updated " + rel(st.builtAt))) + "</div>";
   var pills;
   if (us === null) pills = empty("Loading listeners...");

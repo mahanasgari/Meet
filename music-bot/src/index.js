@@ -842,7 +842,9 @@ function dashboardData(days) {
     feedback,
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
     backup: backupStatus(),
-    archive: catalog ? { ...catalog.stats(days), graph: catalog.graphStats ? catalog.graphStats() : null } : null,
+    archive: catalog
+      ? { ...catalog.stats(days), graph: catalog.graphStats(), videos: catalog.videoStats(), backupChannel: Boolean(BACKUP_CHANNEL) }
+      : null,
   };
   dataCache.set(days, { at: Date.now(), data });
   return data;

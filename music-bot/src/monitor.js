@@ -50,6 +50,53 @@ export function nextAlerts(prev, cur, label) {
   return out;
 }
 
+const MB = 1024 ** 2;
+const GB = 1024 ** 3;
+const isNum = (n) => typeof n === "number" && Number.isFinite(n);
+
+/**
+ * Memory and disk alerts with hysteresis (pure). prev: last {memLow, diskLow}
+ * (undefined on the first observation). Missing mem/disk keeps the old state.
+ * Returns { state: {memLow, diskLow}, alerts }.
+ */
+export function resourceAlerts(prev, server, label) {
+  const alerts = [];
+  // prev undefined starts from "not low", so a low first reading warns once
+  // and a healthy first reading is silent (no "OK again").
+  const state = { memLow: !!prev?.memLow, diskLow: !!prev?.diskLow };
+
+  const mem = server?.mem;
+  if (isNum(mem?.free) && isNum(mem?.total) && mem.total > 0) {
+    const low = mem.free < Math.max(150 * MB, 0.07 * mem.total);
+    const ok = mem.free > Math.max(250 * MB, 0.12 * mem.total);
+    if (state.memLow && ok) {
+      state.memLow = false;
+      alerts.push({ level: "up", text: `Memory OK again on ${label} (${Math.round(mem.free / MB)} MB free)` });
+    } else if (!state.memLow && low) {
+      state.memLow = true;
+      alerts.push({
+        level: "warn",
+        text: `Memory low on ${label}: ${Math.round(mem.free / MB)} MB free of ${(mem.total / GB).toFixed(1)} GB`,
+      });
+    }
+  }
+
+  const disk = server?.disk;
+  if (isNum(disk?.free) && isNum(disk?.total) && disk.total > 0) {
+    const low = disk.free < Math.max(1.5 * GB, 0.05 * disk.total);
+    const ok = disk.free > Math.max(2.5 * GB, 0.08 * disk.total);
+    if (state.diskLow && ok) {
+      state.diskLow = false;
+      alerts.push({ level: "up", text: `Disk space OK again on ${label} (${(disk.free / GB).toFixed(1)} GB free)` });
+    } else if (!state.diskLow && low) {
+      state.diskLow = true;
+      alerts.push({ level: "warn", text: `Disk almost full on ${label}: ${(disk.free / GB).toFixed(1)} GB left` });
+    }
+  }
+
+  return { state, alerts };
+}
+
 const PROBE_NAMES = { search: "Search", artist: "Artist pages", next: "Suggestions", audio: "Audio" };
 
 /**
@@ -137,7 +184,9 @@ export class Monitor {
       probes: prev.probes ?? null,
       probeHistory: prev.probeHistory ?? [],
       probeFails: prev.probeFails ?? {},
+      resource: prev.resource,
     };
+    let fresh = false; // stats fetched this check (not the carried-over copy)
     const healthUrl = t.role === "service" ? t.url : `${t.url}/health`;
     const t0 = Date.now();
     try {
@@ -153,13 +202,17 @@ export class Monitor {
     }
     if (t.role === "home") {
       cur.raw = this.localStats();
+      fresh = true;
     } else if (t.role === "worker" && cur.ok) {
       try {
         const r = await fetch(`${t.url}/admin/stats`, {
           headers: { Authorization: `Bearer ${this.token}` },
           signal: AbortSignal.timeout(20_000),
         });
-        if (r.ok) cur.raw = await r.json();
+        if (r.ok) {
+          cur.raw = await r.json();
+          fresh = true;
+        }
       } catch {
         // keep the last stats
       }
@@ -172,6 +225,11 @@ export class Monitor {
     if (yt.length) {
       cur.ytBlocked = yt[0].ok ? false : yt.length > 1 && !yt[1].ok ? true : prev.ytBlocked ?? false;
       cur.ytDetail = yt[0].detail;
+    }
+    if (fresh) {
+      const res = resourceAlerts(prev.resource, cur.raw?.server, t.label);
+      cur.resource = res.state;
+      for (const a of res.alerts) await this.alert(a.level, t.id, a.text);
     }
     this.state.set(t.id, cur);
     appendFileSync(join(this.dir, `${dayKey(now)}.jsonl`), `${JSON.stringify([now, t.id, cur.ok ? 1 : 0, cur.ms])}\n`);

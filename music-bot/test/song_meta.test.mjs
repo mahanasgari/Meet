@@ -75,8 +75,8 @@ test("splitUploadTitle: reversed 'Title - Artist' when the right side is the cha
 
 test("songMeta: ytm_track keeps title, artist and artists", () => {
   assert.deepEqual(
-    songMeta({ sourceKind: "ytm_track", title: "T", artist: "A", artists: ["A", "B"], album: "Al", durationS: 200 }),
-    { title: "T", artist: "A", artists: ["A", "B"], album: "Al", durationS: 200 },
+    songMeta({ sourceKind: "ytm_track", title: "T", artist: "A", artists: ["A", "B"], album: "Al", durationS: 200, exactDuration: true }),
+    { title: "T", artist: "A", artists: ["A", "B"], album: "Al", durationS: 200, exactDuration: true },
   );
   assert.deepEqual(songMeta({ sourceKind: "ytm_video", title: "T", artist: "A" }).artists, ["A"]);
 });

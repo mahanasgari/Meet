@@ -76,9 +76,11 @@ export function songMeta(song) {
       artists: song.artists?.length ? song.artists : song.artist ? [song.artist] : [],
       album: song.album || null,
       durationS,
+      exactDuration: true, // YouTube Music's own length for the song
     };
   }
   const raw = song.meta?.videoTitle || song.title || "";
   const { title, artist } = splitUploadTitle(raw, song.ytChannel);
-  return { title: title || song.title || null, artist: artist || song.artist || null, artists: artist ? [artist] : [], album: song.album || null, durationS };
+  // An upload's length includes any intro/outro, so it's only a rough guide.
+  return { title: title || song.title || null, artist: artist || song.artist || null, artists: artist ? [artist] : [], album: song.album || null, durationS, exactDuration: false };
 }

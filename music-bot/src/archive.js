@@ -15,7 +15,9 @@ const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|
 // Gone for good. A bare "Video unavailable" is NOT here: YouTube also says
 // that to a server it distrusts (verified: such songs download fine from
 // another server), so that case is retried elsewhere instead.
-const UNAVAILABLE_RE = /private video|has been removed|account associated with this video has been terminated|copyright claim|members-only|no longer available because/i;
+// Age-restricted songs need a signed-in YouTube account, so retrying on
+// another server never helps either.
+const UNAVAILABLE_RE = /private video|has been removed|account associated with this video has been terminated|copyright claim|members-only|no longer available because|confirm your age|age-restricted|inappropriate for some users/i;
 const SERVER_REFUSED_RE = /video unavailable|this video is unavailable|not available in your country|uploader has not made this video available/i;
 
 /** YouTube / YouTube Music page URL → 11-char video id, or null. */

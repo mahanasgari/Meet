@@ -12,7 +12,7 @@ export const VIDEO_FORMAT =
 
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
 const NONE_RE = /requested format is not available|no video formats|only images are available/i;
-const UNAVAILABLE_RE = /private video|has been removed|account associated with this video has been terminated|copyright claim|members-only|no longer available because|video unavailable|this video is unavailable/i;
+const UNAVAILABLE_RE = /private video|has been removed|account associated with this video has been terminated|copyright claim|members-only|no longer available because|video unavailable|this video is unavailable|confirm your age|age-restricted|inappropriate for some users/i;
 
 /** Art tracks ("Topic" channel releases) are a still image: no video worth keeping. */
 export function needsVideo(song) {

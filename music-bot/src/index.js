@@ -3642,11 +3642,32 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const r = await fetch(upstream, {
+        let r = await fetch(upstream, {
           headers: { "User-Agent": "MiniPlayer lyrics proxy (meet music-bot)" },
           signal: AbortSignal.timeout(12_000),
         });
-        const body = await r.text();
+        let body = await r.text();
+        // Google's "gtx" translate answers servers with 429 (too many
+        // requests); its "dict-chrome-ex" endpoint still works. Reshape that
+        // answer into the gtx format the app reads.
+        if (url.pathname === "/lyrics/translate" && r.status === 429) {
+          const alt = new URL("https://translate.googleapis.com/translate_a/t?client=dict-chrome-ex");
+          for (const k of ["sl", "tl", "q"]) {
+            const v = upstream.searchParams.get(k);
+            if (v) alt.searchParams.set(k, v);
+          }
+          const r2 = await fetch(alt, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(12_000) });
+          if (r2.ok) {
+            const j = await r2.json();
+            const first = Array.isArray(j) ? j[0] : null;
+            const text = Array.isArray(first) ? first[0] : first;
+            const src = Array.isArray(first) ? first[1] : upstream.searchParams.get("sl");
+            if (typeof text === "string") {
+              body = JSON.stringify([[[text, upstream.searchParams.get("q") || "", null, null, 1]], null, src || "auto"]);
+              r = { status: 200, headers: new Headers({ "content-type": "application/json; charset=utf-8" }) };
+            }
+          }
+        }
         // Cache answers and clean misses; don't pin transient upstream errors.
         if (r.status === 200 || r.status === 404) {
           lyricsCache.set(cacheKey, {

@@ -475,7 +475,10 @@ export class Catalog {
 
   videoStats() {
     const r = this.#sql(`SELECT
-      COALESCE(SUM(status='stored'),0) stored, COALESCE(SUM(status='failed'),0) failed,
+      COALESCE(SUM(status='stored'),0) stored,
+      -- A claim leaves a 'failed' placeholder until the download finishes;
+      -- only rows with a recorded failure time count as failed.
+      COALESCE(SUM(status='failed' AND stored_at IS NOT NULL),0) failed,
       COALESCE(SUM(status='none'),0) none,
       COALESCE(SUM(CASE WHEN status='stored' THEN size END),0) bytes,
       COALESCE(SUM(plays),0) plays,

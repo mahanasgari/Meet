@@ -101,6 +101,8 @@ const MIGRATIONS = [
     kind TEXT NOT NULL, video_id TEXT NOT NULL, channel TEXT NOT NULL, msg_id INTEGER, at INTEGER,
     PRIMARY KEY (kind, video_id, channel)
   );`,
+  // v7: music videos reported as wrong for a song (never picked again).
+  `ALTER TABLE video_map ADD COLUMN rejected_json TEXT;`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -463,8 +465,31 @@ export class Catalog {
 
   /** The matched music video for an audio track: {srcId|null, title, checkedAt} or null (never checked). */
   videoMapGet(videoId) {
-    const r = this.#sql("SELECT src_id, title, checked_at FROM video_map WHERE video_id=?").get(videoId);
-    return r ? { srcId: r.src_id, title: r.title, checkedAt: r.checked_at } : null;
+    const r = this.#sql("SELECT src_id, title, checked_at, rejected_json FROM video_map WHERE video_id=?").get(videoId);
+    if (!r) return null;
+    let rejected = [];
+    try {
+      rejected = JSON.parse(r.rejected_json || "[]");
+    } catch {
+      rejected = [];
+    }
+    return { srcId: r.src_id, title: r.title, checkedAt: r.checked_at, rejected };
+  }
+
+  /** "Wrong video": remember the current pick as rejected and force a fresh match. */
+  videoMapReject(videoId, now = Date.now()) {
+    const cur = this.videoMapGet(videoId);
+    const rejected = [...new Set([...(cur?.rejected || []), ...(cur?.srcId ? [cur.srcId] : [])])].slice(-20);
+    this.#sql(`INSERT INTO video_map(video_id, src_id, title, checked_at, rejected_json) VALUES(?, NULL, NULL, 0, ?)
+      ON CONFLICT(video_id) DO UPDATE SET src_id=NULL, title=NULL, checked_at=0, rejected_json=excluded.rejected_json`)
+      .run(videoId, JSON.stringify(rejected));
+    return rejected;
+  }
+
+  /** Forget all matches (keeps rejections) so they're redone with a better matcher. */
+  videoMapResetMatches() {
+    this.#sql("DELETE FROM video_map WHERE rejected_json IS NULL OR rejected_json='[]'").run();
+    this.#sql("UPDATE video_map SET src_id=NULL, title=NULL, checked_at=0").run();
   }
 
   videoMapSet(videoId, srcId, title = null, now = Date.now()) {

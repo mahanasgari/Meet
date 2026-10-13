@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "6");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "7");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "6");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "7");
   c.close();
 });
 
@@ -500,5 +500,52 @@ test("needsBackup / markBackup / stats backup + ctxPlays", () => {
   const s = c.stats(7, NOW);
   assert.deepEqual(s.backup, { done: 1, pending: 1 });
   assert.deepEqual(s.ctxPlays, [{ ctx: "picks", plays: 2 }, { ctx: "autoplay", plays: 1 }]);
+  c.close();
+});
+
+test("videoMapReject moves the current src into rejected and clears it", () => {
+  const c = open();
+  c.videoMapSet("v1", "src1", "Title A", NOW);
+  assert.deepEqual(c.videoMapReject("v1", NOW + MIN), ["src1"]);
+  const r = c.videoMapGet("v1");
+  assert.equal(r.srcId, null);
+  assert.equal(r.title, null);
+  assert.equal(r.checkedAt, 0);
+  assert.deepEqual(r.rejected, ["src1"]);
+  c.close();
+});
+
+test("videoMapReject accumulates rejections and de-duplicates", () => {
+  const c = open();
+  c.videoMapSet("v1", "src1", null, NOW);
+  c.videoMapReject("v1", NOW);
+  c.videoMapSet("v1", "src2", null, NOW);
+  assert.deepEqual(c.videoMapReject("v1", NOW), ["src1", "src2"]);
+  c.videoMapSet("v1", "src1", null, NOW); // matcher picks the same one again
+  assert.deepEqual(c.videoMapReject("v1", NOW), ["src1", "src2"]);
+  assert.deepEqual(c.videoMapGet("v1").rejected, ["src1", "src2"]);
+  c.close();
+});
+
+test("videoMapReject with no existing row records nothing but an empty list", () => {
+  const c = open();
+  assert.deepEqual(c.videoMapReject("nope", NOW), []);
+  assert.deepEqual(c.videoMapGet("nope").rejected, []);
+  c.close();
+});
+
+test("videoMapResetMatches clears src ids but keeps rejected lists", () => {
+  const c = open();
+  c.videoMapSet("kept", "src1", "T", NOW);
+  c.videoMapReject("kept", NOW); // rejected ["src1"], src null
+  c.videoMapSet("kept", "src2", "T2", NOW);
+  c.videoMapSet("plain", "src3", "T3", NOW); // no rejections: row is dropped
+  c.videoMapResetMatches();
+  const kept = c.videoMapGet("kept");
+  assert.equal(kept.srcId, null);
+  assert.equal(kept.title, null);
+  assert.equal(kept.checkedAt, 0);
+  assert.deepEqual(kept.rejected, ["src1"]);
+  assert.equal(c.videoMapGet("plain"), null);
   c.close();
 });

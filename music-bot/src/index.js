@@ -37,6 +37,7 @@ import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } fr
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
 import { Recommender } from "./recommend.js";
+import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
@@ -680,6 +681,7 @@ async function resolveVideo(id) {
   const song = catalog.lookup(id);
   if (!song || song.sourceKind !== "ytm_track") return { srcId: id };
   const known = catalog.videoMapGet(id);
+  const exclude = known?.rejected || [];
   // A miss is re-checked after a week (the video may be uploaded later).
   if (known && (known.srcId || Date.now() - known.checkedAt < 7 * 864e5)) return { srcId: known.srcId };
   if (!videoMapInflight.has(id)) {
@@ -689,7 +691,7 @@ async function resolveVideo(id) {
         try {
           const artist = (song.artists && song.artists.length ? song.artists : [song.artist]).filter(Boolean).join(", ");
           const rows = await searchYtmVideos(`${song.title} ${artist}`.trim());
-          const pick = pickOfficialVideo(rows, { title: song.title, artist, durationS: song.durationS });
+          const pick = pickOfficialVideo(rows, { title: song.title, artist, artists: song.artists, durationS: song.durationS }, { exclude });
           catalog.videoMapSet(id, pick?.videoId || null, pick?.title || null);
           if (pick) console.log(`[video] ${song.title} → ${pick.videoId} (${pick.title})`);
           return { srcId: pick?.videoId || null };
@@ -704,7 +706,24 @@ async function resolveVideo(id) {
   }
   return videoMapInflight.get(id);
 }
-if (archive && catalog) archive.home.resolveVideo = resolveVideo;
+if (archive && catalog) {
+  archive.home.resolveVideo = resolveVideo;
+  // Matches made by an older matcher are redone lazily with the current one.
+  const MATCHER = "2";
+  const row = catalog.db.prepare("SELECT value FROM meta WHERE key='video_matcher'").get();
+  if (row?.value !== MATCHER) {
+    catalog.videoMapResetMatches();
+    catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('video_matcher',?)").run(MATCHER);
+    console.log("[video] video matches reset for matcher v" + MATCHER);
+  }
+}
+/** "Wrong video" from a listener: never pick that video for this song again. */
+async function reportVideo(id) {
+  if (!catalog) return { ok: false };
+  catalog.videoMapReject(id);
+  const r = await resolveVideo(id);
+  return { ok: true, srcId: r.srcId };
+}
 
 // --- Music video requests.
 let videoJobs = 0;
@@ -3017,6 +3036,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const body = await readBody(req, 200_000).catch(() => ({}));
+      if (url.pathname === "/archive/video-report") {
+        sendJson(res, 200, await reportVideo(String(body.id || "")));
+        return;
+      }
       const out = await handleHomeRoute(url.pathname, body, { catalog, peers: healthyPeers, resolveVideo });
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
@@ -3763,6 +3786,36 @@ const server = http.createServer(async (req, res) => {
         if (!res.headersSent) sendJson(res, 502, { error: "clip_failed" });
       } finally {
         globalThis.__clips -= 1;
+      }
+      return;
+    }
+
+    // --- Clean song info for matching lyrics in the app.
+    if (req.method === "GET" && url.pathname === "/song/meta") {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!archive || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+      }
+      const meta = songMeta(await archive.home.lookup(id).catch(() => null));
+      sendJson(res, meta ? 200 : 404, meta || { error: "not_found" });
+      return;
+    }
+    // "Wrong video?" from the app.
+    if (req.method === "POST" && url.pathname === "/video/report") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 2_000).catch(() => ({}));
+      const id = String(body.id || "").replace(/^yt_/, "");
+      if (!archive || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      try {
+        const out = catalog ? await reportVideo(id) : await archive.home.post("/archive/video-report", { id }, 20000);
+        sendJson(res, 200, out);
+      } catch {
+        sendJson(res, 502, { error: "report_failed" });
       }
       return;
     }

@@ -5,6 +5,7 @@ import { readFileSync, rmSync, statSync, existsSync } from "node:fs";
 import { once } from "node:events";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { normalize, similarity, splitUploadTitle } from "./song_meta.js";
 import { parseRange, serveFile } from "./disk_cache.js";
 
 export const VIDEO_FORMAT =
@@ -189,41 +190,52 @@ export function serveFileRange(req, res, path, { mime = "video/mp4", source } = 
   serveFile(req, res, path, { mime, extraHeaders: source ? { "X-MP-Source": source } : {} });
 }
 
-const norm = (x) =>
-  String(x || "")
-    .toLowerCase()
-    .replace(/\(.*?\)|\[.*?\]/g, " ")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-
 /**
  * Picks the official music video for an audio track from YouTube Music
  * video-search rows [{videoId, title, subtitle, durationS}], or null.
- * The title must contain the song title and name the artist (in the title
- * or the channel line), the length must be close, and "official video"
- * beats plain uploads; lyric videos and covers are skipped.
+ * The result's own song title must match ours (after splitting "Artist -
+ * Title" and normalising Persian/Arabic letters), an artist must match the
+ * title or the channel, the length must be close, and covers / lyric videos
+ * / remixes / live versions are skipped unless the song itself is one.
+ * Below the confidence bar there's no video: none beats a wrong one.
+ * [exclude]: video ids reported as wrong for this song.
  */
-export function pickOfficialVideo(rows, { title, artist, durationS }) {
-  const t = norm(title);
-  const artists = String(artist || "")
-    .split(/,|&| and | feat\.? | ft\.? /i)
-    .map(norm)
-    .filter((a) => a.length >= 2);
-  if (!t) return null;
+export function pickOfficialVideo(rows, { title, artist, artists, durationS }, { exclude = [] } = {}) {
+  const want = String(title || "").trim();
+  if (!normalize(want)) return null;
+  const wantArtists = (artists && artists.length ? artists : String(artist || "").split(/,|&| and | feat\.? | ft\.? /i))
+    .map((a) => String(a).trim())
+    .filter((a) => normalize(a).length >= 2);
+  const VARIANT = /\b(lyrics?|cover|karaoke|instrumental|remix|live|reaction|slowed|sped ?up|reverb|8d|teaser|trailer|behind the scenes|making of|tutorial|piano version|acoustic)\b/i;
   let best = null;
   for (const r of rows || []) {
-    if (!/^[A-Za-z0-9_-]{11}$/.test(r.videoId || "")) continue;
-    const rt = norm(r.title);
-    const rs = norm(r.subtitle);
-    if (!rt.includes(t)) continue;
-    if (artists.length && !artists.some((a) => rt.includes(a) || rs.includes(a))) continue;
-    if (/\b(lyric|lyrics|cover|karaoke|instrumental|remix|live|reaction|slowed|8d)\b/i.test(r.title || "")) continue;
-    if (durationS && r.durationS && (r.durationS < durationS * 0.75 || r.durationS > durationS * 1.7)) continue;
-    let score = 1;
-    if (/official\s*(music\s*)?video|music\s*video|\bmv\b|video\s*clip/i.test(r.title || "")) score += 2;
-    if (/official\s*(audio|visuali[sz]er)/i.test(r.title || "")) score -= 0.5;
-    if (durationS && r.durationS) score -= Math.abs(r.durationS - durationS) / durationS;
-    if (!best || score > best.score) best = { videoId: r.videoId, title: r.title, score };
+    if (!/^[A-Za-z0-9_-]{11}$/.test(r.videoId || "") || exclude.includes(r.videoId)) continue;
+    const rawTitle = String(r.title || "");
+    const channel = String(r.subtitle || "").split("•")[0].trim();
+    const split = splitUploadTitle(rawTitle, channel);
+    const titleSim = Math.max(similarity(want, split.title), similarity(want, rawTitle) * 0.95);
+    if (titleSim < 0.7) continue;
+    const titleNorm = normalize(rawTitle);
+    const artistSim = wantArtists.length
+      ? Math.max(
+          0,
+          ...wantArtists.map((a) =>
+            Math.max(similarity(a, split.artist || ""), similarity(a, channel), titleNorm.includes(normalize(a)) ? 0.95 : 0),
+          ),
+        )
+      : 0.6;
+    if (artistSim < 0.5) continue;
+    if (VARIANT.test(rawTitle) && !VARIANT.test(want)) continue;
+    let closeness = 0.6;
+    if (durationS && r.durationS) {
+      if (r.durationS < durationS * 0.8 || r.durationS > durationS * 1.6) continue;
+      closeness = Math.max(0, 1 - Math.abs(r.durationS - durationS) / (durationS * 0.6));
+    }
+    let score = 0.45 * titleSim + 0.3 * artistSim + 0.15 * closeness;
+    if (/official\s*(music\s*)?video|music\s*video|\bm\/?v\b|video\s*clip|\bclip\b/i.test(rawTitle)) score += 0.15;
+    if (/official\s*(audio|visuali[sz]er)|\bvisuali[sz]er\b/i.test(rawTitle)) score -= 0.1;
+    if (score < 0.72) continue;
+    if (!best || score > best.score) best = { videoId: r.videoId, title: rawTitle, score: Math.round(score * 100) / 100 };
   }
-  return best ? { videoId: best.videoId, title: best.title } : null;
+  return best;
 }

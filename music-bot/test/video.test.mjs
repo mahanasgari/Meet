@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
-import { VIDEO_FORMAT, classifyYtdlpError, needsVideo, serveVideoFromTelegram, videoCaption } from "../src/video.js";
+import { VIDEO_FORMAT, classifyYtdlpError, needsVideo, pickOfficialVideo, serveVideoFromTelegram, videoCaption } from "../src/video.js";
 
 test("needsVideo", () => {
   assert.equal(needsVideo({ sourceKind: "ytm_track" }), false);
@@ -101,4 +101,52 @@ test("pickOfficialVideo finds the official video and rejects other songs", async
   assert.equal(pickOfficialVideo(maleTo, { title: "Male To", artist: "Kamran & Hooman", durationS: 227 })?.videoId, "lr_a6NjkTL4");
   assert.equal(pickOfficialVideo([{ videoId: "S59SaU-RDD4", title: "Chi Mishe Badet", subtitle: "Kiyarash", durationS: 192 }], { title: "Oftadi Mese Ashk", artist: "Kiyarash", durationS: 196 }), null);
   assert.equal(pickOfficialVideo([{ videoId: "j3vAlrgBvoE", title: "Sami Beigi - In Eshghe Official Video", subtitle: "x", durationS: 600 }], { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 }), null, "length far off");
+});
+
+test("pickOfficialVideo rejects lyric, cover, remix and live versions when the song is none of them", () => {
+  const want = { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 };
+  const bad = [
+    { videoId: "aaaaaaaaaaa", title: "Sami Beigi - In Eshghe (Lyrics)", subtitle: "Sami Beigi • 1M views", durationS: 226 },
+    { videoId: "bbbbbbbbbbb", title: "Sami Beigi - In Eshghe Cover", subtitle: "Some Fan", durationS: 225 },
+    { videoId: "ccccccccccc", title: "Sami Beigi - In Eshghe (Remix)", subtitle: "DJ Someone", durationS: 225 },
+    { videoId: "ddddddddddd", title: "Sami Beigi - In Eshghe Live Concert", subtitle: "Sami Beigi", durationS: 230 },
+  ];
+  assert.equal(pickOfficialVideo(bad, want), null);
+  // A remix/live song is allowed to match those variants.
+  assert.equal(pickOfficialVideo([bad[2]], { title: "In Eshghe Remix", artist: "Sami Beigi", durationS: 225 })?.videoId, "ccccccccccc");
+});
+
+test("pickOfficialVideo rejects a wrong-artist video with the right title", () => {
+  const rows = [{ videoId: "eeeeeeeeeee", title: "Other Singer - In Eshghe Official Video", subtitle: "Other Singer", durationS: 225 }];
+  assert.equal(pickOfficialVideo(rows, { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 }), null);
+});
+
+test("pickOfficialVideo skips excluded ids and picks the next valid one", () => {
+  const rows = [
+    { videoId: "fffffffffff", title: "Sami Beigi - In Eshghe Official Video", subtitle: "Sami Beigi", durationS: 225 },
+    { videoId: "ggggggggggg", title: "Sami Beigi - In Eshghe Official Music Video", subtitle: "Sami Beigi", durationS: 226 },
+  ];
+  const want = { title: "In Eshghe", artist: "Sami Beigi", durationS: 225 };
+  assert.equal(pickOfficialVideo(rows, want)?.videoId, "fffffffffff");
+  assert.equal(pickOfficialVideo(rows, want, { exclude: ["fffffffffff"] })?.videoId, "ggggggggggg");
+  assert.equal(pickOfficialVideo(rows, want, { exclude: ["fffffffffff", "ggggggggggg"] }), null);
+});
+
+test("pickOfficialVideo returns null below the confidence bar", () => {
+  // No artist given (default 0.6), no official keyword, length 300 vs 225: score ~0.70 < 0.72.
+  const far = [{ videoId: "hhhhhhhhhhh", title: "In Eshghe", subtitle: "Somebody", durationS: 300 }];
+  assert.equal(pickOfficialVideo(far, { title: "In Eshghe", durationS: 225 }), null);
+  // Positive control: same row with an official keyword clears the bar.
+  const ok = [{ videoId: "iiiiiiiiiii", title: "In Eshghe Official Video", subtitle: "Somebody", durationS: 300 }];
+  assert.equal(pickOfficialVideo(ok, { title: "In Eshghe", durationS: 225 })?.videoId, "iiiiiiiiiii");
+});
+
+test("pickOfficialVideo matches Persian-letter variants", () => {
+  // Arabic-letter upload title and artist vs Persian-letter song metadata.
+  const rows = [{ videoId: "jjjjjjjjjjj", title: "سوگند - بليط يك طرفه OFFICIAL VIDEO", subtitle: "Sogand", durationS: 210 }];
+  const got = pickOfficialVideo(rows, { title: "بلیط یک طرفه", artist: "سوگند", durationS: 210 });
+  assert.equal(got?.videoId, "jjjjjjjjjjj");
+  // Arabic-letter want vs Persian-letter upload.
+  const arabicWant = pickOfficialVideo(rows, { title: "بليط يك طرفه", artist: "سوگند", durationS: 210 });
+  assert.equal(arabicWant?.videoId, "jjjjjjjjjjj");
 });

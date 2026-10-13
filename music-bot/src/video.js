@@ -210,6 +210,8 @@ export function pickOfficialVideo(rows, { title, artist, artists, durationS }, {
   let best = null;
   for (const r of rows || []) {
     if (!/^[A-Za-z0-9_-]{11}$/.test(r.videoId || "") || exclude.includes(r.videoId)) continue;
+    // Audio tracks with a still image and podcast episodes aren't videos.
+    if (r.videoType === "ATV" || r.videoType === "PODCAST_EPISODE") continue;
     const rawTitle = String(r.title || "");
     const channel = String(r.subtitle || "").split("•")[0].trim();
     const split = splitUploadTitle(rawTitle, channel);
@@ -233,7 +235,10 @@ export function pickOfficialVideo(rows, { title, artist, artists, durationS }, {
     }
     let score = 0.45 * titleSim + 0.3 * artistSim + 0.15 * closeness;
     if (/official\s*(music\s*)?video|music\s*video|\bm\/?v\b|video\s*clip|\bclip\b/i.test(rawTitle)) score += 0.15;
-    if (/official\s*(audio|visuali[sz]er)|\bvisuali[sz]er\b/i.test(rawTitle)) score -= 0.1;
+    if (/official\s*(audio|track|visuali[sz]er)|\bvisuali[sz]er\b/i.test(rawTitle)) score -= 0.12;
+    // YouTube Music's own label beats any title wording.
+    if (r.videoType === "OMV") score += 0.2;
+    else if (r.videoType === "UGC") score -= 0.1;
     if (score < 0.72) continue;
     if (!best || score > best.score) best = { videoId: r.videoId, title: rawTitle, score: Math.round(score * 100) / 100 };
   }

@@ -667,7 +667,10 @@ async function searchYtmVideos(query) {
       const sub = cols.slice(1).join(" • ");
       const d = /(?:^|\D)(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/.exec(sub);
       const durationS = d ? (d[3] ? Number(d[1]) * 3600 + Number(d[2]) * 60 + Number(d[3]) : Number(d[1]) * 60 + Number(d[2])) : null;
-      rows.push({ videoId: m.playlistItemData?.videoId, title: cols[0] || "", subtitle: sub, durationS });
+      // YouTube Music's own label: OMV = official music video, UGC = user
+      // upload, ATV = audio track with a still image.
+      const videoType = (/MUSIC_VIDEO_TYPE_([A-Z_]+)/.exec(JSON.stringify(m.overlay || m.flexColumns || m)) || [])[1] || null;
+      rows.push({ videoId: m.playlistItemData?.videoId, title: cols[0] || "", subtitle: sub, durationS, videoType });
       return;
     }
     for (const v of Object.values(n)) walk(v);
@@ -709,7 +712,7 @@ async function resolveVideo(id) {
 if (archive && catalog) {
   archive.home.resolveVideo = resolveVideo;
   // Matches made by an older matcher are redone lazily with the current one.
-  const MATCHER = "2";
+  const MATCHER = "3";
   const row = catalog.db.prepare("SELECT value FROM meta WHERE key='video_matcher'").get();
   if (row?.value !== MATCHER) {
     catalog.videoMapResetMatches();

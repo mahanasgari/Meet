@@ -23,6 +23,9 @@ export function needsVideo(song) {
 /** yt-dlp stderr → 'blocked' | 'none' | 'unavailable' | 'failed'. */
 export function classifyYtdlpError(stderr) {
   const s = String(stderr || "");
+  // Age-restricted/removed first: "Sign in to confirm your age" also
+  // matches the bot-check words but isn't a block.
+  if (UNAVAILABLE_RE.test(s)) return "unavailable";
   if (BLOCKED_RE.test(s)) return "blocked";
   if (NONE_RE.test(s)) return "none";
   if (UNAVAILABLE_RE.test(s)) return "unavailable";

@@ -420,7 +420,12 @@ export class Archive {
       clearTimeout(timer);
       file.end();
       await once(file, "finish").catch(() => undefined);
-      if (sent && !gone) res.end();
+      // A download that died midway must look broken to the player (reset),
+      // not finished — otherwise it jumps to the next song.
+      if (sent && !gone) {
+        if (code === 0) res.end();
+        else res.destroy();
+      }
       const size = existsSync(tmp) ? statSync(tmp).size : 0;
       let info = {};
       try {
@@ -438,8 +443,11 @@ export class Archive {
       }
       this.cache.discard(tmp);
       const last = stderr.trim().split("\n").pop() || `yt-dlp exit ${code}`;
-      const blocked = BLOCKED_RE.test(stderr);
-      const unavailable = !blocked && UNAVAILABLE_RE.test(stderr);
+      // "Sign in to confirm your age" shares words with the bot check but
+      // only means this one song needs an account: never cool the server.
+      const ageGate = /confirm your age|age-restricted|inappropriate for some users/i.test(stderr);
+      const blocked = !ageGate && BLOCKED_RE.test(stderr);
+      const unavailable = ageGate || (!blocked && UNAVAILABLE_RE.test(stderr));
       // Refused on this server only: skip this server for the song, no cooldown.
       const refusedHere = !blocked && !unavailable && SERVER_REFUSED_RE.test(stderr);
       if (blocked) {

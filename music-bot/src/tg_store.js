@@ -124,6 +124,8 @@ export class TgStore {
           if (!this._Api) this._Api = (await import("telegram")).Api;
           const Api = this._Api;
           const msg = await this._client.sendFile(this._peer, {
+        parseMode: false,
+            parseMode: false, // plain text: song titles contain _ * [ ]
             file: path,
             caption: caption || "",
             forceDocument: false,
@@ -174,6 +176,7 @@ export class TgStore {
   async uploadVideo(path, { title, artist, durationS, width, height, thumbPath, caption } = {}) {
     return this._queued("upload", async (Api) => {
       const msg = await this._client.sendFile(this._peer, {
+        parseMode: false,
         file: path,
         caption: caption || "",
         forceDocument: false,
@@ -234,7 +237,7 @@ export class TgStore {
   /** Replaces an archived message's caption (e.g. to add quality details). */
   async editCaption(msgId, caption) {
     await this.connect();
-    await this._client.editMessage(this._peer, { message: Number(msgId), text: String(caption).slice(0, 1024) });
+    await this._client.editMessage(this._peer, { message: Number(msgId), text: String(caption).slice(0, 1024), parseMode: false });
     this._msgs.delete(Number(msgId));
   }
 

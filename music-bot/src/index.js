@@ -2765,10 +2765,135 @@ function trackRequest(req, res, url) {
   });
 }
 
+/**
+ * Browsers (the web app) may call every server from another origin. An
+ * <audio> tag can't send headers, so the web app packs them into `_h`
+ * (base64url JSON) and they're unpacked here. True when the request was a
+ * preflight and is answered.
+ */
+function corsAndPackedHeaders(req, res, url) {
+  const packed = url.searchParams.get("_h");
+  if (packed) {
+    try {
+      const h = JSON.parse(Buffer.from(packed, "base64url").toString("utf8"));
+      for (const [k, v] of Object.entries(h)) {
+        const key = k.toLowerCase();
+        if (typeof v === "string" && !(key in req.headers) && /^(authorization|x-music-token|x-mp-[a-z-]+)$/.test(key)) {
+          req.headers[key] = v;
+        }
+      }
+    } catch {
+      // ignore a broken _h
+    }
+  }
+  if (!req.headers.origin) return false;
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Expose-Headers", "X-MP-Source, Content-Range, Content-Length, Accept-Ranges");
+  if (req.method !== "OPTIONS") return false;
+  res.writeHead(204, {
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": req.headers["access-control-request-headers"] || "*",
+    "Access-Control-Max-Age": "86400",
+  });
+  res.end();
+  return true;
+}
+
+const WEB_TYPES = {
+  html: "text/html; charset=utf-8",
+  js: "text/javascript; charset=utf-8",
+  mjs: "text/javascript; charset=utf-8",
+  json: "application/json",
+  wasm: "application/wasm",
+  css: "text/css",
+  png: "image/png",
+  jpg: "image/jpeg",
+  svg: "image/svg+xml",
+  ico: "image/x-icon",
+  ttf: "font/ttf",
+  otf: "font/otf",
+  woff2: "font/woff2",
+  frag: "text/plain",
+  bin: "application/octet-stream",
+  symbols: "text/plain",
+};
+
+/** Static files of the Flutter web build; revalidated (file names aren't hashed), .gz twins used when present. */
+function serveWebApp(req, res, rawPath) {
+  let rel;
+  try {
+    rel = decodeURIComponent(rawPath).replace(/^\/+/, "") || "index.html";
+  } catch {
+    rel = "";
+  }
+  if (!rel || rel.split("/").some((part) => part === ".." || part.startsWith("."))) {
+    sendJson(res, 404, { error: "not_found" });
+    return;
+  }
+  const root = joinPath(SHARES_DIR, "web");
+  let p = joinPath(root, rel);
+  let st;
+  try {
+    st = statSync(p);
+    if (st.isDirectory()) {
+      p = joinPath(p, "index.html");
+      st = statSync(p);
+    }
+  } catch {
+    // App routes (no extension) open the app; missing files are 404.
+    if (/\.[a-z0-9]+$/i.test(rel)) {
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+    p = joinPath(root, "index.html");
+    try {
+      st = statSync(p);
+    } catch {
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+  }
+  const ext = (p.match(/\.([a-z0-9]+)$/i)?.[1] || "").toLowerCase();
+  const etag = `"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+  const headers = {
+    "Content-Type": WEB_TYPES[ext] || "application/octet-stream",
+    "Cache-Control": "no-cache",
+    ETag: etag,
+    Vary: "Accept-Encoding",
+  };
+  if (req.headers["if-none-match"] === etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  let file = p;
+  let size = st.size;
+  if (/\bgzip\b/.test(req.headers["accept-encoding"] || "")) {
+    try {
+      const gz = statSync(`${p}.gz`);
+      if (gz.mtimeMs >= st.mtimeMs - 5000) {
+        file = `${p}.gz`;
+        size = gz.size;
+        headers["Content-Encoding"] = "gzip";
+      }
+    } catch {
+      // no compressed twin
+    }
+  }
+  headers["Content-Length"] = size;
+  res.writeHead(200, headers);
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  createReadStream(file).pipe(res);
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
     trackRequest(req, res, url);
+    if (corsAndPackedHeaders(req, res, url)) return;
 
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, {
@@ -3246,6 +3371,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+
+    // --- The web app (iPhone and locked-down computers): SHARES_DIR/web.
+    const webPath = url.pathname.match(/^\/web(\/.*)?$/);
+    if ((req.method === "GET" || req.method === "HEAD") && webPath) {
+      if (!webPath[1]) {
+        res.writeHead(301, { Location: "web/" });
+        res.end();
+        return;
+      }
+      serveWebApp(req, res, webPath[1]);
       return;
     }
 

@@ -27,6 +27,11 @@ export function renderDownloadPage(manifest) {
 </a>`;
     })
     .join("\n");
+  // iPhone, Mac, and computers where apps can't be installed: the web app.
+  const web = `<a class="dl" data-os="web" href="../web/">
+  <span class="name">Web app</span>
+  <span class="meta">iPhone, iPad, Mac or any computer · opens in the browser, nothing to install</span>
+</a>`;
   const version = manifest
     ? `Version ${esc(manifest.version)} · build ${esc(manifest.build)}`
     : "No release published yet";
@@ -68,12 +73,19 @@ export function renderDownloadPage(manifest) {
   <p class="sub">Music from YouTube, light and fast. ${version}</p>
 
   ${rows || '<p class="muted">Nothing to download yet.</p>'}
+  ${web}
 
   <h2>Installing on Android</h2>
   <ol>
     <li>Open the downloaded file. If Android asks, allow installing apps from your browser (or Telegram).</li>
     <li>If <b>Google Play Protect</b> says it hasn’t seen the app, tap <b>Scan app</b> (or <b>Install anyway</b>).</li>
     <li>Open MiniPlayer and enter the <b>invite code</b> you were given.</li>
+  </ol>
+
+  <h2>iPhone and iPad</h2>
+  <ol>
+    <li>Open the <b>Web app</b> link in <b>Safari</b> and enter your invite code.</li>
+    <li>Tap <b>Share</b> → <b>Add to Home Screen</b>. MiniPlayer then opens full screen from its own icon, and keeps playing with the screen locked.</li>
   </ol>
 
   <h2>Installing on Windows or Linux</h2>
@@ -88,7 +100,7 @@ export function renderDownloadPage(manifest) {
 <script>
   // Highlight the download that fits this device.
   const ua = navigator.userAgent.toLowerCase();
-  const os = /android/.test(ua) ? "android" : /windows/.test(ua) ? "windows" : /linux|x11/.test(ua) ? "linux" : "";
+  const os = /iphone|ipad|ipod|macintosh/.test(ua) ? "web" : /android/.test(ua) ? "android" : /windows/.test(ua) ? "windows" : /linux|x11/.test(ua) ? "linux" : "";
   const best = document.querySelector('.dl[data-os="' + os + '"]');
   if (best) { best.classList.add("best"); best.parentNode.insertBefore(best, best.parentNode.querySelector(".dl")); }
 </script>

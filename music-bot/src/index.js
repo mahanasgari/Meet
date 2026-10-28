@@ -2968,6 +2968,59 @@ function serveWebApp(req, res, rawPath) {
   createReadStream(file).pipe(res);
 }
 
+const HD_THUMBS = joinPath(SHARES, "thumbs-hd");
+let hdThumbJobs = 0;
+
+/**
+ * A sharp square cover for a YouTube id (up to 720×720 JPEG): the largest
+ * thumbnail YouTube has, cropped to the picture itself. 16:9 frames are cut
+ * to their centre square (an art track's cover sits there); 4:3 ones carry
+ * letterbox bars, so the 16:9 picture inside is found first. Kept on disk.
+ */
+async function hdThumb(id) {
+  const file = joinPath(HD_THUMBS, `${id}.jpg`);
+  try {
+    return readFileSync(file);
+  } catch {
+    // not made yet
+  }
+  if (hdThumbJobs >= 3) return null;
+  hdThumbJobs++;
+  try {
+    let src = null;
+    for (const name of ["maxresdefault", "sddefault", "hqdefault"]) {
+      const r = await fetch(`https://i.ytimg.com/vi/${id}/${name}.jpg`, { signal: AbortSignal.timeout(10_000) }).catch(() => null);
+      if (r?.ok) {
+        src = Buffer.from(await r.arrayBuffer());
+        break;
+      }
+    }
+    if (!src) return null;
+    const side = "if(gt(iw/ih\\,1.5)\\,ih\\,iw*9/16)";
+    const out = await new Promise((resolve) => {
+      const c = spawn(FFMPEG_BIN, ["-v", "error", "-i", "pipe:0", "-vf", `crop=${side}:${side},scale='min(720,iw)':-1`, "-q:v", "3", "-f", "image2", "pipe:1"], {
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      const chunks = [];
+      c.stdout.on("data", (d) => chunks.push(d));
+      c.on("error", () => resolve(null));
+      c.on("close", (code) => resolve(code === 0 && chunks.length ? Buffer.concat(chunks) : null));
+      c.stdin.on("error", () => {});
+      c.stdin.end(src);
+    });
+    if (!out) return null;
+    try {
+      mkdirSync(HD_THUMBS, { recursive: true });
+      writeFileSync(file, out);
+    } catch {
+      // serve it anyway
+    }
+    return out;
+  } finally {
+    hdThumbJobs--;
+  }
+}
+
 /** Archive the songs in a YouTube Music answer the app just asked for (see interest.js). */
 function queueInterest(endpoint, body, text) {
   let json;
@@ -3966,6 +4019,20 @@ const server = http.createServer(async (req, res) => {
       const id = url.searchParams.get("id") || "";
       if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
         sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      if (url.searchParams.get("hd") === "1") {
+        const body = await hdThumb(id).catch(() => null);
+        if (body) {
+          res.writeHead(200, {
+            "Content-Type": "image/jpeg",
+            "Content-Length": body.length,
+            "Cache-Control": "public, max-age=604800, immutable",
+          });
+          res.end(body);
+        } else {
+          sendJson(res, 404, { error: "thumb_not_found" });
+        }
         return;
       }
       for (const name of ["hqdefault", "mqdefault", "default"]) {

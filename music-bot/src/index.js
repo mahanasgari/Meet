@@ -2970,6 +2970,7 @@ function serveWebApp(req, res, rawPath) {
 
 const HD_THUMBS = joinPath(SHARES, "thumbs-hd");
 let hdThumbJobs = 0;
+const hdThumbWaiting = [];
 
 /**
  * A sharp square cover for a YouTube id (up to 720×720 JPEG): the largest
@@ -2984,9 +2985,19 @@ async function hdThumb(id) {
   } catch {
     // not made yet
   }
-  if (hdThumbJobs >= 3) return null;
-  hdThumbJobs++;
+  // Three at a time; a page of covers waits its turn (a long queue gives up).
+  if (hdThumbJobs >= 3) {
+    if (hdThumbWaiting.length >= 60) return null;
+    await new Promise((resolve) => hdThumbWaiting.push(resolve));
+  } else {
+    hdThumbJobs++;
+  }
   try {
+    try {
+      return readFileSync(file); // made while this one waited
+    } catch {
+      // still to make
+    }
     let src = null;
     for (const name of ["maxresdefault", "sddefault", "hqdefault"]) {
       const r = await fetch(`https://i.ytimg.com/vi/${id}/${name}.jpg`, { signal: AbortSignal.timeout(10_000) }).catch(() => null);
@@ -3017,7 +3028,9 @@ async function hdThumb(id) {
     }
     return out;
   } finally {
-    hdThumbJobs--;
+    const next = hdThumbWaiting.shift();
+    if (next) next(); // hand the slot over
+    else hdThumbJobs--;
   }
 }
 

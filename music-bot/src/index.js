@@ -36,6 +36,7 @@ import { dailyReport, weeklyReport } from "./reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
+import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
@@ -611,6 +612,77 @@ if (catalog) {
     setTimeout(() => void graph.tick(), 4 * 60_000).unref();
     setInterval(() => void graph.tick(), (Number(process.env.GRAPH_EVERY_S) || 90) * 1000).unref();
   }
+
+  // Grow the archive around what friends like: every song of the artists
+  // they keep coming back to (hourly), and popular Persian playlists for
+  // friends without much history yet (weekly). Remembered in seed-state.json.
+  const seedStateFile = joinPath(SHARES, "archive", "seed-state.json");
+  const seedState = (() => {
+    try {
+      return JSON.parse(readFileSync(seedStateFile, "utf8"));
+    } catch {
+      return { artists: {}, playlistsAt: 0 };
+    }
+  })();
+  const saveSeedState = () => {
+    try {
+      writeFileSync(seedStateFile, JSON.stringify(seedState));
+    } catch (e) {
+      console.error("[archive] seed state:", e.message);
+    }
+  };
+  const browsePlaylist = async (vlId, limit) =>
+    listedSongIds(await graph.transport("browse", { browseId: vlId })).slice(0, limit);
+
+  const seedArtists = async () => {
+    try {
+      // Artists with 3+ plays in two weeks, most played first.
+      const rows = catalog.db
+        .prepare(`SELECT sa.artist_id id, COUNT(*) n FROM plays p JOIN song_artists sa ON sa.video_id=p.video_id
+          WHERE p.at > ? GROUP BY sa.artist_id HAVING n >= 3 ORDER BY n DESC LIMIT 40`)
+        .all(Date.now() - 14 * 864e5);
+      let done = 0;
+      for (const { id } of rows) {
+        if (done >= 8) break; // a few artist pages per hour
+        if (Date.now() - (seedState.artists[id] || 0) < 7 * 864e5) continue;
+        done++;
+        seedState.artists[id] = Date.now();
+        const page = await graph.transport("browse", { browseId: id });
+        const top = listedSongIds(page);
+        let queued = catalog.enqueue(top, "interest");
+        const all = artistSongsPlaylist(page);
+        if (all) queued += catalog.enqueue(await browsePlaylist(all, 150), "prefetch");
+        const known = catalog.db.prepare("SELECT video_id FROM song_artists WHERE artist_id=?").all(id).map((r) => r.video_id);
+        queued += catalog.enqueue(known, "prefetch");
+        if (queued) console.log(`[archive] queued ${queued} songs of artist ${id}`);
+      }
+      saveSeedState();
+    } catch (e) {
+      console.error("[archive] artist seed:", e.message);
+    }
+  };
+  setTimeout(() => void seedArtists(), 15 * 60_000).unref();
+  setInterval(() => void seedArtists(), 3600_000).unref();
+
+  const PERSIAN_PLAYLIST_QUERIES = ["Persian pop hits", "Iranian top songs", "Persian rap", "Persian love songs", "Persian dance hits"];
+  const seedPlaylists = async () => {
+    if (Date.now() - (seedState.playlistsAt || 0) < 7 * 864e5) return;
+    seedState.playlistsAt = Date.now();
+    saveSeedState();
+    let queued = 0;
+    for (const query of PERSIAN_PLAYLIST_QUERIES) {
+      try {
+        // "Featured playlists" filter.
+        const found = playlistIds(await graph.transport("search", { query, params: "EgeKAQQoADgBagwQDhAKEAMQBBAJEAU=" }));
+        for (const vl of found.slice(0, 2)) queued += catalog.enqueue(await browsePlaylist(vl, 60), "prefetch");
+      } catch (e) {
+        console.error(`[archive] playlist seed "${query}":`, e.message);
+      }
+    }
+    if (queued) console.log(`[archive] queued ${queued} songs from Persian playlists`);
+  };
+  setTimeout(() => void seedPlaylists(), 25 * 60_000).unref();
+  setInterval(() => void seedPlaylists(), 6 * 3600_000).unref();
 }
 
 // In-house recommender (home only): friends' plays + co-listening + the
@@ -634,7 +706,14 @@ if (recommender) {
       for (const { video_id } of top) {
         for (const x of recommender.similarTo(video_id, { limit: 10 })) if (!x.archived) want.add(x.videoId);
       }
-      const ids = [...want].filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 300);
+      // Up next of every archived song: what autoplay picks after them.
+      const upNext = catalog.db
+        .prepare(`SELECT r.related_id id FROM related r LEFT JOIN songs s ON s.video_id=r.related_id
+          WHERE r.kind='next' AND r.rank < 5 AND s.video_id IS NULL
+          GROUP BY r.related_id ORDER BY COUNT(*) DESC LIMIT 300`)
+        .all();
+      for (const { id } of upNext) want.add(id);
+      const ids = [...want].filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 600);
       const n = catalog.enqueue(ids, "prefetch");
       if (n) console.log(`[archive] queued ${n} songs from suggestions and the song graph`);
     } catch (e) {
@@ -2889,6 +2968,19 @@ function serveWebApp(req, res, rawPath) {
   createReadStream(file).pipe(res);
 }
 
+/** Archive the songs in a YouTube Music answer the app just asked for (see interest.js). */
+function queueInterest(endpoint, body, text) {
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return;
+  }
+  for (const { ids, reason } of interestFor(endpoint, body, json)) {
+    archive.home.enqueue(ids, reason).catch(() => {});
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
@@ -3172,6 +3264,19 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    // --- Songs a friend keeps (likes, playlists): archive them ahead of time.
+    if (req.method === "POST" && url.pathname === "/interest") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 50_000).catch(() => ({}));
+      const ids = (Array.isArray(body.ids) ? body.ids : [])
+        .map((x) => String(x).replace(/^yt_/, ""))
+        .filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id))
+        .slice(0, 300);
+      const queued = archive ? await archive.home.enqueue(ids, "interest").catch(() => 0) : 0;
+      sendJson(res, 200, { queued });
+      return;
+    }
+
     // --- In-house suggestions for the app (home server; friends' tokens).
     // Items look like /charts/weekly's so the app parses them the same way.
     if (req.method === "GET" && (url.pathname === "/recommend" || url.pathname === "/recommend/similar")) {
@@ -3670,6 +3775,7 @@ const server = http.createServer(async (req, res) => {
           text = await r.text();
         }
         sendMaybeGzip(req, res, status, text);
+        if (status === 200 && archive) setImmediate(() => queueInterest(ytmMatch[1], body, text));
       } catch {
         sendJson(res, 502, { error: "ytm_upstream_failed" });
       }

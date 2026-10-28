@@ -131,6 +131,11 @@ const qualityLabel = (codec, kbps) => {
   return kbps > 0 ? `${short} ${Math.round(kbps / 16) * 16} kbps` : short;
 };
 
+const JOB_ORDER = ["play", "retry", "next", "interest", "prefetch"];
+/** SQL rank of a job's reason (lower runs first). */
+const JOB_PRIORITY = `CASE reason ${JOB_ORDER.map((r, i) => `WHEN '${r}' THEN ${i >= 1 ? i - 1 : 0}`).join(" ")} ELSE 9 END`;
+const jobPriority = (reason) => Math.max(0, JOB_ORDER.indexOf(reason) - 1);
+
 export class Catalog {
   constructor(file) {
     mkdirSync(dirname(file), { recursive: true });
@@ -292,12 +297,20 @@ export class Catalog {
     });
   }
 
-  nextJobs(server, limit = 2, now = Date.now()) {
+  /**
+   * Claim up to [limit] queued downloads. Plays and retries first, then
+   * songs about to play ("next"), then what listeners opened ("interest",
+   * newest first: the freshest intent), then background prefetch.
+   * [urgentOnly] skips interest and prefetch (the hourly budget is nearly
+   * used up and up-next songs need the room).
+   */
+  nextJobs(server, limit = 2, now = Date.now(), { urgentOnly = false } = {}) {
     return this.#tx(() => {
       this.#reap(now);
-      // retry/play before prefetch, then oldest first.
       const rows = this.#sql(`SELECT * FROM jobs WHERE state='queued' AND next_at<=?
-        ORDER BY (reason='prefetch'), created_at, rowid`).all(now);
+        ${urgentOnly ? "AND reason IN ('play','retry','next')" : ""}
+        ORDER BY ${JOB_PRIORITY},
+          CASE WHEN reason IN ('next','interest') THEN -created_at ELSE created_at END, rowid`).all(now);
       const picked = [];
       for (const job of rows) {
         if (picked.length >= limit) break;
@@ -314,7 +327,14 @@ export class Catalog {
     return this.#tx(() => {
       let n = 0;
       for (const id of new Set(videoIds)) {
-        if (this.lookup(id)) continue;
+        if (this.lookup(id)) {
+          // Already waiting with a lower priority: move it up, as fresh.
+          const r = this.#sql(`UPDATE jobs SET reason=?, created_at=?, updated_at=?
+            WHERE video_id=? AND state='queued' AND ${JOB_PRIORITY} > ${jobPriority(reason)}`)
+            .run(reason, now, now, id);
+          n += Number(r.changes);
+          continue;
+        }
         this.#ensureSong(id, now);
         this.#sql(`INSERT INTO jobs(video_id,state,reason,created_at,updated_at)
           VALUES(?, 'queued', ?, ?, ?)`).run(id, reason, now, now);

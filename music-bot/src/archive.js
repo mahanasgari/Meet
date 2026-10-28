@@ -167,9 +167,15 @@ export class HomeLink {
   failed(id, server, error, flags) {
     return this.catalog ? this.catalog.failed(id, server, error, flags) : this.post("/archive/failed", { id, server, error, flags });
   }
-  async nextJobs(server, limit) {
-    if (this.catalog) return this.catalog.nextJobs(server, limit);
-    return (await this.post("/archive/jobs", { server, limit })).ids || [];
+  async nextJobs(server, limit, { urgentOnly = false } = {}) {
+    if (this.catalog) return this.catalog.nextJobs(server, limit, Date.now(), { urgentOnly });
+    return (await this.post("/archive/jobs", { server, limit, ...(urgentOnly ? { urgentOnly } : {}) })).ids || [];
+  }
+  /** Queue songs listeners are likely to play next (fire and forget). */
+  enqueue(ids, reason) {
+    if (!ids.length) return Promise.resolve(0);
+    if (this.catalog) return Promise.resolve(this.catalog.enqueue(ids, reason));
+    return this.post("/archive/enqueue", { ids, reason }).then((r) => r.queued || 0);
   }
   plays(events) {
     return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
@@ -230,7 +236,7 @@ export class Archive {
     this.tg.connect().catch((e) => this.log.error("[archive] telegram connect:", e.message));
     setInterval(() => void this.flushPlays(), 30_000).unref();
     setInterval(() => void this.uploadTick(), 5_000).unref();
-    setInterval(() => void this.jobTick(), 60_000).unref();
+    setInterval(() => void this.jobTick(), 20_000).unref();
   }
 
   cooling() {
@@ -611,9 +617,14 @@ export class Archive {
     const hourAgo = Date.now() - 3600_000;
     this.jobTimes = this.jobTimes.filter((t) => t > hourAgo);
     if (this.jobTimes.length >= this.jobsPerHour) return;
+    // Background downloads are spread over the hour and leave a quarter of
+    // the budget for songs about to play; those may start right away.
+    const sinceLast = Date.now() - (this.jobTimes.at(-1) || 0);
+    const urgentOnly =
+      this.jobTimes.length >= Math.floor(this.jobsPerHour * 0.75) || sinceLast < 1800_000 / this.jobsPerHour;
     let ids = [];
     try {
-      ids = await this.home.nextJobs(this.serverId, 1);
+      ids = await this.home.nextJobs(this.serverId, 1, urgentOnly ? { urgentOnly } : undefined);
     } catch {
       return;
     }
@@ -719,7 +730,16 @@ export async function handleHomeRoute(path, body, { catalog, peers, resolveVideo
       catalog.failed(String(body.id), String(body.server || "?"), String(body.error || ""), body.flags || {});
       return { ok: true };
     case "/archive/jobs":
-      return { ids: catalog.nextJobs(String(body.server || "?"), Math.max(1, Math.min(Number(body.limit) || 1, 5))) };
+      return {
+        ids: catalog.nextJobs(String(body.server || "?"), Math.max(1, Math.min(Number(body.limit) || 1, 5)), Date.now(), {
+          urgentOnly: body.urgentOnly === true,
+        }),
+      };
+    case "/archive/enqueue": {
+      const reason = ["next", "interest", "prefetch"].includes(body.reason) ? body.reason : "prefetch";
+      const ids = (Array.isArray(body.ids) ? body.ids : []).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 300);
+      return { queued: catalog.enqueue(ids, reason) };
+    }
     case "/archive/plays":
       catalog.recordPlays(Array.isArray(body.events) ? body.events.slice(0, 1000) : []);
       return { ok: true };

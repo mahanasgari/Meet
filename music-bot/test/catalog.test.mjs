@@ -549,3 +549,29 @@ test("videoMapResetMatches clears src ids but keeps rejected lists", () => {
   assert.equal(c.videoMapGet("plain"), null);
   c.close();
 });
+
+test("nextJobs: play, then up next (newest first), then interest, then prefetch", () => {
+  const c = open();
+  c.enqueue(["pf1"], "prefetch", NOW);
+  c.enqueue(["in1"], "interest", NOW + 1);
+  c.enqueue(["nx1"], "next", NOW + 2);
+  c.enqueue(["nx2"], "next", NOW + 3);
+  c.enqueue(["pl1"], "play", NOW + 4);
+  assert.deepEqual(c.nextJobs("s1", 5, NOW + MIN), ["pl1", "nx2", "nx1", "in1", "pf1"]);
+});
+
+test("nextJobs urgentOnly skips interest and prefetch", () => {
+  const c = open();
+  c.enqueue(["pf1"], "prefetch", NOW);
+  c.enqueue(["in1"], "interest", NOW);
+  c.enqueue(["nx1"], "next", NOW);
+  assert.deepEqual(c.nextJobs("s1", 5, NOW + MIN, { urgentOnly: true }), ["nx1"]);
+});
+
+test("enqueue moves a waiting song up, never down", () => {
+  const c = open();
+  assert.equal(c.enqueue(["a", "b"], "prefetch", NOW), 2);
+  assert.equal(c.enqueue(["a"], "next", NOW + 1), 1); // up
+  assert.equal(c.enqueue(["a"], "prefetch", NOW + 2), 0); // not down
+  assert.deepEqual(c.nextJobs("s1", 1, NOW + MIN, { urgentOnly: true }), ["a"]);
+});

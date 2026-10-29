@@ -177,7 +177,14 @@ const isBlocked = (uid) =>
 // --- Admin dashboard: metrics on every server, monitor on the home one.
 const SHARES = process.env.SHARES_DIR || "/shares";
 const metrics = new Metrics(SHARES);
-setInterval(() => metrics.save(), 60_000).unref();
+setInterval(() => {
+  try {
+    metrics.save();
+  } catch (e) {
+    // A full disk must not take the server down; the next minute retries.
+    console.error("[metrics] save:", e.message);
+  }
+}, 60_000).unref();
 
 let ytdlpVersion = null;
 function readYtdlpVersion() {
@@ -4343,5 +4350,7 @@ async function shutdown() {
   setTimeout(() => process.exit(0), 2000).unref();
 }
 
+// A failed background task (e.g. a write on a full disk) is logged, not fatal.
+process.on("unhandledRejection", (e) => console.error("[music-bot] unhandled:", e?.stack || e));
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

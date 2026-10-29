@@ -27,4 +27,7 @@ docker run -d --name music-bot --restart unless-stopped --memory "$MEM" \
   --env-file /root/music-bot.current.env -v music_shares:/shares "$IMG" >/dev/null
 sleep 8
 docker exec -u root music-bot sh -c 'mkdir -p /shares/users && chown -R node:node /shares'
+# The image just replaced is left untagged; each is ~1 GB and they filled
+# Germany's disk once (2026-10-29).
+docker image prune -f >/dev/null 2>&1 || true
 curl -s -m 5 127.0.0.1:4100/health; echo

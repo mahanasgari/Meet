@@ -513,3 +513,9 @@ test("handleAudio waits for a download already running here instead of asking Yo
   }
   assert.deepEqual(home.calls.filter((c) => c[0] === "claim"), [], "no second fetch");
 });
+
+test("warm: nothing when the disk is nearly full", () => {
+  const archive = makeArchive();
+  archive.freeBytes = () => 500 * 1024 ** 2;
+  assert.equal(archive.warm(ID), "low_disk");
+});

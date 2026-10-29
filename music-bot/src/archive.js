@@ -4,7 +4,7 @@
 // server — come from the local disk cache or the channel instead of YouTube.
 // A server YouTube is blocking hands its listeners to a healthy peer.
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { join } from "node:path";
 import { parseRange, serveFile } from "./disk_cache.js";
@@ -14,6 +14,8 @@ const COOL_MS = 20 * 60_000;
 // Songs fetched ahead at once per server, and how long a play waits for a
 // download already running here before asking YouTube itself.
 const WARM_MAX = 4;
+// Fetching ahead stops when the disk gets this low (plays still work).
+const WARM_MIN_FREE = 2 * 1024 ** 3;
 const WAIT_INFLIGHT_MS = 45_000;
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
 // Gone for good. A bare "Video unavailable" is NOT here: YouTube also says
@@ -507,6 +509,16 @@ export class Archive {
     return finished;
   }
 
+  /** Free space where the cache lives (Infinity when it can't be read). */
+  freeBytes() {
+    try {
+      const st = statfsSync(this.cache.dir || this.queueDir);
+      return st.bavail * st.bsize;
+    } catch {
+      return Infinity;
+    }
+  }
+
   /**
    * Get [id] onto this server's disk ahead of a play (the app's next song):
    * from the channel when archived, else archived now. Returns at once.
@@ -516,6 +528,7 @@ export class Archive {
     if (this.cache.has(id)) return "ready";
     if (this.inflight.has(id) || this.warming.has(id)) return "fetching";
     if (this.cooling() || this.warming.size + this.inflight.size >= WARM_MAX) return "busy";
+    if (this.freeBytes() < WARM_MIN_FREE) return "low_disk";
     this.warming.add(id);
     this.counters.warms = (this.counters.warms || 0) + 1;
     void this.localFile(id)

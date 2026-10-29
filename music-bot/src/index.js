@@ -816,9 +816,19 @@ async function reportVideo(id) {
 
 // --- Music video requests.
 let videoJobs = 0;
+// Videos downloaded here and still uploading: id → { path, users }. Later
+// listeners play the same file instead of downloading it again.
+const videoTemp = new Map();
 async function handleVideo(req, res, id) {
   const home = archive.home;
   const sid = archive.serverId;
+  const tmp = videoTemp.get(id);
+  if (tmp) {
+    tmp.users++;
+    res.once("close", tmp.release);
+    serveFileRange(req, res, tmp.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
+    return;
+  }
   // Someone else is downloading it: wait (up to ~90 s) until it's stored.
   let c = await home.videoClaim(id, sid).catch(() => null);
   for (let i = 0; c?.action === "wait" && i < 30; i++) {
@@ -863,12 +873,18 @@ async function handleVideo(req, res, id) {
   }
   // Play it to this listener from the temp file while it uploads; the file
   // is deleted once both are done.
-  let pending = 2;
-  const done = () => {
-    if (--pending > 0) return;
-    rmSync(v.path, { force: true });
-    if (v.thumbPath) rmSync(v.thumbPath, { force: true });
+  const entry = {
+    path: v.path,
+    users: 2, // this listener + the upload
+    release: () => {
+      if (--entry.users > 0) return;
+      if (videoTemp.get(id) === entry) videoTemp.delete(id);
+      rmSync(v.path, { force: true });
+      if (v.thumbPath) rmSync(v.thumbPath, { force: true });
+    },
   };
+  const done = entry.release;
+  videoTemp.set(id, entry);
   res.once("close", done);
   serveFileRange(req, res, v.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
   (async () => {
@@ -890,6 +906,9 @@ async function handleVideo(req, res, id) {
       await Promise.resolve(home.videoFailed(id, sid, `upload: ${e.message}`.slice(0, 200), {})).catch(() => undefined);
     } finally {
       videoJobs--;
+      // New listeners go to the channel (or a fresh try) from now on; ones
+      // still playing the file keep it until they finish.
+      if (videoTemp.get(id) === entry) videoTemp.delete(id);
       done();
     }
   })();

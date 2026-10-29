@@ -447,3 +447,69 @@ test("flushPlays keeps events when home.plays rejects", async () => {
   await archive.flushPlays();
   assert.deepEqual(archive.events, events);
 });
+
+// ---------- fetching ahead ----------
+
+test("warm: an archived song is pulled from the channel onto disk; repeats and junk are cheap", async () => {
+  const dir = tmpDir();
+  const bytes = Buffer.from("song-bytes-".repeat(50));
+  const has = [];
+  const cache = fakeCache(dir, has);
+  const origCommit = cache.commit;
+  cache.commit = (tmp, id) => {
+    origCommit(tmp, id);
+    has.push(id);
+  };
+  const tg = {
+    ready: true,
+    connect: async () => {},
+    open: async () => ({ size: bytes.length, read: async function* () { yield bytes; } }),
+  };
+  const home = fakeHome({ claim: async () => ({ action: "stored", song: { msgId: 7 } }) });
+  const archive = makeArchive({ dir, cache, tg, home });
+  assert.equal(archive.warm("nope"), "invalid");
+  assert.equal(archive.warm(ID), "started");
+  assert.equal(archive.warm(ID), "fetching");
+  await waitFor(() => has.includes(ID));
+  assert.deepEqual(readFileSync(cache.path(ID)), bytes);
+  await waitFor(() => archive.warming.size === 0);
+  assert.equal(archive.warm(ID), "ready");
+});
+
+test("warm: nothing while YouTube is cooling this server down", () => {
+  const archive = makeArchive();
+  archive.coolUntil = Date.now() + 60_000;
+  assert.equal(archive.warm(ID), "busy");
+});
+
+test("handleAudio waits for a download already running here instead of asking YouTube again", async () => {
+  const dir = tmpDir();
+  const has = [];
+  const cache = fakeCache(dir, has);
+  const home = fakeHome();
+  const archive = makeArchive({ dir, cache, home });
+  archive.pending.set(
+    ID,
+    new Promise((resolve) =>
+      setTimeout(() => {
+        writeFileSync(cache.path(ID), "ready-bytes");
+        has.push(ID);
+        resolve(true);
+      }, 50),
+    ),
+  );
+  const srv = await listen(async (req, res) => {
+    if (!(await archive.handleAudio(req, res, PAGE, "")) && !res.headersSent) {
+      res.writeHead(500);
+      res.end();
+    }
+  });
+  try {
+    const r = await fetch(srv.url);
+    assert.equal(r.status, 200);
+    assert.equal(await r.text(), "ready-bytes");
+  } finally {
+    await srv.close();
+  }
+  assert.deepEqual(home.calls.filter((c) => c[0] === "claim"), [], "no second fetch");
+});

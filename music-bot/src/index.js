@@ -3330,6 +3330,15 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    // --- The app's next song: get it onto this server's disk before it plays.
+    if (req.method === "POST" && url.pathname === "/warm") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 2_000).catch(() => ({}));
+      const id = String(body.id || "").replace(/^yt_/, "");
+      sendJson(res, 200, { state: archive ? archive.warm(id) : "off" });
+      return;
+    }
+
     // --- Lyrics one listener found, for everyone (kept in the home catalog).
     if (url.pathname === "/lyrics/song" || url.pathname === "/lyrics/song/reject") {
       if (!requireApiToken(req, res)) return;

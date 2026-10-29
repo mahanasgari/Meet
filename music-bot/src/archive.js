@@ -11,6 +11,10 @@ import { parseRange, serveFile } from "./disk_cache.js";
 
 const ARCHIVE_FORMAT = "bestaudio[ext=m4a]/bestaudio";
 const COOL_MS = 20 * 60_000;
+// Songs fetched ahead at once per server, and how long a play waits for a
+// download already running here before asking YouTube itself.
+const WARM_MAX = 4;
+const WAIT_INFLIGHT_MS = 45_000;
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
 // Gone for good. A bare "Video unavailable" is NOT here: YouTube also says
 // that to a server it distrusts (verified: such songs download fine from
@@ -239,6 +243,9 @@ export class Archive {
     this.coolUntil = 0;
     this.events = [];
     this.inflight = new Set(); // video ids downloading here
+    /** @type {Map<string, Promise<boolean>>} finishes when a download here ends */
+    this.pending = new Map();
+    this.warming = new Set(); // ids being fetched ahead of a play
     this.jobTimes = [];
     this.peerCache = { at: 0, list: [] };
     this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0 };
@@ -290,11 +297,19 @@ export class Archive {
     if (!id) return false;
     const hop = req.headers["x-mp-hop"] === "1";
 
-    if (this.cache.has(id)) {
+    const fromDisk = () => {
       this.cache.touch(id);
       serveFile(req, res, this.cache.path(id), { mime: "audio/mp4", extraHeaders: { "X-MP-Source": `disk:${this.serverId}` } });
       this.play(id, "disk", req);
       return true;
+    };
+    if (this.cache.has(id)) return fromDisk();
+    // Already downloading here (fetched ahead, or another listener): wait
+    // for that rather than asking YouTube a second time.
+    const running = this.pending.get(id);
+    if (running) {
+      await Promise.race([running, new Promise((r) => setTimeout(r, WAIT_INFLIGHT_MS).unref())]);
+      if (this.cache.has(id)) return fromDisk();
     }
 
     // Blocked here: archived songs still come from the channel; anything
@@ -435,7 +450,7 @@ export class Archive {
       });
       child.on("close", (code) => resolve(code));
     });
-    return done.then(async (code) => {
+    const finished = done.then(async (code) => {
       clearTimeout(timer);
       file.end();
       await once(file, "finish").catch(() => undefined);
@@ -487,6 +502,26 @@ export class Archive {
       }
       return false;
     });
+    this.pending.set(id, finished);
+    void finished.finally(() => this.pending.delete(id));
+    return finished;
+  }
+
+  /**
+   * Get [id] onto this server's disk ahead of a play (the app's next song):
+   * from the channel when archived, else archived now. Returns at once.
+   */
+  warm(id) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(id || "")) return "invalid";
+    if (this.cache.has(id)) return "ready";
+    if (this.inflight.has(id) || this.warming.has(id)) return "fetching";
+    if (this.cooling() || this.warming.size + this.inflight.size >= WARM_MAX) return "busy";
+    this.warming.add(id);
+    this.counters.warms = (this.counters.warms || 0) + 1;
+    void this.localFile(id)
+      .catch(() => null)
+      .finally(() => this.warming.delete(id));
+    return "started";
   }
 
   /**

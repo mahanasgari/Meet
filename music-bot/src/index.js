@@ -825,6 +825,13 @@ function readSyncLinks() {
     return {};
   }
 }
+/**
+ * The owner's devices use the master secret, not an invite: like /recommend,
+ * take them to be the heaviest listener.
+ */
+function ownerUid() {
+  return recommender?.users()[0]?.uid || null;
+}
 function storeSyncLines(id, lines, user) {
   if (!lines.length) return;
   mkdirSync(joinPath(SHARES_DIR, "users"), { recursive: true });
@@ -3385,7 +3392,7 @@ const server = http.createServer(async (req, res) => {
           sendJson(res, 400, { error: "invalid_uid" });
           return;
         }
-        storeSyncLines(id, lines, typeof body.user === "string" ? body.user : null);
+        storeSyncLines(id, lines, typeof body.user === "string" ? body.user : body.owner === true ? ownerUid() : null);
         sendJson(res, 200, { ok: true, stored: lines.length });
         return;
       }
@@ -3511,7 +3518,7 @@ const server = http.createServer(async (req, res) => {
         // A friend gets their own picks; the owner's secret may ask for anyone.
         // (The owner's PC uses the secret: default to the heaviest listener.)
         let uid = req.mpUser || (isMasterToken(req) ? String(url.searchParams.get("uid") || "") : "");
-        if (!uid && isMasterToken(req)) uid = [...recommender.users()].sort((a, b) => b.plays - a.plays)[0]?.uid || "";
+        if (!uid && isMasterToken(req)) uid = ownerUid() || "";
         const r = recommender.forUser(uid, { limit });
         sendJson(res, 200, { items: r.items.filter((x) => x.title).map(toItem) });
       } catch (e) {
@@ -3797,14 +3804,15 @@ const server = http.createServer(async (req, res) => {
         // keeps them only when home can't be reached.
         if (lines.length && !catalog && archive) {
           try {
-            await archive.home.post("/archive/sync-events", { uid: id, lines, user: req.mpUser || null }, 10000);
+            const owner = !req.mpUser && isMasterToken(req);
+            await archive.home.post("/archive/sync-events", { uid: id, lines, user: req.mpUser || null, owner }, 10000);
             sendJson(res, 200, { ok: true, stored: lines.length });
             return;
           } catch {
             // stored here below
           }
         }
-        storeSyncLines(id, lines, req.mpUser);
+        storeSyncLines(id, lines, req.mpUser || (isMasterToken(req) ? ownerUid() : null));
         sendJson(res, 200, { ok: true, stored: lines.length });
         return;
       }

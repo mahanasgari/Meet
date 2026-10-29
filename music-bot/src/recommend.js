@@ -1,6 +1,8 @@
-// In-house music recommender, version 1. No external calls: everything comes
+// In-house music recommender, version 2. No external calls: everything comes
 // from the catalog (plays, YouTube Music song graph, similar artists) and the
-// opt-in listening sync files (users/*.jsonl).
+// opt-in listening sync files (users/*.jsonl), whose skips, likes and
+// dislikes steer it: a song you skipped or disliked isn't suggested to you,
+// songs most people skip rank lower, and "A, then B skipped" weakens A→B.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
@@ -13,6 +15,7 @@ const WINDOW = 5; // positions looked ahead when counting co-occurrence
 const MAX_NEIGHBORS = 50;
 const HALF_LIFE_DAYS = 14;
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+const FEEDBACK = new Set(["play", "skip", "like", "dislike", "fav", "unfav"]);
 
 const parse = (s, fallback = null) => {
   if (s == null) return fallback;
@@ -40,45 +43,103 @@ export class Recommender {
 
   // ---------------------------------------------------------------- model
 
-  /** Read plays of every listener (catalog + sync files) in the last 90 days. */
+  /**
+   * Every listener's history of the last 90 days: server plays (catalog, by
+   * invite) and the app's sync files (plays, skips, likes). A sync file
+   * linked to an invite (users/links.json) joins that listener, and where
+   * sync covers a stretch of time its events replace the server's plays:
+   * a song skipped after two seconds is still a "play" on the server.
+   */
   #loadListeners(now) {
     const from = now - HISTORY_DAYS * DAY;
-    const listeners = new Map(); // id -> [{ id: videoId, at }]
+    const plays = new Map(); // who -> [{ id, at }] from the catalog
+    const events = new Map(); // who -> [{ t, id, at, ctx }] from sync files
     const titles = new Map(); // videoId -> { title, artist } from sync files
-    const add = (who, id, at) => {
-      let list = listeners.get(who);
-      if (!list) listeners.set(who, (list = []));
-      list.push({ id, at });
+    const push = (map, who, x) => {
+      let list = map.get(who);
+      if (!list) map.set(who, (list = []));
+      list.push(x);
     };
     // 'peer' rows are copies of plays another server already recorded.
     for (const r of this.#q(`SELECT video_id, at, uid FROM plays
       WHERE uid IS NOT NULL AND (source IS NULL OR source != 'peer') AND at >= ? AND at <= ?`).all(from, now)) {
-      add(r.uid, r.video_id, r.at);
+      push(plays, r.uid, { id: r.video_id, at: r.at });
     }
+    const links = parse(this.#read(join(this.#usersDir, "links.json")), {}) || {};
     let files = [];
     try { files = readdirSync(this.#usersDir).filter((f) => f.endsWith(".jsonl")); } catch { /* no sync yet */ }
     for (const f of files) {
       const path = join(this.#usersDir, f);
-      let text;
       try {
         if (statSync(path).mtimeMs < from) continue;
-        text = readFileSync(path, "utf8");
       } catch { continue; }
-      const who = f.slice(0, -6);
+      const text = this.#read(path);
+      if (!text) continue;
+      const syncId = f.slice(0, -6);
+      const who = typeof links[syncId] === "string" ? links[syncId] : syncId;
       for (const line of text.split("\n")) {
         if (!line) continue;
         const e = parse(line);
-        if (!e || e.t !== "play") continue;
+        if (!e || !FEEDBACK.has(e.t)) continue;
         const ts = Number(e.ts);
         if (!(ts >= from && ts <= now)) continue;
         const id = typeof e.id === "string" ? e.id.replace(/^yt_/, "") : "";
         if (!YT_ID.test(id)) continue;
-        add(who, id, ts);
+        push(events, who, { t: e.t, id, at: ts, ctx: e.ctx });
         if (e.ti && !titles.has(id)) titles.set(id, { title: e.ti, artist: e.a ?? null });
       }
     }
-    for (const list of listeners.values()) list.sort((a, b) => a.at - b.at);
-    return { listeners, titles };
+
+    const listeners = new Map(); // who -> [{ id, at }] plays, oldest first
+    const feedback = new Map(); // who -> { skips, full: Map(id -> n), liked: Map(id -> true|false) }
+    const songFb = new Map(); // id -> { plays, skips } over everyone's sync
+    const badNext = new Map(); // a -> Map(b -> times b was skipped right after a)
+    const origins = {}; // ctx -> { plays, skips }: how suggestions fare
+    const inc = (map, k) => map.set(k, (map.get(k) ?? 0) + 1);
+    for (const who of new Set([...plays.keys(), ...events.keys()])) {
+      const ev = (events.get(who) ?? []).sort((a, b) => a.at - b.at);
+      const syncFrom = ev.length ? ev[0].at - SESSION_GAP_MS : Infinity;
+      const syncTo = ev.length ? ev[ev.length - 1].at + SESSION_GAP_MS : -Infinity;
+      const list = (plays.get(who) ?? []).filter((p) => p.at < syncFrom || p.at > syncTo);
+      const fb = { skips: new Map(), full: new Map(), liked: new Map() };
+      let prev = null; // last song played through
+      let lastAt = 0;
+      for (const e of ev) {
+        if (e.at - lastAt > SESSION_GAP_MS) prev = null;
+        lastAt = e.at;
+        const sf = songFb.get(e.id) ?? songFb.set(e.id, { plays: 0, skips: 0 }).get(e.id);
+        const o = e.ctx ? (origins[e.ctx] ??= { plays: 0, skips: 0 }) : null;
+        if (e.t === "play") {
+          list.push({ id: e.id, at: e.at });
+          inc(fb.full, e.id);
+          sf.plays++;
+          if (o) o.plays++;
+          prev = e.id;
+        } else if (e.t === "skip") {
+          inc(fb.skips, e.id);
+          sf.skips++;
+          if (o) o.skips++;
+          if (prev && prev !== e.id) {
+            const m = badNext.get(prev) ?? badNext.set(prev, new Map()).get(prev);
+            inc(m, e.id);
+          }
+        } else if (e.t === "like" || e.t === "fav") {
+          fb.liked.set(e.id, true);
+        } else if (e.t === "dislike") {
+          fb.liked.set(e.id, false);
+        } else if (e.t === "unfav" && fb.liked.get(e.id) === true) {
+          fb.liked.delete(e.id);
+        }
+      }
+      list.sort((a, b) => a.at - b.at);
+      if (list.length) listeners.set(who, list);
+      if (ev.length) feedback.set(who, fb);
+    }
+    return { listeners, titles, feedback, songFb, badNext, origins };
+  }
+
+  #read(path) {
+    try { return readFileSync(path, "utf8"); } catch { return null; }
   }
 
   /**
@@ -88,7 +149,7 @@ export class Recommender {
   build({ force = false } = {}) {
     const now = this.#now();
     if (!force && this.#m && now - this.#m.builtAt < CACHE_MS) return this.stats();
-    const { listeners, titles } = this.#loadListeners(now);
+    const { listeners, titles, feedback, songFb, badNext, origins } = this.#loadListeners(now);
 
     const co = new Map(); // a -> Map(b -> weighted co-occurrence), kept symmetric
     const n = new Map(); // song -> number of sessions containing it
@@ -145,11 +206,18 @@ export class Recommender {
         s.last = Math.max(s.last, p.at);
         songs.set(p.id, s);
       }
+      // A like counts like a few recent plays: a strong seed.
+      for (const [id, liked] of feedback.get(who)?.liked ?? []) {
+        if (!liked) continue;
+        const s = songs.get(id) ?? { weight: 0, count: 0, last: 0 };
+        s.weight += 2;
+        songs.set(id, s);
+      }
       perUser.set(who, songs);
     }
 
     this.#m = {
-      builtAt: now, neighbors, perUser, titles,
+      builtAt: now, neighbors, perUser, titles, feedback, songFb, badNext, origins,
       listeners: listeners.size, sessions: sessionCount, pairs: pairs / 2,
       // plays of everyone in the last 14 days, for popularity
       recent: this.#recentCounts(listeners, now - 14 * DAY),
@@ -173,9 +241,18 @@ export class Recommender {
   stats() {
     const m = this.#m;
     if (!m) return { listeners: 0, sessions: 0, songsWithNeighbors: 0, pairs: 0, builtAt: null };
+    let skips = 0;
+    let likes = 0;
+    for (const fb of m.feedback.values()) {
+      for (const n of fb.skips.values()) skips += n;
+      for (const v of fb.liked.values()) if (v) likes++;
+    }
     return {
       listeners: m.listeners, sessions: m.sessions, songsWithNeighbors: m.neighbors.size,
       pairs: m.pairs, builtAt: m.builtAt,
+      feedback: { listeners: m.feedback.size, skips, likes },
+      // Plays vs skips of songs started from each place (picks, morelike, autoplay, …).
+      origins: m.origins,
     };
   }
 
@@ -275,9 +352,23 @@ export class Recommender {
     return cands;
   }
 
+  /**
+   * How much listeners' skips hold a candidate back (1 = not at all): songs
+   * most people skip, and songs skipped right after [seed].
+   */
+  #skipFactor(id, seed) {
+    const m = this.#m;
+    const f = m.songFb.get(id);
+    // Two "free" plays so one early skip doesn't bury a song.
+    const rate = f ? f.skips / (f.skips + f.plays + 2) : 0;
+    const after = seed ? (m.badNext.get(seed)?.get(id) ?? 0) : 0;
+    return (1 - 0.7 * rate) / (1 + after);
+  }
+
   /** Songs like this one: graph edges, co-listening and artist links merged into a 0..1 score. */
   similarTo(videoId, { limit = 20 } = {}) {
     const cands = this.#candidates(videoId);
+    for (const [id, c] of cands) c.score *= this.#skipFactor(id, videoId);
     let top = 0;
     for (const c of cands.values()) top = Math.max(top, c.score);
     const out = [];
@@ -357,10 +448,25 @@ export class Recommender {
       inc(c.signals, "Popular with friends", w);
     }
 
-    // Songs the listener already knows are not suggestions.
+    // Songs like ones the listener disliked, or keeps skipping, sink.
+    const fb = m.feedback.get(uid);
+    const rejected = (id) => fb?.liked.get(id) === false || ((fb?.skips.get(id) ?? 0) > 0 && !fb?.full.get(id));
+    if (fb) {
+      const negatives = [...fb.liked].filter(([, v]) => v === false).map(([id]) => [id, 0.5]);
+      for (const [id, n] of fb.skips) if (n >= 2 && !fb.full.get(id)) negatives.push([id, 0.25]);
+      for (const [neg, strength] of negatives.slice(0, 20)) {
+        for (const s of this.similarTo(neg, { limit: 30 })) {
+          const c = cands.get(s.videoId);
+          if (c) c.score *= 1 - strength * s.score;
+        }
+      }
+    }
+
+    // Songs the listener already knows or liked, disliked, or skipped
+    // without ever playing through are not suggestions.
     const known = (id) => {
       const s = mine.get(id);
-      return s && (now - s.last < 7 * DAY || s.count > 3);
+      return (s && (now - s.last < 7 * DAY || s.count > 3)) || rejected(id) || fb?.liked.get(id) === true;
     };
     const list = [...cands]
       .filter(([id]) => !known(id))

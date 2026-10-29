@@ -1158,7 +1158,9 @@ function suggestCard() {
 function pageForYou() {
   var st = state.fyStats, us = state.fyUsers, rec = state.fyReq && state.fyReq.uid === state.fyUid ? state.fyReq : null;
   var h = suggestCard() + '<div class="upd" style="margin-bottom:12px">' + (!st ? "Loading stats..." : st.err ? "Stats unavailable" :
-    esc("Built from " + fmt(st.listeners) + " listeners · " + fmt(st.sessions) + " sessions · " + fmt(st.songsWithNeighbors) + " songs with neighbors · updated " + rel(st.builtAt))) + "</div>";
+    esc("Built from " + fmt(st.listeners) + " listeners · " + fmt(st.sessions) + " sessions · " + fmt(st.songsWithNeighbors) + " songs with neighbors" +
+      (st.feedback ? " · learns from " + fmt(st.feedback.skips) + " skips and " + fmt(st.feedback.likes) + " likes" : "") +
+      " · updated " + rel(st.builtAt))) + "</div>";
   var pills;
   if (us === null) pills = empty("Loading listeners...");
   else if (state.fyUsersErr) pills = '<div class="empty bad">Could not load listeners (' + esc(state.fyUsersErr) + ").</div>";

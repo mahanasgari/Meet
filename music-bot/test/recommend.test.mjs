@@ -183,3 +183,68 @@ test("model is cached for 30 minutes", () => {
   assert.equal(rec.stats().builtAt, first);
   cleanup();
 });
+
+// ---------- v2: skips, likes, dislikes ----------
+
+const ev = (t, idv, ts, extra = {}) => JSON.stringify({ t, id: "yt_" + idv, ts, ...extra });
+const writeSync = (usersDir, name, lines) => writeFileSync(join(usersDir, `${name}.jsonl`), lines.join("\n") + "\n");
+
+test("a linked sync file replaces the invite's server plays where it covers them: skipped songs drop out", () => {
+  const { catalog, usersDir, rec, cleanup } = setup();
+  const t0 = NOW - 2 * DAY;
+  // The server saw A, B, C played (B was really skipped after 3 s).
+  catalog.recordPlays(seq("u1", [A, B, C], { start: t0 }));
+  writeSync(usersDir, "abcdef0123456789", [ev("play", A, t0), ev("skip", B, t0 + 5 * MIN, { s: 3 }), ev("play", C, t0 + 10 * MIN)]);
+  writeFileSync(join(usersDir, "links.json"), JSON.stringify({ abcdef0123456789: "u1" }));
+  rec.build({ force: true });
+  assert.equal(rec.stats().listeners, 1, "one listener, not two");
+  assert.deepEqual(rec.similarTo(A).map((s) => s.videoId), [C], "B was skipped, so it isn't co-listened");
+  assert.deepEqual(rec.stats().feedback, { listeners: 1, skips: 1, likes: 0 });
+  cleanup();
+});
+
+test("songs most people skip rank lower; a skip right after a song weakens that pair", () => {
+  const { catalog, usersDir, rec, cleanup } = setup();
+  // A is followed by both B and C equally often on the server.
+  catalog.recordPlays([...seq("x", [A, B]), ...seq("y", [A, C]), ...seq("z", [A, B], { start: NOW - 5 * DAY }), ...seq("w", [A, C], { start: NOW - 5 * DAY })]);
+  const before = rec.similarTo(A).map((s) => s.videoId);
+  assert.equal(before.length, 2);
+  // Another listener plays A and skips C straight after, twice.
+  writeSync(usersDir, "s1", [ev("play", A, NOW - DAY), ev("skip", C, NOW - DAY + MIN), ev("play", A, NOW - 3 * DAY), ev("skip", C, NOW - 3 * DAY + MIN)]);
+  rec.build({ force: true });
+  const [first, second] = rec.similarTo(A);
+  assert.equal(first.videoId, B);
+  assert.equal(second.videoId, C);
+  assert.ok(second.score < 0.5, `C sinks (score ${second.score})`);
+  cleanup();
+});
+
+test("forUser: no disliked, liked or skipped-only songs; songs like a disliked one sink", () => {
+  const { catalog, usersDir, rec, cleanup } = setup();
+  // Everyone else: A goes with B, C, D; E goes with D.
+  catalog.recordPlays([
+    ...seq("o1", [A, B, C, D]), ...seq("o2", [A, B, C, D], { start: NOW - 6 * DAY }),
+    ...seq("o3", [E, D], { start: NOW - 4 * DAY }), ...seq("o4", [E, D], { start: NOW - 3 * DAY }),
+  ]);
+  writeSync(usersDir, "me", [
+    ev("play", A, NOW - 30 * DAY), ev("skip", B, NOW - 30 * DAY + MIN), ev("like", G, NOW - 29 * DAY), ev("dislike", E, NOW - 28 * DAY),
+  ]);
+  rec.build({ force: true });
+  const ids = rec.forUser("me", { limit: 10 }).items.map((x) => x.videoId);
+  assert.ok(!ids.includes(B), "skipped and never played through");
+  assert.ok(!ids.includes(E), "disliked");
+  assert.ok(!ids.includes(G), "already liked");
+  assert.ok(ids.includes(C), "still suggests the rest");
+  assert.ok(ids.indexOf(C) < ids.indexOf(D), "D is like the disliked E, so it comes after C");
+  cleanup();
+});
+
+test("stats: how songs started from each place fare", () => {
+  const { usersDir, rec, cleanup } = setup();
+  writeSync(usersDir, "s1", [
+    ev("play", A, NOW - DAY, { ctx: "picks" }), ev("skip", B, NOW - DAY + MIN, { ctx: "picks" }), ev("play", C, NOW - DAY + 2 * MIN, { ctx: "autoplay" }),
+  ]);
+  rec.build({ force: true });
+  assert.deepEqual(rec.stats().origins, { picks: { plays: 1, skips: 1 }, autoplay: { plays: 1, skips: 0 } });
+  cleanup();
+});

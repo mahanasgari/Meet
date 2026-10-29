@@ -814,6 +814,36 @@ async function reportVideo(id) {
   return { ok: true, srcId: r.srcId };
 }
 
+// --- Listening sync files (shares/users/<sync id>.jsonl) and which invite
+// each sync id belongs to (users/links.json), so the recommender can join a
+// friend's plays on the server with their skips and likes from the app.
+const syncLinksPath = () => joinPath(SHARES_DIR, "users", "links.json");
+function readSyncLinks() {
+  try {
+    return JSON.parse(readFileSync(syncLinksPath(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+function storeSyncLines(id, lines, user) {
+  if (!lines.length) return;
+  mkdirSync(joinPath(SHARES_DIR, "users"), { recursive: true });
+  appendFileSync(joinPath(SHARES_DIR, "users", `${id}.jsonl`), lines.join("\n") + "\n");
+  if (/^[a-f0-9]{12}$/.test(user || "")) {
+    const links = readSyncLinks();
+    if (links[id] !== user) {
+      links[id] = user;
+      writeFileSync(syncLinksPath(), JSON.stringify(links));
+    }
+  }
+}
+function unlinkSyncUser(id) {
+  const links = readSyncLinks();
+  if (!(id in links)) return;
+  delete links[id];
+  writeFileSync(syncLinksPath(), JSON.stringify(links));
+}
+
 // --- Music video requests.
 let videoJobs = 0;
 // Videos downloaded here and still uploading: id → { path, users }. Later
@@ -3348,6 +3378,26 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const body = await readBody(req, 500_000).catch(() => ({}));
+      if (url.pathname === "/archive/sync-events") {
+        const id = String(body.uid || "").toLowerCase();
+        const lines = (Array.isArray(body.lines) ? body.lines : []).filter((l) => typeof l === "string" && l.length < 2000).slice(0, 500);
+        if (!/^[a-f0-9]{16,40}$/.test(id)) {
+          sendJson(res, 400, { error: "invalid_uid" });
+          return;
+        }
+        storeSyncLines(id, lines, typeof body.user === "string" ? body.user : null);
+        sendJson(res, 200, { ok: true, stored: lines.length });
+        return;
+      }
+      if (url.pathname === "/archive/sync-delete") {
+        const id = String(body.uid || "").toLowerCase();
+        if (/^[a-f0-9]{16,40}$/.test(id)) {
+          rmSync(joinPath(SHARES_DIR, "users", `${id}.jsonl`), { force: true });
+          unlinkSyncUser(id);
+        }
+        sendJson(res, 200, { ok: true });
+        return;
+      }
       if (url.pathname === "/archive/video-report") {
         sendJson(res, 200, await reportVideo(String(body.id || "")));
         return;
@@ -3743,10 +3793,18 @@ const server = http.createServer(async (req, res) => {
               ts: Number.isFinite(e.ts) ? Math.round(e.ts) : Date.now(),
             }),
           );
-        if (lines.length) {
-          mkdirSync(joinPath(SHARES_DIR, "users"), { recursive: true });
-          appendFileSync(joinPath(SHARES_DIR, "users", `${id}.jsonl`), lines.join("\n") + "\n");
+        // The recommender lives on home: a mirror hands the events over and
+        // keeps them only when home can't be reached.
+        if (lines.length && !catalog && archive) {
+          try {
+            await archive.home.post("/archive/sync-events", { uid: id, lines, user: req.mpUser || null }, 10000);
+            sendJson(res, 200, { ok: true, stored: lines.length });
+            return;
+          } catch {
+            // stored here below
+          }
         }
+        storeSyncLines(id, lines, req.mpUser);
         sendJson(res, 200, { ok: true, stored: lines.length });
         return;
       }
@@ -3756,6 +3814,8 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         rmSync(joinPath(SHARES_DIR, "users", `${uid}.jsonl`), { force: true });
+        if (!catalog && archive) await archive.home.post("/archive/sync-delete", { uid }, 10000).catch(() => null);
+        else unlinkSyncUser(uid);
         sendJson(res, 200, { ok: true, deleted: true });
         return;
       }

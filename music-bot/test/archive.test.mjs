@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Catalog } from "../src/catalog.js";
 import { Archive, HomeLink, handleHomeRoute, songInfoFromYtdlp, videoIdFromUrl } from "../src/archive.js";
 
 const ID = "dQw4w9WgXcQ";
@@ -282,6 +283,24 @@ test("handleHomeRoute returns null for unknown paths", async () => {
 });
 
 // ---------- HomeLink (catalog mode) ----------
+
+test("HomeLink on the home server returns promises, so callers can .catch() (music videos broke without it)", async () => {
+  const dir = tmpDir();
+  const catalog = new Catalog(join(dir, "c.db"));
+  const link = new HomeLink({ catalog });
+  for (const call of [
+    () => link.claim(ID, "s1"),
+    () => link.videoClaim(ID, "s1"),
+    () => link.videoFailed(ID, "s1", "busy", {}),
+    () => link.failed(ID, "s1", "err", {}),
+    () => link.plays([]),
+  ]) {
+    const r = call();
+    assert.equal(typeof r.catch, "function");
+    await r.catch(() => null);
+  }
+  catalog.close();
+});
 
 test("HomeLink in catalog mode delegates to the catalog and peers function", async () => {
   const catalog = fakeCatalog();

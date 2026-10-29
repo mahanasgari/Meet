@@ -164,13 +164,13 @@ export class HomeLink {
     if (this.catalog) return this.catalog.lookup(id);
     return (await this.post("/archive/lookup", { id }, 4000)).song || null;
   }
-  claim(id, server) {
+  async claim(id, server) {
     return this.catalog ? this.catalog.claim(id, server) : this.post("/archive/claim", { id, server }, 4000);
   }
-  stored(id, info) {
+  async stored(id, info) {
     return this.catalog ? this.catalog.stored(id, info) : this.post("/archive/stored", { id, info }, 15000);
   }
-  failed(id, server, error, flags) {
+  async failed(id, server, error, flags) {
     return this.catalog ? this.catalog.failed(id, server, error, flags) : this.post("/archive/failed", { id, server, error, flags });
   }
   async nextJobs(server, limit, { urgentOnly = false } = {}) {
@@ -183,7 +183,7 @@ export class HomeLink {
     if (this.catalog) return Promise.resolve(this.catalog.enqueue(ids, reason));
     return this.post("/archive/enqueue", { ids, reason }).then((r) => r.queued || 0);
   }
-  plays(events) {
+  async plays(events) {
     return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
   }
   async archivedIds(ids) {
@@ -200,13 +200,13 @@ export class HomeLink {
     if (this.resolveVideo) return this.resolveVideo(id);
     return this.post("/archive/video-map", { id }, 15000);
   }
-  videoClaim(id, server) {
+  async videoClaim(id, server) {
     return this.catalog ? this.catalog.videoClaim(id, server) : this.post("/archive/video-claim", { id, server }, 4000);
   }
-  videoStored(id, info) {
+  async videoStored(id, info) {
     return this.catalog ? this.catalog.videoStored(id, info) : this.post("/archive/video-stored", { id, info }, 15000);
   }
-  videoFailed(id, server, error, flags) {
+  async videoFailed(id, server, error, flags) {
     return this.catalog ? this.catalog.videoFailed(id, server, error, flags) : this.post("/archive/video-failed", { id, server, error, flags });
   }
   // Shared lyrics, kept in the home catalog.

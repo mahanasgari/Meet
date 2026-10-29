@@ -152,27 +152,27 @@ test("resourceAlerts: memory between thresholds from OK does not trip", () => {
   assert.deepEqual(r.alerts, []);
 });
 
-test("resourceAlerts: disk low below max(1.5 GB, 5%), recovers above max(2.5 GB, 8%)", () => {
-  // 100 GB total: low = max(1.5, 5) = 5 GB; recover = max(2.5, 8) = 8 GB
-  let r = resourceAlerts({ diskLow: false }, diskSrv(6 * GB), "Worker");
+test("resourceAlerts: disk low below max(3 GB, 8%), recovers above max(4.5 GB, 12%)", () => {
+  // 100 GB total: low = max(3, 8) = 8 GB; recover = max(4.5, 12) = 12 GB
+  let r = resourceAlerts({ diskLow: false }, diskSrv(9 * GB), "Worker");
   assert.equal(r.state.diskLow, false);
   assert.deepEqual(r.alerts, []);
 
-  r = resourceAlerts({ diskLow: false }, diskSrv(4 * GB), "Worker");
+  r = resourceAlerts({ diskLow: false }, diskSrv(7 * GB), "Worker");
   assert.equal(r.state.diskLow, true);
-  assert.deepEqual(r.alerts, [{ level: "warn", text: "Disk almost full on Worker: 4.0 GB left" }]);
+  assert.deepEqual(r.alerts, [{ level: "warn", text: "Disk almost full on Worker: 7.0 GB left" }]);
 
-  r = resourceAlerts(r.state, diskSrv(7 * GB), "Worker");
+  r = resourceAlerts(r.state, diskSrv(10 * GB), "Worker");
   assert.equal(r.state.diskLow, true, "between thresholds stays low");
   assert.deepEqual(r.alerts, []);
 
-  r = resourceAlerts(r.state, diskSrv(8.5 * GB), "Worker");
+  r = resourceAlerts(r.state, diskSrv(12.5 * GB), "Worker");
   assert.equal(r.state.diskLow, false);
-  assert.deepEqual(r.alerts, [{ level: "up", text: "Disk space OK again on Worker (8.5 GB free)" }]);
+  assert.deepEqual(r.alerts, [{ level: "up", text: "Disk space OK again on Worker (12.5 GB free)" }]);
 });
 
-test("resourceAlerts: small disks use the 1.5 GB / 2.5 GB floors", () => {
-  // 10 GB total: 5% = 0.5 GB, so the 1.5 GB floor applies
+test("resourceAlerts: small disks use the 3 GB / 4.5 GB floors", () => {
+  // 10 GB total: 8% = 0.8 GB, so the 3 GB floor applies
   const r = resourceAlerts({ diskLow: false }, diskSrv(1 * GB, 10 * GB), "S");
   assert.equal(r.state.diskLow, true);
   assert.equal(r.alerts.length, 1);

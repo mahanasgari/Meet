@@ -83,8 +83,10 @@ export function resourceAlerts(prev, server, label) {
 
   const disk = server?.disk;
   if (isNum(disk?.free) && isNum(disk?.total) && disk.total > 0) {
-    const low = disk.free < Math.max(1.5 * GB, 0.05 * disk.total);
-    const ok = disk.free > Math.max(2.5 * GB, 0.08 * disk.total);
+    // Warned early: a full disk crash-loops the server, and builds and old
+    // images can eat a few GB between checks.
+    const low = disk.free < Math.max(3 * GB, 0.08 * disk.total);
+    const ok = disk.free > Math.max(4.5 * GB, 0.12 * disk.total);
     if (state.diskLow && ok) {
       state.diskLow = false;
       alerts.push({ level: "up", text: `Disk space OK again on ${label} (${(disk.free / GB).toFixed(1)} GB free)` });

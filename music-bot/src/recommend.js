@@ -393,13 +393,14 @@ export class Recommender {
     const popMax = Math.max(1, ...m.recent.values());
     const pop = (id) => (m.recent.get(id) ?? 0) / popMax;
 
-    // Final pass shared by both paths: drop unavailable, cap two per artist.
+    // Final pass shared by both paths: drop unavailable and untitled songs, cap two per artist.
     const finish = (list) => {
       const perArtist = new Map();
       const items = [];
       for (const c of list) {
         const meta = this.#meta(c.videoId);
-        if (meta.unavailable) continue;
+        // No title anywhere yet: nothing to show in the app.
+        if (meta.unavailable || !meta.title) continue;
         const key = (meta.artist ?? "").split(",")[0].trim().toLowerCase();
         if (key) {
           const k = perArtist.get(key) ?? 0;

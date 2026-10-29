@@ -151,9 +151,10 @@ test("forUser: filters known songs, weights recency, limits two per artist", () 
   cleanup();
 });
 
-test("forUser cold start returns friends' popular songs", () => {
+test("forUser cold start returns friends' popular songs (untitled ones are skipped)", () => {
   const { catalog, rec, cleanup } = setup();
   catalog.stored(A, { title: "Hit", artist: "X" });
+  catalog.stored(B, { title: "Other", artist: "Y" });
   catalog.recordPlays([
     { videoId: A, uid: "f1", at: NOW - DAY, source: "disk" },
     { videoId: A, uid: "f2", at: NOW - DAY, source: "disk" },
@@ -226,6 +227,7 @@ test("forUser: no disliked, liked or skipped-only songs; songs like a disliked o
     ...seq("o1", [A, B, C, D]), ...seq("o2", [A, B, C, D], { start: NOW - 6 * DAY }),
     ...seq("o3", [E, D], { start: NOW - 4 * DAY }), ...seq("o4", [E, D], { start: NOW - 3 * DAY }),
   ]);
+  for (const [v, a] of [[A, "a1"], [B, "a2"], [C, "a3"], [D, "a4"], [E, "a5"], [G, "a6"]]) catalog.stored(v, { title: `Song ${v[0]}`, artist: a });
   writeSync(usersDir, "me", [
     ev("play", A, NOW - 30 * DAY), ev("skip", B, NOW - 30 * DAY + MIN), ev("like", G, NOW - 29 * DAY), ev("dislike", E, NOW - 28 * DAY),
   ]);

@@ -229,6 +229,15 @@ export class Catalog {
     return this.#song(this.#sql("SELECT * FROM songs WHERE video_id=?").get(videoId));
   }
 
+  /** Which of [videoIds] are stored in the channel (at most 200 asked). */
+  archivedIds(videoIds) {
+    const ids = [...new Set(videoIds)].filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 200);
+    if (!ids.length) return [];
+    return this.#sql(`SELECT video_id FROM songs WHERE status='stored' AND video_id IN (${ids.map(() => "?").join(",")})`)
+      .all(...ids)
+      .map((r) => r.video_id);
+  }
+
   // Stored songs with no source kind yet, oldest first.
   missingMeta(limit = 20) {
     return this.#sql(`SELECT video_id FROM songs WHERE status='stored' AND source_kind IS NULL

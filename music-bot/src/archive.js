@@ -186,6 +186,10 @@ export class HomeLink {
   plays(events) {
     return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
   }
+  async archivedIds(ids) {
+    if (this.catalog) return this.catalog.archivedIds(ids);
+    return (await this.post("/archive/archived", { ids }, 5000)).ids || [];
+  }
   // Music videos: same pattern as songs, kept in the catalog's videos table.
   async videoLookup(id) {
     if (this.catalog) return this.catalog.videoLookup(id);
@@ -248,6 +252,7 @@ export class Archive {
     /** @type {Map<string, Promise<boolean>>} finishes when a download here ends */
     this.pending = new Map();
     this.warming = new Set(); // ids being fetched ahead of a play
+    this.knownArchived = new Set(); // ids the catalog said are stored
     this.jobTimes = [];
     this.peerCache = { at: 0, list: [] };
     this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0 };
@@ -538,6 +543,23 @@ export class Archive {
   }
 
   /**
+   * Which of [ids] start from the channel (the app's "archived" badge).
+   * Stored songs stay stored, so yeses are remembered here and only the
+   * rest go to the catalog.
+   */
+  async archived(ids) {
+    const want = [...new Set(ids)].filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 200);
+    const ask = want.filter((id) => !this.knownArchived.has(id));
+    if (ask.length) {
+      for (const id of await this.home.archivedIds(ask)) {
+        if (this.knownArchived.size >= 50_000) this.knownArchived.clear();
+        this.knownArchived.add(id);
+      }
+    }
+    return want.filter((id) => this.knownArchived.has(id));
+  }
+
+  /**
    * A local file for [id] for clips and "share as file": the disk cache,
    * else fetched from the channel, else archived now (one YouTube request
    * that also serves future plays). Null when another server is archiving
@@ -801,6 +823,8 @@ export async function handleHomeRoute(path, body, { catalog, peers, resolveVideo
       const ids = (Array.isArray(body.ids) ? body.ids : []).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 300);
       return { queued: catalog.enqueue(ids, reason) };
     }
+    case "/archive/archived":
+      return { ids: catalog.archivedIds(Array.isArray(body.ids) ? body.ids.map(String) : []) };
     case "/archive/plays":
       catalog.recordPlays(Array.isArray(body.events) ? body.events.slice(0, 1000) : []);
       return { ok: true };

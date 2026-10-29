@@ -519,3 +519,20 @@ test("warm: nothing when the disk is nearly full", () => {
   archive.freeBytes = () => 500 * 1024 ** 2;
   assert.equal(archive.warm(ID), "low_disk");
 });
+
+// ---------- archived badge ----------
+
+test("archived: asks home only for songs not already known as stored", async () => {
+  const home = fakeHome({ archivedIds: async (ids) => ids.filter((id) => id === ID) });
+  const calls = [];
+  const orig = home.archivedIds;
+  home.archivedIds = async (ids) => {
+    calls.push(ids);
+    return orig(ids);
+  };
+  const archive = makeArchive({ home });
+  const OTHER = "zzzzzzzzzzz";
+  assert.deepEqual(await archive.archived([ID, OTHER, "junk"]), [ID]);
+  assert.deepEqual(await archive.archived([ID, OTHER]), [ID]);
+  assert.deepEqual(calls, [[ID, OTHER], [OTHER]], "a known yes is not asked again");
+});

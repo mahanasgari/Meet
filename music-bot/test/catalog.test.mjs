@@ -610,3 +610,12 @@ test("shared lyrics: junk is refused", () => {
   }
   assert.equal(c.lyricsGet("vid00000002"), null);
 });
+
+test("archivedIds: only stored songs, junk and repeats ignored", () => {
+  const c = open();
+  c.stored("vid00000001", { msgId: 5 }, NOW);
+  c.claim("vid00000002", "s1", NOW); // still downloading
+  assert.deepEqual(c.archivedIds(["vid00000001", "vid00000002", "vid00000003", "vid00000001", "bad"]), ["vid00000001"]);
+  assert.deepEqual(c.archivedIds([]), []);
+  c.close();
+});

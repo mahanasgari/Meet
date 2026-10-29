@@ -3346,6 +3346,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- Which songs are archived (start straight from the channel): the app's badge.
+    if (req.method === "POST" && url.pathname === "/archived") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 20_000).catch(() => ({}));
+      const ids = (Array.isArray(body.ids) ? body.ids : []).map((id) => String(id).replace(/^yt_/, ""));
+      if (!archive) {
+        sendJson(res, 200, { ids: [] });
+        return;
+      }
+      const out = await archive.archived(ids).catch(() => null);
+      sendJson(res, out ? 200 : 503, out ? { ids: out } : { error: "home_unreachable" });
+      return;
+    }
+
     // --- Lyrics one listener found, for everyone (kept in the home catalog).
     if (url.pathname === "/lyrics/song" || url.pathname === "/lyrics/song/reject") {
       if (!requireApiToken(req, res)) return;

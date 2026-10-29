@@ -250,3 +250,16 @@ test("stats: how songs started from each place fare", () => {
   assert.deepEqual(rec.stats().origins, { picks: { plays: 1, skips: 1 }, autoplay: { plays: 1, skips: 0 } });
   cleanup();
 });
+
+test("a linked sync file keeps the listener's server plays from other devices", () => {
+  const { catalog, usersDir, rec, cleanup } = setup();
+  const t0 = NOW - 2 * DAY;
+  // Phone (not syncing) plays D, E in the middle of the PC's synced stretch.
+  catalog.recordPlays([...seq("u1", [A, B], { start: t0 }), ...seq("u1", [D, E], { start: t0 + DAY })]);
+  writeSync(usersDir, "pc", [ev("play", A, t0 + 4 * MIN), ev("skip", B, t0 + 6 * MIN), ev("play", C, t0 + 2 * DAY)]);
+  writeFileSync(join(usersDir, "links.json"), JSON.stringify({ pc: "u1" }));
+  rec.build({ force: true });
+  assert.deepEqual(rec.similarTo(D).map((s) => s.videoId), [E], "the phone's session survives");
+  assert.deepEqual(rec.similarTo(A), [], "B was a skip, not a play");
+  cleanup();
+});

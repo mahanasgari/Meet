@@ -15,6 +15,7 @@ const WINDOW = 5; // positions looked ahead when counting co-occurrence
 const MAX_NEIGHBORS = 50;
 const HALF_LIFE_DAYS = 14;
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+const SAME_LISTEN_MS = 15 * MIN;
 const FEEDBACK = new Set(["play", "skip", "like", "dislike", "fav", "unfav"]);
 
 const parse = (s, fallback = null) => {
@@ -46,9 +47,10 @@ export class Recommender {
   /**
    * Every listener's history of the last 90 days: server plays (catalog, by
    * invite) and the app's sync files (plays, skips, likes). A sync file
-   * linked to an invite (users/links.json) joins that listener, and where
-   * sync covers a stretch of time its events replace the server's plays:
-   * a song skipped after two seconds is still a "play" on the server.
+   * linked to an invite (users/links.json) joins that listener, and a server
+   * play the app also reported is dropped for the app's event: a song
+   * skipped after two seconds is still a "play" on the server. Other server
+   * plays stay (the listener's other devices may not sync).
    */
   #loadListeners(now) {
     const from = now - HISTORY_DAYS * DAY;
@@ -98,9 +100,12 @@ export class Recommender {
     const inc = (map, k) => map.set(k, (map.get(k) ?? 0) + 1);
     for (const who of new Set([...plays.keys(), ...events.keys()])) {
       const ev = (events.get(who) ?? []).sort((a, b) => a.at - b.at);
-      const syncFrom = ev.length ? ev[0].at - SESSION_GAP_MS : Infinity;
-      const syncTo = ev.length ? ev[ev.length - 1].at + SESSION_GAP_MS : -Infinity;
-      const list = (plays.get(who) ?? []).filter((p) => p.at < syncFrom || p.at > syncTo);
+      // The app reports a song when it ends (or is skipped), the server when
+      // it starts: the same listen is a server play up to 15 min before.
+      const reported = new Map(); // id -> [at]
+      for (const e of ev) if (e.t === "play" || e.t === "skip") (reported.get(e.id) ?? reported.set(e.id, []).get(e.id)).push(e.at);
+      const sameListen = (p) => (reported.get(p.id) ?? []).some((at) => p.at >= at - SAME_LISTEN_MS && p.at <= at + 2 * MIN);
+      const list = (plays.get(who) ?? []).filter((p) => !sameListen(p));
       const fb = { skips: new Map(), full: new Map(), liked: new Map() };
       let prev = null; // last song played through
       let lastAt = 0;

@@ -3321,7 +3321,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { error: "no_archive" });
         return;
       }
-      const body = await readBody(req, 200_000).catch(() => ({}));
+      const body = await readBody(req, 500_000).catch(() => ({}));
       if (url.pathname === "/archive/video-report") {
         sendJson(res, 200, await reportVideo(String(body.id || "")));
         return;
@@ -3330,6 +3330,49 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    // --- Lyrics one listener found, for everyone (kept in the home catalog).
+    if (url.pathname === "/lyrics/song" || url.pathname === "/lyrics/song/reject") {
+      if (!requireApiToken(req, res)) return;
+      const raw = req.method === "GET" ? url.searchParams.get("id") : null;
+      const body = req.method === "GET" ? {} : await readBody(req, 500_000).catch(() => ({}));
+      const id = String(raw ?? body.id ?? "").replace(/^yt_/, "");
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_params" });
+        return;
+      }
+      if (!archive) {
+        sendJson(res, 404, { error: "not_found" });
+        return;
+      }
+      try {
+        if (req.method === "GET" && url.pathname === "/lyrics/song") {
+          const entry = await archive.home.lyricsGet(id);
+          if (!entry?.lyrics) {
+            sendJson(res, 404, { error: "no_lyrics" });
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ ...entry.lyrics, picked: entry.picked }));
+          return;
+        }
+        if (req.method === "PUT" && url.pathname === "/lyrics/song") {
+          sendJson(res, 200, { stored: await archive.home.lyricsPut(id, body.lyrics, body.picked === true) });
+          return;
+        }
+        if (req.method === "POST" && url.pathname === "/lyrics/song/reject") {
+          await archive.home.lyricsReject(id, body.lyrics || null);
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+      } catch (e) {
+        res.mpError = String(e?.message || e).slice(0, 200);
+        sendJson(res, 502, { error: "home_unreachable" });
+        return;
+      }
+      sendJson(res, 405, { error: "method_not_allowed" });
+      return;
+    }
+
     // --- Songs a friend keeps (likes, playlists): archive them ahead of time.
     if (req.method === "POST" && url.pathname === "/interest") {
       if (!requireApiToken(req, res)) return;

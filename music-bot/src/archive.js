@@ -199,6 +199,19 @@ export class HomeLink {
   videoFailed(id, server, error, flags) {
     return this.catalog ? this.catalog.videoFailed(id, server, error, flags) : this.post("/archive/video-failed", { id, server, error, flags });
   }
+  // Shared lyrics, kept in the home catalog.
+  async lyricsGet(id) {
+    if (this.catalog) return this.catalog.lyricsGet(id);
+    return (await this.post("/archive/lyrics-get", { id }, 4000)).entry || null;
+  }
+  async lyricsPut(id, lyrics, picked) {
+    if (this.catalog) return this.catalog.lyricsPut(id, lyrics, { picked });
+    return (await this.post("/archive/lyrics-put", { id, lyrics, picked }, 8000)).stored === true;
+  }
+  async lyricsReject(id, lyrics = null) {
+    if (this.catalog) return this.catalog.lyricsReject(id, lyrics);
+    await this.post("/archive/lyrics-reject", { id, lyrics }, 8000);
+  }
   async peers() {
     if (this.catalog) return this.localPeers();
     return (await this.post("/archive/peers", {}, 5000)).peers || [];
@@ -756,6 +769,13 @@ export async function handleHomeRoute(path, body, { catalog, peers, resolveVideo
       return { ok: true };
     case "/archive/peers":
       return { peers: peers() };
+    case "/archive/lyrics-get":
+      return { entry: catalog.lyricsGet(String(body.id)) };
+    case "/archive/lyrics-put":
+      return { stored: catalog.lyricsPut(String(body.id), body.lyrics, { picked: body.picked === true }) };
+    case "/archive/lyrics-reject":
+      catalog.lyricsReject(String(body.id), body.lyrics || null);
+      return { ok: true };
     default:
       return null;
   }

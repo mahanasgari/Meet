@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "7");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "8");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "7");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "8");
   c.close();
 });
 
@@ -574,4 +574,39 @@ test("enqueue moves a waiting song up, never down", () => {
   assert.equal(c.enqueue(["a"], "next", NOW + 1), 1); // up
   assert.equal(c.enqueue(["a"], "prefetch", NOW + 2), 0); // not down
   assert.deepEqual(c.nextJobs("s1", 1, NOW + MIN, { urgentOnly: true }), ["a"]);
+});
+
+test("shared lyrics: first find kept, a pick replaces it, wrong ones never come back", () => {
+  const c = open();
+  const auto = { source: "LRCLIB", sync: "line", score: 0.9, lines: [{ t: 1000, text: "hello" }] };
+  const other = { source: "KuGou", sync: "line", lines: [{ t: 900, text: "something else" }] };
+  assert.equal(c.lyricsGet("vid00000001"), null);
+  assert.equal(c.lyricsPut("vid00000001", auto, {}, NOW), true);
+  assert.deepEqual(c.lyricsGet("vid00000001").lyrics, auto);
+  // Another automatic find doesn't replace it; a listener's pick does.
+  assert.equal(c.lyricsPut("vid00000001", other, {}, NOW), false);
+  assert.equal(c.lyricsPut("vid00000001", other, { picked: true }, NOW), true);
+  assert.equal(c.lyricsGet("vid00000001").picked, true);
+  // Reported wrong: gone, and the same lyrics are refused even as a pick.
+  c.lyricsReject("vid00000001", NOW);
+  assert.equal(c.lyricsGet("vid00000001").lyrics, null);
+  assert.equal(c.lyricsPut("vid00000001", { ...other, lines: [{ t: 5, text: "something else" }] }, { picked: true }), false);
+  assert.equal(c.lyricsPut("vid00000001", auto, {}, NOW), true);
+  assert.deepEqual(c.lyricsStats(), { songs: 1, picked: 0 });
+  // Rejecting lyrics that aren't the shared copy keeps the shared copy.
+  c.lyricsReject("vid00000001", other, NOW);
+  assert.deepEqual(c.lyricsGet("vid00000001").lyrics, auto);
+  // A rejection before anyone shared is remembered.
+  c.lyricsReject("vid00000003", auto, NOW);
+  assert.equal(c.lyricsPut("vid00000003", auto, {}, NOW), false);
+});
+
+test("shared lyrics: junk is refused", () => {
+  const c = open();
+  for (const bad of [null, [], { source: "x", sync: "line", lines: [] }, { source: "<b>", sync: "line", lines: [{}] },
+    { source: "A", sync: "fast", lines: [{}] }, { source: "A", sync: "none", lines: ["text"] },
+    { source: "A", sync: "none", lines: [{ text: "x".repeat(500_000) }] }]) {
+    assert.equal(c.lyricsPut("vid00000002", bad), false);
+  }
+  assert.equal(c.lyricsGet("vid00000002"), null);
 });

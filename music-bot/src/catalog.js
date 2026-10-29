@@ -1,5 +1,6 @@
 // Catalog of songs archived in the private Telegram channel, the shared
 // download-job queue and play events. Home server only; peers use HTTP.
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -103,6 +104,11 @@ const MIGRATIONS = [
   );`,
   // v7: music videos reported as wrong for a song (never picked again).
   `ALTER TABLE video_map ADD COLUMN rejected_json TEXT;`,
+  // v8: lyrics one listener found, shared with everyone (the app's own JSON).
+  `CREATE TABLE IF NOT EXISTS lyrics (
+    video_id TEXT PRIMARY KEY, body TEXT, sig TEXT, picked INTEGER NOT NULL DEFAULT 0,
+    rejected_json TEXT, updated_at INTEGER NOT NULL
+  );`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -130,6 +136,32 @@ const qualityLabel = (codec, kbps) => {
   const short = codecShort(codec);
   return kbps > 0 ? `${short} ${Math.round(kbps / 16) * 16} kbps` : short;
 };
+
+const LYRICS_SYNC = ["none", "line", "word"];
+const LYRICS_MAX_BYTES = 400_000;
+
+/**
+ * The app's lyrics JSON ({source, sync, score?, lines: [...]}) checked and
+ * re-serialised, or null when it isn't one.
+ */
+export function cleanLyrics(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const { source, sync, score, lines } = body;
+  if (typeof source !== "string" || !/^[A-Za-z0-9 ._-]{1,40}$/.test(source)) return null;
+  if (!LYRICS_SYNC.includes(sync)) return null;
+  if (!Array.isArray(lines) || lines.length === 0 || lines.length > 3000) return null;
+  if (!lines.every((l) => l && typeof l === "object" && !Array.isArray(l))) return null;
+  const out = { source, sync, ...(typeof score === "number" && score >= 0 && score <= 1 ? { score } : {}), lines };
+  const text = JSON.stringify(out);
+  return Buffer.byteLength(text) <= LYRICS_MAX_BYTES ? text : null;
+}
+
+/** Identity of a set of lyrics: source + the words (timings ignored). */
+function lyricsSig(text) {
+  const { source, lines } = JSON.parse(text);
+  const words = lines.map((l) => String(l.x ?? l.text ?? "")).join("\n");
+  return `${source}|${createHash("sha1").update(words).digest("hex").slice(0, 16)}`;
+}
 
 const JOB_ORDER = ["play", "retry", "next", "interest", "prefetch"];
 /** SQL rank of a job's reason (lower runs first). */
@@ -516,6 +548,60 @@ export class Catalog {
     this.#sql(`INSERT INTO video_map(video_id, src_id, title, checked_at) VALUES(?,?,?,?)
       ON CONFLICT(video_id) DO UPDATE SET src_id=excluded.src_id, title=excluded.title, checked_at=excluded.checked_at`)
       .run(videoId, srcId, title, now);
+  }
+
+  // --- Shared lyrics ----------------------------------------------------
+
+  /** {lyrics (parsed) | null, picked, updatedAt} or null when nobody has looked yet. */
+  lyricsGet(videoId) {
+    const r = this.#sql("SELECT body, picked, updated_at FROM lyrics WHERE video_id=?").get(videoId);
+    if (!r) return null;
+    return { lyrics: parse(r.body), picked: r.picked === 1, updatedAt: r.updated_at };
+  }
+
+  /**
+   * Keep [body] for the song. A listener's own pick replaces anything; an
+   * automatic find only fills an empty slot. Lyrics reported wrong are refused.
+   * Returns true when stored.
+   */
+  lyricsPut(videoId, body, { picked = false } = {}, now = Date.now()) {
+    const text = cleanLyrics(body);
+    if (!text) return false;
+    const sig = lyricsSig(text);
+    const cur = this.#sql("SELECT body, picked, rejected_json FROM lyrics WHERE video_id=?").get(videoId);
+    if (cur) {
+      if (parse(cur.rejected_json, []).includes(sig)) return false;
+      if (cur.body && !picked) return false;
+    }
+    this.#sql(`INSERT INTO lyrics(video_id, body, sig, picked, updated_at) VALUES(?,?,?,?,?)
+      ON CONFLICT(video_id) DO UPDATE SET body=excluded.body, sig=excluded.sig, picked=excluded.picked,
+        updated_at=excluded.updated_at`)
+      .run(videoId, text, sig, picked ? 1 : 0, now);
+    return true;
+  }
+
+  /**
+   * "Wrong lyrics": never take [lyrics] for the song again, and drop the
+   * shared copy when it's those. Without [lyrics], the shared copy is meant.
+   */
+  lyricsReject(videoId, lyrics = null, now = Date.now()) {
+    const cur = this.#sql("SELECT sig, rejected_json FROM lyrics WHERE video_id=?").get(videoId);
+    const text = lyrics ? cleanLyrics(lyrics) : null;
+    const sig = text ? lyricsSig(text) : cur?.sig;
+    if (!sig) return;
+    const rejected = [...new Set([...parse(cur?.rejected_json, []), sig])].slice(-20);
+    if (!cur) {
+      this.#sql("INSERT INTO lyrics(video_id, rejected_json, updated_at) VALUES(?,?,?)").run(videoId, JSON.stringify(rejected), now);
+    } else if (cur.sig === sig) {
+      this.#sql("UPDATE lyrics SET body=NULL, sig=NULL, picked=0, rejected_json=?, updated_at=? WHERE video_id=?")
+        .run(JSON.stringify(rejected), now, videoId);
+    } else {
+      this.#sql("UPDATE lyrics SET rejected_json=? WHERE video_id=?").run(JSON.stringify(rejected), videoId);
+    }
+  }
+
+  lyricsStats() {
+    return { ...this.#sql("SELECT COALESCE(SUM(body IS NOT NULL),0) songs, COALESCE(SUM(picked),0) picked FROM lyrics").get() };
   }
 
   videoStats() {

@@ -23,6 +23,7 @@ export function routeKey(pathname) {
   if (p.startsWith("/app")) return "app";
   if (p.startsWith("/invite/")) return "invite";
   if (p.startsWith("/charts/")) return "charts";
+  if (p === "/releases") return "releases";
   const m = /^\/(audio|search|meta|playlist|clip|img|thumb|feedback|health)$/.exec(p);
   return m ? m[1] : "other";
 }

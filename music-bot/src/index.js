@@ -3922,7 +3922,9 @@ const server = http.createServer(async (req, res) => {
         return { id: /^UC[\w-]{22}$/.test(id) ? id : undefined, name: (i > 0 ? x.slice(i + 1) : x).trim().slice(0, 80) };
       }).filter((a) => a.name);
       try {
+        const t0 = Date.now();
         const items = await releases.forArtists(artists, { limit: 20 });
+        console.log(`[releases] ${artists.length} artists → ${items.length} songs (${Date.now() - t0} ms)`);
         // Get them into the archive so they start fast.
         archive?.home.enqueue(items.slice(0, 10).map((x) => x.videoId), "prefetch").catch(() => {});
         sendJson(res, 200, {

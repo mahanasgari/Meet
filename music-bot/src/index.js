@@ -39,6 +39,7 @@ import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
+import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -696,6 +697,27 @@ if (catalog) {
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
+// New songs of the artists a friend follows or plays (Home "New from your
+// artists"): YouTube newest-first search, confirmed on YouTube Music.
+const ytInnertube = (url, client, body) =>
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: new URL(url).origin },
+    body: JSON.stringify({ context: { client }, ...body }),
+    signal: AbortSignal.timeout(20_000),
+  }).then((r) => {
+    if (!r.ok) throw new Error(`youtube ${r.status}`);
+    return r.json();
+  });
+const releases = new Releases({
+  ytSearch: (query) =>
+    ytInnertube("https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
+      { clientName: "WEB", clientVersion: "2.20251020.01.00", hl: "en", gl: "US" }, { query, params: YT_NEWEST_PARAMS }),
+  ytmSongs: (query) =>
+    ytInnertube("https://music.youtube.com/youtubei/v1/search?prettyPrint=false",
+      { clientName: "WEB_REMIX", clientVersion: "1.20250101.01.00", hl: "en" }, { query, params: decodeURIComponent(YTM_SONGS_PARAMS) }),
+});
+
 // Public song links live on home, the server behind the public domain.
 const songLinks = catalog ? new SongLinks({ file: joinPath(SHARES, "song-links.json") }) : null;
 const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
@@ -3888,6 +3910,28 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 405, { error: "method_not_allowed" });
+      return;
+    }
+
+    // --- New songs from these artists: ?a=<channel id>~<name> (repeated, ≤12).
+    if (req.method === "GET" && url.pathname === "/releases") {
+      if (!requireApiToken(req, res)) return;
+      const artists = url.searchParams.getAll("a").slice(0, 12).map((x) => {
+        const i = x.indexOf("~");
+        const id = i > 0 ? x.slice(0, i) : "";
+        return { id: /^UC[\w-]{22}$/.test(id) ? id : undefined, name: (i > 0 ? x.slice(i + 1) : x).trim().slice(0, 80) };
+      }).filter((a) => a.name);
+      try {
+        const items = await releases.forArtists(artists, { limit: 20 });
+        // Get them into the archive so they start fast.
+        archive?.home.enqueue(items.slice(0, 10).map((x) => x.videoId), "prefetch").catch(() => {});
+        sendJson(res, 200, {
+          items: items.map((x) => ({ id: `yt_${x.videoId}`, title: x.title, artist: x.artist, publishedAt: x.publishedAt })),
+        });
+      } catch (e) {
+        console.error("[releases]", e.message);
+        sendJson(res, 502, { error: "releases_failed" });
+      }
       return;
     }
 

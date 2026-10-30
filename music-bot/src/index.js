@@ -38,6 +38,7 @@ import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
+import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -695,6 +696,22 @@ if (catalog) {
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
+// Public song links live on home, the server behind the public domain.
+const songLinks = catalog ? new SongLinks({ file: joinPath(SHARES, "song-links.json") }) : null;
+const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
+// Per-IP budget for the public song pages' audio (a play is a few ranged
+// requests): 120 requests per 10 minutes.
+const songLinkHits = new Map();
+function songLinkAllowed(req) {
+  const ip = String(req.headers["x-real-ip"] || req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+  const now = Date.now();
+  let h = songLinkHits.get(ip);
+  if (!h || now - h.since > 10 * 60_000) {
+    if (songLinkHits.size > 5000) songLinkHits.clear();
+    songLinkHits.set(ip, (h = { since: now, n: 0 }));
+  }
+  return ++h.n <= 120;
+}
 
 // Archive ahead of time what we're about to suggest: each friend's picks
 // and the closest neighbours of the most-played songs. Queued as low-priority
@@ -3694,6 +3711,49 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- A friend's song link: the page, its audio and cover, public. nginx
+    // sends the domain root to /web/, so /web/s/<code> is /s/<code> outside.
+    const songLink = url.pathname.match(/^(?:\/web)?\/s\/([A-Za-z2-9]{8})(?:\/(audio|cover))?\/?$/);
+    if ((req.method === "GET" || req.method === "HEAD") && songLink && songLinks) {
+      const link = songLinks.get(songLink[1]);
+      const part = songLink[2];
+      if (!link) {
+        if (part) sendJson(res, 404, { error: "link_expired" });
+        else {
+          res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(expiredPage());
+        }
+        return;
+      }
+      if (!part) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+        res.end(renderSongPage(link, { base: SONG_LINK_BASE, code: songLink[1].toUpperCase() }));
+        return;
+      }
+      if (part === "cover") {
+        let body = await hdThumb(link.id).catch(() => null);
+        if (!body) {
+          const up = await fetch(`https://i.ytimg.com/vi/${link.id}/hqdefault.jpg`, { signal: AbortSignal.timeout(10_000) }).catch(() => null);
+          if (up?.ok) body = Buffer.from(await up.arrayBuffer());
+        }
+        if (!body) {
+          sendJson(res, 404, { error: "no_cover" });
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": body.length, "Cache-Control": "public, max-age=604800" });
+        res.end(body);
+        return;
+      }
+      if (!songLinkAllowed(req)) {
+        sendJson(res, 429, { error: "slow_down" });
+        return;
+      }
+      const pageUrl = `https://www.youtube.com/watch?v=${link.id}`;
+      if (archive && (await archive.handleAudio(req, res, pageUrl, ""))) return;
+      pipeExtractorAudio(pageUrl, req, res, null, "");
+      return;
+    }
+
     // --- The web app (iPhone and locked-down computers): SHARES_DIR/web.
     const webPath = url.pathname.match(/^\/web(\/.*)?$/);
     if ((req.method === "GET" || req.method === "HEAD") && webPath) {
@@ -3828,6 +3888,25 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 405, { error: "method_not_allowed" });
+      return;
+    }
+
+    // --- Make a public link for one song (the app's "Send link").
+    if (req.method === "POST" && url.pathname === "/share/song") {
+      if (!requireApiToken(req, res)) return;
+      if (!songLinks) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const body = await readBody(req, 4_000).catch(() => ({}));
+      const id = String(body.id || "").replace(/^yt_/, "");
+      const code = songLinks.create({ id, title: body.title, artist: body.artist, by: req.mpUser || "owner" });
+      if (!code) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      archive?.warm(id); // so the friend's first play starts from disk
+      sendJson(res, 200, { code, url: `${SONG_LINK_BASE}/s/${code}` });
       return;
     }
 

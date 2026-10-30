@@ -710,6 +710,7 @@ const ytInnertube = (url, client, body) =>
     return r.json();
   });
 const releases = new Releases({
+  file: joinPath(SHARES, "archive", "releases-cache.json"),
   ytSearch: (query) =>
     ytInnertube("https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
       { clientName: "WEB", clientVersion: "2.20251020.01.00", hl: "en", gl: "US" }, { query, params: YT_NEWEST_PARAMS }),

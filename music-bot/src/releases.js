@@ -5,12 +5,16 @@
 // Per artist: YouTube search sorted by upload date (this month) finds what's
 // new; obvious noise is dropped (live clips, covers, remixes, reactions, fan
 // mixes); each remaining video is confirmed on YouTube Music, which gives the
-// clean song with its real title and artists. Cached per artist for 6 hours.
+// clean song with its real title and artists. Cached per artist (on disk
+// too): fresh for 6 hours, then shown while a refresh runs.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 const MIN = 6e4;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
-const CACHE_MS = 6 * HOUR;
+const CACHE_MS = 6 * HOUR; // refreshed in the background after this
+const STALE_MS = 3 * DAY; // still shown (while refreshing) up to this
 const MAX_AGE_MS = 60 * DAY;
 const VERIFY_PER_ARTIST = 6;
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -111,25 +115,37 @@ export class Releases {
    * @param {(query: string) => Promise<object>} o.ytSearch    YouTube search, newest first (raw response)
    * @param {(query: string) => Promise<object>} o.ytmSongs    YouTube Music song search (raw response)
    * @param {() => number} [o.now]
+   * @param {string} [o.file]   where the cache is kept across restarts
    */
-  constructor({ ytSearch, ytmSongs, now = () => Date.now() }) {
+  constructor({ ytSearch, ytmSongs, now = () => Date.now(), file = null }) {
     this.ytSearch = ytSearch;
     this.ytmSongs = ytmSongs;
     this.now = now;
-    this.cache = new Map(); // artist key -> { at, items, pending }
+    this.file = file;
+    this.cache = new Map(); // artist key -> { at, items }
+    this.pending = new Map(); // artist key -> refresh in flight
+    if (file) {
+      try {
+        for (const [k, v] of Object.entries(JSON.parse(readFileSync(file, "utf8")))) this.cache.set(k, v);
+      } catch {
+        // first run
+      }
+    }
   }
 
   /** New songs of [artists] ([{ id?, name }]), newest first. */
   async forArtists(artists, { limit = 20 } = {}) {
     const list = artists.filter((a) => a?.name).slice(0, 12);
     const results = [];
-    // Three artists at a time: each is a few YouTube requests.
-    for (let i = 0; i < list.length; i += 3) {
-      results.push(...(await Promise.all(list.slice(i, i + 3).map((a) => this.#artist(a).catch(() => [])))));
+    // Four artists at a time: each is a few YouTube requests.
+    for (let i = 0; i < list.length; i += 4) {
+      results.push(...(await Promise.all(list.slice(i, i + 4).map((a) => this.#artist(a).catch(() => [])))));
     }
+    const now = this.now();
     const seen = new Set();
     const out = [];
-    for (const it of results.flat().sort((a, b) => b.publishedAt - a.publishedAt)) {
+    // A cached list may hold songs that have since passed 60 days.
+    for (const it of results.flat().filter((x) => now - x.publishedAt <= MAX_AGE_MS).sort((a, b) => b.publishedAt - a.publishedAt)) {
       const key = norm(it.title);
       if (seen.has(it.videoId) || seen.has(key)) continue;
       seen.add(it.videoId);
@@ -142,20 +158,40 @@ export class Releases {
   #artist(a) {
     const key = a.id || norm(a.name);
     const hit = this.cache.get(key);
-    const now = this.now();
-    if (hit && (hit.pending || now - hit.at < CACHE_MS)) return hit.pending || Promise.resolve(hit.items);
-    const pending = this.#find(a)
-      .then((items) => {
-        this.cache.set(key, { at: this.now(), items });
-        return items;
-      })
-      .catch((e) => {
-        this.cache.delete(key);
-        throw e;
-      });
-    this.cache.set(key, { at: now, items: [], pending });
-    if (this.cache.size > 2000) this.cache.delete(this.cache.keys().next().value);
-    return pending;
+    const age = hit ? this.now() - hit.at : Infinity;
+    if (age < CACHE_MS) return Promise.resolve(hit.items);
+    let refresh = this.pending.get(key);
+    if (!refresh) {
+      refresh = this.#find(a)
+        .then((items) => {
+          this.cache.set(key, { at: this.now(), items });
+          if (this.cache.size > 2000) this.cache.delete(this.cache.keys().next().value);
+          this.#saveSoon();
+          return items;
+        })
+        .finally(() => this.pending.delete(key));
+      this.pending.set(key, refresh);
+    }
+    // A list a few hours old is shown at once while the refresh runs.
+    if (age < STALE_MS) {
+      refresh.catch(() => {});
+      return Promise.resolve(hit.items);
+    }
+    return refresh;
+  }
+
+  #saveSoon() {
+    if (!this.file) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      try {
+        mkdirSync(dirname(this.file), { recursive: true });
+        writeFileSync(this.file, JSON.stringify(Object.fromEntries(this.cache)));
+      } catch (e) {
+        console.error("[releases] save failed", e?.message);
+      }
+    }, 2000);
+    this.timer.unref?.();
   }
 
   async #find(a) {
@@ -180,11 +216,10 @@ export class Releases {
         // song title that happens to be their name.
         (mentions(splitTitle(v.title).artists || v.title) || (v.verified && mentions(v.owner))),
     );
-    const out = [];
-    for (const v of videos.slice(0, VERIFY_PER_ARTIST)) {
+    const checked = await Promise.all(videos.slice(0, VERIFY_PER_ARTIST).map(async (v) => {
       const { artists, song: name } = splitTitle(v.title);
       const want = norm(name);
-      if (!want) continue;
+      if (!want) return null;
       // "Artists - Song" finds a collaboration best; a bare title needs the
       // name. "x"/"feat." and a Persian word in a Latin title throw the
       // search, so simpler queries follow.
@@ -209,22 +244,22 @@ export class Releases {
         if (song) break;
       }
       if (song) {
-        out.push({
+        return {
           videoId: song.videoId,
           title: song.title,
           // Full credits from the video title when YouTube Music lists only the lead.
           artist: isArtist(song.artists) || !artists ? song.artists.map((x) => x.name).join(", ") : artists,
           publishedAt: v.publishedAt,
-        });
-      } else if (other) {
-        continue;
-      } else if (v.verified && (mentions(v.owner) || mentions(artists))) {
+        };
+      }
+      if (!other && v.verified && (mentions(v.owner) || mentions(artists))) {
         // Not (yet) on YouTube Music: an upload by a verified channel, the
         // artist's own or one naming them before the dash. ("Official" in a
         // title alone proves nothing: anyone can write it.)
-        out.push({ videoId: v.videoId, title: name, artist: mentions(artists) ? artists : v.owner, publishedAt: v.publishedAt });
+        return { videoId: v.videoId, title: name, artist: mentions(artists) ? artists : v.owner, publishedAt: v.publishedAt };
       }
-    }
-    return out;
+      return null;
+    }));
+    return checked.filter(Boolean);
   }
 }

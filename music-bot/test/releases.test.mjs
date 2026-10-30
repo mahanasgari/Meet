@@ -106,3 +106,32 @@ test("a video not on YouTube Music needs a verified channel", async () => {
   });
   assert.deepEqual((await rel.forArtists([{ name: "Reza Pishro" }])).map((x) => x.videoId), ["aaaaaaaaaaa"]);
 });
+
+test("a list older than 6 hours is shown at once while it refreshes; the cache survives a restart", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "rel-"));
+  let now = NOW;
+  let title = "Old Hit";
+  let searches = 0;
+  const make = () => new Releases({
+    now: () => now,
+    file: join(dir, "c.json"),
+    ytSearch: async () => (searches++, { contents: [video("aaaaaaaaaaa", `A1 - ${title}`, "A1", "1 day ago", "3:00", true)] }),
+    ytmSongs: async () => ({ contents: [] }),
+  });
+  const rel = make();
+  assert.equal((await rel.forArtists([{ name: "A1" }]))[0].title, "Old Hit");
+  now += 7 * 3600e3;
+  title = "New Hit";
+  assert.equal((await rel.forArtists([{ name: "A1" }]))[0].title, "Old Hit", "stale list served at once");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal((await rel.forArtists([{ name: "A1" }]))[0].title, "New Hit", "refreshed in the background");
+  await new Promise((r) => setTimeout(r, 2200));
+  const again = make();
+  const before = searches;
+  assert.equal((await again.forArtists([{ name: "A1" }]))[0].title, "New Hit");
+  assert.equal(searches, before, "served from the saved cache");
+  rmSync(dir, { recursive: true, force: true });
+});

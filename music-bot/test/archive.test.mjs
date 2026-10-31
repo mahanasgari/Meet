@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -554,4 +554,35 @@ test("archived: asks home only for songs not already known as stored", async () 
   assert.deepEqual(await archive.archived([ID, OTHER, "junk"]), [ID]);
   assert.deepEqual(await archive.archived([ID, OTHER]), [ID]);
   assert.deepEqual(calls, [[ID, OTHER], [OTHER]], "a known yes is not asked again");
+});
+
+// ---------- stuck downloads ----------
+
+/** A fake yt-dlp: a shell script with [body]. */
+function fakeYtdlp(dir, body) {
+  const bin = join(dir, "yt-dlp");
+  writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+test("download ends when yt-dlp exits but a child it started keeps the output open", async () => {
+  const dir = tmpDir();
+  // The background sleep inherits stdout, like a hung ffmpeg.
+  const archive = makeArchive({ dir, ytdlpBin: fakeYtdlp(dir, "sleep 30 &\nexit 1"), exitGraceMs: 100 });
+  const t0 = Date.now();
+  assert.equal(await archive.download(ID, `https://www.youtube.com/watch?v=${ID}`), false);
+  assert.ok(Date.now() - t0 < 5000, "did not wait for the leftover child");
+  assert.equal(archive.inflight.size, 0, "a new download can start");
+});
+
+test("a download that sends nothing is stopped, with the processes it started", async () => {
+  const dir = tmpDir();
+  const home = fakeHome();
+  const archive = makeArchive({ dir, home, ytdlpBin: fakeYtdlp(dir, "sleep 30"), stallMs: 200 });
+  const t0 = Date.now();
+  assert.equal(await archive.download(ID, `https://www.youtube.com/watch?v=${ID}`), false);
+  assert.ok(Date.now() - t0 < 5000);
+  assert.equal(archive.inflight.size, 0);
+  assert.match(String(home.calls.find((c) => c[0] === "failed")?.[3] ?? ""), /stalled/);
 });

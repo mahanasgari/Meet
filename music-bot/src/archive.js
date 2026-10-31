@@ -17,6 +17,11 @@ const WARM_MAX = 4;
 // Fetching ahead stops when the disk gets this low (plays still work).
 const WARM_MIN_FREE = 2 * 1024 ** 3;
 const WAIT_INFLIGHT_MS = 45_000;
+// A download that sends nothing for this long is stuck (an ffmpeg yt-dlp
+// started can hang on YouTube's connection for hours).
+const STALL_MS = 2 * 60_000;
+// After yt-dlp exits, how long a leftover child may keep its output open.
+const EXIT_GRACE_MS = 5_000;
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
 // Gone for good. A bare "Video unavailable" is NOT here: YouTube also says
 // that to a server it distrusts (verified: such songs download fine from
@@ -243,7 +248,9 @@ export class Archive {
    */
   constructor(o) {
     Object.assign(this, o);
-    this.jobsPerHour ??= 20;
+    this.jobsPerHour ??= 30;
+    this.stallMs ??= STALL_MS;
+    this.exitGraceMs ??= EXIT_GRACE_MS;
     this.queueDir = join(o.dir, "uploads");
     mkdirSync(this.queueDir, { recursive: true });
     this.coolUntil = 0;
@@ -426,16 +433,38 @@ export class Archive {
     const child = spawn(
       this.ytdlpBin,
       ["-f", ARCHIVE_FORMAT, "--no-playlist", "--no-warnings", "--print-to-file", "%()j", metaFile, ...this.ytdlpArgs(), "-o", "-", pageUrl],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      // Own process group, so a kill also reaches the ffmpeg it starts.
+      { stdio: ["ignore", "pipe", "pipe"], detached: true },
     );
+    const kill = () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
     const file = createWriteStream(tmp);
     let stderr = "";
     let sent = false;
     let gone = !res;
     req?.on("close", () => (gone = true));
-    const timer = setTimeout(() => child.kill("SIGKILL"), 10 * 60_000);
-    child.stderr.on("data", (d) => (stderr = (stderr + d).slice(-4000)));
+    const timer = setTimeout(kill, 10 * 60_000);
+    let idle = null;
+    const stalled = () => {
+      stderr += `\nstalled: no data for ${Math.round(this.stallMs / 1000)} s`;
+      kill();
+    };
+    const bump = () => {
+      clearTimeout(idle);
+      idle = setTimeout(stalled, this.stallMs);
+    };
+    bump();
+    child.stderr.on("data", (d) => {
+      stderr = (stderr + d).slice(-4000);
+      bump(); // progress lines while yt-dlp fetches the page
+    });
     child.stdout.on("data", (chunk) => {
+      bump();
       file.write(chunk);
       if (gone) return;
       if (!sent) {
@@ -455,10 +484,25 @@ export class Archive {
         stderr += String(e?.message || e);
         resolve(-1);
       });
-      child.on("close", (code) => resolve(code));
+      let closed = false;
+      child.on("close", (code) => {
+        closed = true;
+        resolve(code);
+      });
+      // A leftover child holding the output open would delay "close" forever.
+      child.on("exit", (code) => {
+        setTimeout(() => {
+          if (closed) return; // all done (and the group id may be reused)
+          kill();
+          child.stdout.destroy();
+          child.stderr.destroy();
+          resolve(code);
+        }, this.exitGraceMs).unref();
+      });
     });
     const finished = done.then(async (code) => {
       clearTimeout(timer);
+      clearTimeout(idle);
       file.end();
       await once(file, "finish").catch(() => undefined);
       // A download that died midway must look broken to the player (reset),

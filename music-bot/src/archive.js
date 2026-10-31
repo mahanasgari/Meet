@@ -248,7 +248,7 @@ export class Archive {
    */
   constructor(o) {
     Object.assign(this, o);
-    this.jobsPerHour ??= 30;
+    this.jobsPerHour ??= 40;
     this.stallMs ??= STALL_MS;
     this.exitGraceMs ??= EXIT_GRACE_MS;
     this.queueDir = join(o.dir, "uploads");

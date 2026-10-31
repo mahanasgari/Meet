@@ -529,7 +529,7 @@ const archive = ARCHIVE_ON
       ytdlpBin: YTDLP_BIN,
       ffmpegBin: FFMPEG_BIN,
       ytdlpArgs: () => [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
-      jobsPerHour: Number(process.env.ARCHIVE_JOBS_PER_HOUR) || 30,
+      jobsPerHour: Number(process.env.ARCHIVE_JOBS_PER_HOUR) || 40,
     })
   : null;
 archive?.start();

@@ -40,6 +40,7 @@ import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./
 import { Recommender } from "./recommend.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
+import { ChordStore } from "./chords.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -709,6 +710,11 @@ const ytInnertube = (url, client, body) =>
     if (!r.ok) throw new Error(`youtube ${r.status}`);
     return r.json();
   });
+// Chord sheets: worked out from the song's audio once, kept on disk.
+const chordStore = archive
+  ? new ChordStore({ dir: joinPath(SHARES, "chords"), localFile: (id) => archive.localFile(id), ffmpegBin: FFMPEG_BIN })
+  : null;
+
 const releases = new Releases({
   file: joinPath(SHARES, "archive", "releases-cache.json"),
   ytSearch: (query) =>
@@ -3934,6 +3940,25 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         console.error("[releases]", e.message);
         sendJson(res, 502, { error: "releases_failed" });
+      }
+      return;
+    }
+
+    // --- Chords, key and tempo of one song (the app's chord sheet).
+    if (req.method === "GET" && url.pathname === "/chords") {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!chordStore || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, chordStore ? 400 : 404, { error: chordStore ? "invalid_id" : "not_here" });
+        return;
+      }
+      try {
+        const r = await chordStore.get(id);
+        if (!r) sendJson(res, 404, { error: "no_audio" });
+        else sendJson(res, 200, r);
+      } catch (e) {
+        console.error("[chords]", id, e.message);
+        sendJson(res, 502, { error: "chords_failed" });
       }
       return;
     }

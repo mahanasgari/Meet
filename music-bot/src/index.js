@@ -727,7 +727,8 @@ if (chordStore && catalog) {
       nextFill = Date.now() + 6 * 3600_000; // all done: look again in a while
       todo = catalog.db
         .prepare(`SELECT p.video_id id FROM plays p JOIN songs s ON s.video_id=p.video_id
-          WHERE s.status='stored' AND p.at>? GROUP BY p.video_id ORDER BY COUNT(*) DESC LIMIT 500`)
+          WHERE s.status='stored' AND COALESCE(s.duration_s, 0) <= 720 AND p.at>?
+          GROUP BY p.video_id ORDER BY COUNT(*) DESC LIMIT 500`)
         .all(Date.now() - 30 * 864e5)
         .map((r) => r.id)
         .filter((id) => !chordStore.has(id))

@@ -72,3 +72,37 @@ test("names a seventh only when it clearly sounds", () => {
   const r = analyze(concat(tones(Cmaj7, 3), tones(G7, 3), tones(C, 3)));
   assert.deepEqual(r.chords.map((x) => x.c).filter((c) => c !== "N"), ["Cmaj7", "G7", "C"]);
 });
+
+test("ChordStore works a song out on a worker thread and keeps it", async (t) => {
+  const { execFileSync } = await import("node:child_process");
+  try {
+    execFileSync("ffmpeg", ["-version"], { stdio: "ignore" });
+  } catch {
+    t.skip("no ffmpeg");
+    return;
+  }
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { ChordStore } = await import("../src/chords.js");
+  const dir = mkdtempSync(join(tmpdir(), "chords-"));
+  // A 16-bit WAV of C then G.
+  const pcm = concat(tones(C, 3), tones([43, 55, 59, 62], 3));
+  const data = Buffer.alloc(pcm.length * 2);
+  pcm.forEach((x, i) => data.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(x * 20000))), i * 2));
+  const head = Buffer.alloc(44);
+  head.write("RIFF", 0); head.writeUInt32LE(36 + data.length, 4); head.write("WAVEfmt ", 8);
+  head.writeUInt32LE(16, 16); head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22);
+  head.writeUInt32LE(SR, 24); head.writeUInt32LE(SR * 2, 28); head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34);
+  head.write("data", 36); head.writeUInt32LE(data.length, 40);
+  const wav = join(dir, "song.wav");
+  writeFileSync(wav, Buffer.concat([head, data]));
+  let asked = 0;
+  const store = new ChordStore({ dir: join(dir, "chords"), localFile: async () => (asked++, wav) });
+  t.after(() => store.close());
+  const r = await store.get("aaaaaaaaaaa");
+  assert.deepEqual(r.chords.map((x) => x.c).filter((c) => c !== "N"), ["C", "G"]);
+  assert.ok(store.has("aaaaaaaaaaa"));
+  await store.get("aaaaaaaaaaa");
+  assert.equal(asked, 1, "kept on disk, not worked out again");
+});

@@ -4,6 +4,7 @@
 // triads, then smoothed so a chord only changes when the music clearly does.
 // Good on pop/rap/ballad progressions; jazz chords come out as their triad.
 import { spawn } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -24,6 +25,8 @@ export const DEFAULTS = {
 };
 const BASS_HI_HZ = 200;
 export const VERSION = 3;
+// Longer is a mix or a podcast, not a song: no chord sheet.
+export const MAX_SECONDS = 12 * 60;
 
 const NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
 const SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -394,6 +397,43 @@ export class ChordStore {
     mkdirSync(dir, { recursive: true });
   }
 
+  /** Stops the worker thread (tests; the server keeps it for its lifetime). */
+  close() {
+    const w = this.worker;
+    this.worker = null;
+    return w ? w.terminate() : Promise.resolve();
+  }
+
+  /** analyze() on a worker thread, so the server keeps answering. */
+  #inWorker(samples) {
+    if (!this.worker) {
+      this.worker = new Worker(new URL("./chords_worker.js", import.meta.url));
+      this.worker.unref();
+      this.jobs = new Map();
+      this.seq = 0;
+      const failAll = (e) => {
+        for (const { reject } of this.jobs.values()) reject(e);
+        this.jobs.clear();
+        this.worker = null;
+      };
+      this.worker.on("message", ({ id, result, error }) => {
+        const job = this.jobs.get(id);
+        this.jobs.delete(id);
+        if (!job) return;
+        if (error) job.reject(new Error(error));
+        else job.resolve(result);
+      });
+      this.worker.on("error", failAll);
+      this.worker.on("exit", () => failAll(new Error("chord worker stopped")));
+    }
+    const id = ++this.seq;
+    return new Promise((resolve, reject) => {
+      this.jobs.set(id, { resolve, reject });
+      const copy = samples.slice(); // own buffer, handed over without copying again
+      this.worker.postMessage({ id, buffer: copy.buffer }, [copy.buffer]);
+    });
+  }
+
   #file(id) {
     return join(this.dir, `${id}.json`);
   }
@@ -429,7 +469,12 @@ export class ChordStore {
         const path = await this.localFile(id);
         if (!path) return null;
         const t0 = Date.now();
-        const r = { v: VERSION, ...analyze(await decode(path, this.ffmpegBin)) };
+        const samples = await decode(path, this.ffmpegBin);
+        if (samples.length > MAX_SECONDS * SR) {
+          console.log(`[chords] ${id}: ${Math.round(samples.length / SR / 60)} min, too long for a chord sheet`);
+          return null;
+        }
+        const r = { v: VERSION, ...(await this.#inWorker(samples)) };
         writeFileSync(f, JSON.stringify(r));
         console.log(`[chords] ${id}: ${r.key?.name ?? "?"} ${r.bpm ?? "?"} bpm, ${r.chords.length} changes (${Date.now() - t0} ms)`);
         return r;

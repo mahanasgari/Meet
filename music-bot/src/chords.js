@@ -20,9 +20,10 @@ export const DEFAULTS = {
   minSegS: 0.6, // shorter chords are folded into the one before
   noChord: 0.55, // fit "no chord" needs to beat (silence always does)
   bass: 0.15, // weight of "the bass plays this chord's root"
+  seventh: 0.9, // a 7th this strong next to the triad's notes is named (strict: a wrong 7th reads worse than a missing one)
 };
 const BASS_HI_HZ = 200;
-export const VERSION = 2;
+export const VERSION = 3;
 
 const NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
 const SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -186,6 +187,56 @@ function viterbi(scores, changeCost) {
   return path;
 }
 
+/**
+ * "7", "maj7" or "" for the chord [root] over frames [g.s, g.e): a 7th is
+ * named only when it sounds about as strong as the triad's own notes.
+ */
+function seventhOf(sm, g, root, minor, ratio) {
+  const c = new Float64Array(12);
+  for (let t = g.s; t < g.e; t++) {
+    const v = normalize(sm[t]);
+    for (let i = 0; i < 12; i++) c[i] += v[i];
+  }
+  const third = (root + (minor ? 3 : 4)) % 12;
+  const triad = (c[root] + c[third] + c[(root + 7) % 12]) / 3;
+  const b7 = c[(root + 10) % 12];
+  const maj7 = c[(root + 11) % 12];
+  if (b7 >= ratio * triad && b7 > maj7) return "7";
+  if (!minor && maj7 >= ratio * triad && maj7 > b7) return "maj7";
+  return "";
+}
+
+/**
+ * The key from the chords played: the one whose own chords fill most of the
+ * song, its home chord counting extra, with the note profile breaking ties.
+ */
+function keyFromChords(segs, total) {
+  const dur = new Float64Array(24);
+  let all = 0;
+  for (const g of segs) {
+    if (g.k < 0) continue;
+    dur[g.k] += g.e - g.s;
+    all += g.e - g.s;
+  }
+  const profile = keyOf(total);
+  if (!all) return profile;
+  const maj = (r) => ((r % 12) + 12) % 12;
+  const min = (r) => 12 + (((r % 12) + 12) % 12);
+  let best = null;
+  for (let r = 0; r < 12; r++) {
+    for (const mode of ["major", "minor"]) {
+      const own = mode === "major"
+        ? [maj(r), min(r + 2), min(r + 4), maj(r + 5), maj(r + 7), min(r + 9)]
+        : [min(r), maj(r + 3), min(r + 5), min(r + 7), maj(r + 7), maj(r + 8), maj(r + 10)];
+      const fit = own.reduce((a, k) => a + dur[k], 0) / all;
+      const home = dur[own[0]] / all;
+      const score = fit + 0.5 * home + (profile && profile.root === r && profile.mode === mode ? 0.1 : 0);
+      if (!best || score > best.score) best = { score, root: r, mode };
+    }
+  }
+  return { name: `${NAMES[best.root]}${best.mode === "minor" ? "m" : ""}`, root: best.root, mode: best.mode };
+}
+
 /** The key whose profile best matches the whole song's notes. */
 function keyOf(total) {
   let best = { score: -Infinity, name: null };
@@ -275,25 +326,34 @@ export function analyze(samples, opts = {}) {
     return out;
   });
   const path = viterbi(scores, o.changeCost);
-  const key = keyOf(total);
-  const names = spelling(key);
-  // Runs of the same chord, too-short ones folded into the one before.
+  // Runs of the same chord (k: 0–11 major, 12–23 minor, -1 none), too-short
+  // ones folded into the one before.
   let segs = [];
   for (let t = 0; t < path.length; t++) {
     const k = path[t] - 1;
-    const c = k < 0 ? "N" : `${names[k % 12]}${k >= 12 ? "m" : ""}`;
     const last = segs.at(-1);
-    if (last && last.c === c) last.e = t + 1;
-    else segs.push({ s: t, e: t + 1, c });
+    if (last && last.k === k) last.e = t + 1;
+    else segs.push({ s: t, e: t + 1, k });
   }
   const minFrames = Math.round(o.minSegS / FRAME_S);
   const merged = [];
   for (const g of segs) {
     const last = merged.at(-1);
-    if (last && (g.e - g.s < minFrames || last.c === g.c)) last.e = g.e;
+    if (last && (g.e - g.s < minFrames || last.k === g.k)) last.e = g.e;
     else merged.push({ ...g });
   }
   segs = merged;
+  const key = keyFromChords(segs, total);
+  const names = spelling(key);
+  for (const g of segs) {
+    if (g.k < 0) {
+      g.c = "N";
+      continue;
+    }
+    const root = g.k % 12;
+    const minor = g.k >= 12;
+    g.c = `${names[root]}${minor ? "m" : ""}${seventhOf(sm, g, root, minor, o.seventh)}`;
+  }
   // Frames are centred half a window after their start.
   const ms = (f) => Math.max(0, Math.round((f * HOP + N / 2) * (1000 / SR)));
   return {
@@ -336,6 +396,20 @@ export class ChordStore {
 
   #file(id) {
     return join(this.dir, `${id}.json`);
+  }
+
+  /** Worked out already (by this version)? */
+  has(id) {
+    try {
+      return JSON.parse(readFileSync(this.#file(id), "utf8")).v === VERSION;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Nothing being worked out right now. */
+  get idle() {
+    return this.pending.size === 0;
   }
 
   /** The chords of song [id], or null when its audio can't be had. */

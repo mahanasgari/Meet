@@ -715,6 +715,30 @@ const chordStore = archive
   ? new ChordStore({ dir: joinPath(SHARES, "chords"), localFile: (id) => archive.localFile(id), ffmpegBin: FFMPEG_BIN })
   : null;
 
+// Ahead of time, one song a minute while nothing else is being worked out:
+// the most-played archived songs, so their chord sheets open at once.
+if (chordStore && catalog) {
+  let todo = [];
+  let nextFill = 0;
+  setInterval(() => {
+    if (!chordStore.idle) return;
+    if (!todo.length) {
+      if (Date.now() < nextFill) return;
+      nextFill = Date.now() + 6 * 3600_000; // all done: look again in a while
+      todo = catalog.db
+        .prepare(`SELECT p.video_id id FROM plays p JOIN songs s ON s.video_id=p.video_id
+          WHERE s.status='stored' AND p.at>? GROUP BY p.video_id ORDER BY COUNT(*) DESC LIMIT 500`)
+        .all(Date.now() - 30 * 864e5)
+        .map((r) => r.id)
+        .filter((id) => !chordStore.has(id))
+        .reverse();
+      if (!todo.length) return;
+    }
+    const id = todo.pop();
+    if (!chordStore.has(id)) chordStore.get(id).catch((e) => console.error("[chords] ahead", id, e.message));
+  }, 60_000).unref();
+}
+
 const releases = new Releases({
   file: joinPath(SHARES, "archive", "releases-cache.json"),
   ytSearch: (query) =>

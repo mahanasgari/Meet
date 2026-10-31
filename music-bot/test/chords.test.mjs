@@ -65,3 +65,10 @@ test("tempo from a click track", () => {
   for (let i = 0; i < n; i += every) for (let j = 0; j < 200 && i + j < n; j++) x[i + j] = Math.sin(j / 3) * (1 - j / 200);
   assert.equal(tempoOf(x), 120);
 });
+
+test("names a seventh only when it clearly sounds", () => {
+  const Cmaj7 = [48, 60, 64, 67, 71, 83]; // the 7th in two octaves, as on a piano
+  const G7 = [43, 55, 59, 62, 65];
+  const r = analyze(concat(tones(Cmaj7, 3), tones(G7, 3), tones(C, 3)));
+  assert.deepEqual(r.chords.map((x) => x.c).filter((c) => c !== "N"), ["Cmaj7", "G7", "C"]);
+});

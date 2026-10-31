@@ -586,3 +586,27 @@ test("a download that sends nothing is stopped, with the processes it started", 
   assert.equal(archive.inflight.size, 0);
   assert.match(String(home.calls.find((c) => c[0] === "failed")?.[3] ?? ""), /stalled/);
 });
+
+test("jobTick: with nothing urgent waiting, background songs use the reserved part of the budget", async () => {
+  const asked = [];
+  const home = fakeHome({
+    nextJobs: async (server, n, opts) => {
+      asked.push(opts?.urgentOnly ? "urgent" : "any");
+      return opts?.urgentOnly ? [] : [ID];
+    },
+  });
+  const archive = makeArchive({ home, jobsPerHour: 30 });
+  const longAgo = Date.now() - 20 * 60_000;
+  archive.jobTimes = Array.from({ length: 23 }, () => longAgo); // past the 75% mark
+  const got = [];
+  archive.download = async (id) => got.push(id);
+  await archive.jobTick();
+  assert.deepEqual(asked, ["urgent", "any"]);
+  assert.deepEqual(got, [ID]);
+
+  // Too soon after the last job: only urgent songs, no fallback.
+  asked.length = 0;
+  archive.jobTimes = [Date.now()];
+  await archive.jobTick();
+  assert.deepEqual(asked, ["urgent"]);
+});

@@ -747,11 +747,15 @@ export class Archive {
     // Background downloads are spread over the hour and leave a quarter of
     // the budget for songs about to play; those may start right away.
     const sinceLast = Date.now() - (this.jobTimes.at(-1) || 0);
-    const urgentOnly =
-      this.jobTimes.length >= Math.floor(this.jobsPerHour * 0.75) || sinceLast < 1800_000 / this.jobsPerHour;
+    const tooSoon = sinceLast < 1800_000 / this.jobsPerHour;
+    const reserved = this.jobTimes.length >= Math.floor(this.jobsPerHour * 0.75);
     let ids = [];
     try {
-      ids = await this.home.nextJobs(this.serverId, 1, urgentOnly ? { urgentOnly } : undefined);
+      ids = await this.home.nextJobs(this.serverId, 1, tooSoon || reserved ? { urgentOnly: true } : undefined);
+      // The reserve is for songs about to play; with none waiting, background
+      // songs may use it rather than leave it idle (songs played right away
+      // download outside this budget anyway).
+      if (!ids.length && reserved && !tooSoon) ids = await this.home.nextJobs(this.serverId, 1);
     } catch {
       return;
     }

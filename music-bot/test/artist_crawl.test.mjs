@@ -68,7 +68,7 @@ test("crawler saves pages, skips artists found after it started, then finishes",
     log: { log() {}, error() {} },
     transport: async (path, body) => {
       asked.push(body.browseId);
-      return body.browseId === A ? page : { contents: [row("ccccccccccc", "Three", [["Reza Pishro", A]], null, "2:00")] };
+      return body.browseId === A ? page : { contents: [row("ccccccccccc", "Three", [["Reza Pishro", A]], null, "2:00"), row("livelivelive".slice(0, 11), "Live in Istanbul", [["Reza Pishro", A]], null, "1:32:10")] };
     },
   });
   assert.equal(await crawler.tick(), true);
@@ -77,7 +77,7 @@ test("crawler saves pages, skips artists found after it started, then finishes",
   assert.equal(st.fetched, 1);
   assert.equal(st.pending, 0, "Yas, first seen on the page, is not crawled");
   const songs = catalog.db.prepare("SELECT video_id FROM song_artists WHERE artist_id=? ORDER BY video_id").all(A).map((r) => r.video_id);
-  assert.deepEqual(songs, ["ccccccccccc", "r6qM8uSNjjU"]);
+  assert.deepEqual(songs, ["ccccccccccc", "liveliveliv", "r6qM8uSNjjU"], "the concert is still known");
   assert.equal(catalog.db.prepare("SELECT subscribers FROM artists WHERE id=?").get(A).subscribers, 352000);
   // Its songs wait in the archive queue, the page's top song first.
   const jobs = catalog.db.prepare("SELECT video_id, reason, weight FROM jobs ORDER BY weight DESC").all();

@@ -127,6 +127,8 @@ export function parseArtistPage(json) {
   return out;
 }
 
+const MAX_SONG_S = 15 * 60;
+
 /** Archive order of an artist's [rank]-th song: popular artists' top songs first. */
 export function crawlWeight(subscribers, rank) {
   return Math.round(100 * Math.log10((subscribers || 0) + 10) - 15 * rank);
@@ -166,7 +168,8 @@ export class ArtistCrawler {
       }
       this.catalog.saveArtistPage(id, { ...page, songs }, this.now());
       this.catalog.enqueue(
-        songs.map((s) => s.videoId),
+        // Not concerts, mixes or full albums (over 15 minutes).
+        songs.filter((s) => !(s.durationS > MAX_SONG_S)).map((s) => s.videoId),
         "crawl",
         this.now(),
         new Map(songs.map((s, i) => [s.videoId, crawlWeight(page.subscribers, i)])),

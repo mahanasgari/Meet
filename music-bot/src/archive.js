@@ -20,6 +20,7 @@ const WAIT_INFLIGHT_MS = 45_000;
 // A download that sends nothing for this long is stuck (an ffmpeg yt-dlp
 // started can hang on YouTube's connection for hours).
 const STALL_MS = 2 * 60_000;
+const MAX_REFUSED_PER_HOUR = 60;
 // After yt-dlp exits, how long a leftover child may keep its output open.
 const EXIT_GRACE_MS = 5_000;
 const BLOCKED_RE = /confirm you.?re not a bot|sign in to confirm|HTTP Error 429|too many requests/i;
@@ -248,7 +249,7 @@ export class Archive {
    */
   constructor(o) {
     Object.assign(this, o);
-    this.jobsPerHour ??= 40;
+    this.jobsPerHour ??= 50;
     this.stallMs ??= STALL_MS;
     this.exitGraceMs ??= EXIT_GRACE_MS;
     this.queueDir = join(o.dir, "uploads");
@@ -535,6 +536,7 @@ export class Archive {
       const unavailable = ageGate || (!blocked && UNAVAILABLE_RE.test(stderr));
       // Refused on this server only: skip this server for the song, no cooldown.
       const refusedHere = !blocked && !unavailable && SERVER_REFUSED_RE.test(stderr);
+      this.lastRefused = refusedHere;
       if (blocked) {
         this.coolUntil = Date.now() + COOL_MS;
         this.counters.blocked++;
@@ -763,8 +765,19 @@ export class Archive {
     if (!id || this.inflight.has(id) || this.cache.has(id)) return;
     this.jobRunning = true;
     this.jobTimes.push(Date.now());
+    this.lastRefused = false;
     try {
       await this.download(id, `https://www.youtube.com/watch?v=${id}`);
+      // Refused in this server's country (Germany and Persian music): no
+      // download happened, so it doesn't use up the hour's budget. Capped,
+      // so a server refused everything doesn't keep asking YouTube.
+      if (this.lastRefused) {
+        this.refusedTimes = (this.refusedTimes || []).filter((t) => t > hourAgo);
+        if (this.refusedTimes.length < MAX_REFUSED_PER_HOUR) {
+          this.refusedTimes.push(Date.now());
+          this.jobTimes.pop();
+        }
+      }
     } finally {
       this.jobRunning = false;
     }

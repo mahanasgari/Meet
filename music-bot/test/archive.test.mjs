@@ -610,3 +610,21 @@ test("jobTick: with nothing urgent waiting, background songs use the reserved pa
   await archive.jobTick();
   assert.deepEqual(asked, ["urgent"]);
 });
+
+test("jobTick: a song refused in this server's country doesn't use up the hour's budget", async () => {
+  const home = fakeHome({ nextJobs: async () => [ID] });
+  const archive = makeArchive({ home, jobsPerHour: 50 });
+  archive.download = async () => {
+    archive.lastRefused = true;
+    return false;
+  };
+  await archive.jobTick();
+  assert.equal(archive.jobTimes.length, 0, "refusal not counted");
+  assert.equal(archive.refusedTimes.length, 1);
+  archive.download = async () => {
+    archive.lastRefused = false;
+    return true;
+  };
+  await archive.jobTick();
+  assert.equal(archive.jobTimes.length, 1, "a real download counts");
+});

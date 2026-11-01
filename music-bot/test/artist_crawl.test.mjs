@@ -79,6 +79,10 @@ test("crawler saves pages, skips artists found after it started, then finishes",
   const songs = catalog.db.prepare("SELECT video_id FROM song_artists WHERE artist_id=? ORDER BY video_id").all(A).map((r) => r.video_id);
   assert.deepEqual(songs, ["ccccccccccc", "r6qM8uSNjjU"]);
   assert.equal(catalog.db.prepare("SELECT subscribers FROM artists WHERE id=?").get(A).subscribers, 352000);
+  // Its songs wait in the archive queue, the page's top song first.
+  const jobs = catalog.db.prepare("SELECT video_id, reason, weight FROM jobs ORDER BY weight DESC").all();
+  assert.deepEqual(jobs.map((j) => [j.video_id, j.reason]), [["r6qM8uSNjjU", "crawl"], ["ccccccccccc", "crawl"]]);
+  assert.ok(jobs[0].weight > jobs[1].weight);
   assert.equal(await crawler.tick(), false, "nothing left");
 });
 

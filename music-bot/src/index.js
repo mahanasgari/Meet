@@ -41,7 +41,7 @@ import { Recommender } from "./recommend.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
-import { ArtistCrawler } from "./artist_crawl.js";
+import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -633,6 +633,16 @@ if (catalog) {
       catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_crawl_cutoff',?)").run(String(cutoff));
     }
     const artistCrawler = new ArtistCrawler({ catalog, transport: graph.transport, cutoff });
+    // Once: queue the songs of artists crawled before crawl songs were queued.
+    if (!catalog.db.prepare("SELECT value FROM meta WHERE key='crawl_queue_backfill'").get()) {
+      let n = 0;
+      for (const a of catalog.db.prepare("SELECT id, subscribers FROM artists WHERE page_ok=1").all()) {
+        const ids = catalog.db.prepare("SELECT video_id FROM song_artists WHERE artist_id=? ORDER BY position, rowid").all(a.id).map((r) => r.video_id);
+        n += catalog.enqueue(ids, "crawl", Date.now(), new Map(ids.map((id, i) => [id, crawlWeight(a.subscribers, i)])));
+      }
+      catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('crawl_queue_backfill','1')").run();
+      console.log(`[artists] queued ${n} songs of artists crawled earlier`);
+    }
     const every = (Number(process.env.ARTIST_CRAWL_EVERY_S) || 8) * 1000;
     const timer = setInterval(() => {
       artistCrawler.tick().then((more) => {

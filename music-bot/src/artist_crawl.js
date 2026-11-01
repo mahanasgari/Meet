@@ -1,7 +1,12 @@
 // Artist crawler (home only): fetches the YouTube Music page of every artist
 // in the catalog — name, subscribers, about, albums/singles, similar artists —
 // and their songs ("Songs → See all", the first page of up to ~100), into the
-// catalog. Song details only; nothing is queued for archiving.
+// catalog.
+//
+// Every song found is queued for the archive with the lowest priority
+// ("crawl": after plays, up next, opened and suggested songs), most popular
+// first: artists with more subscribers, and each artist's top songs (the
+// page lists them by popularity).
 //
 // One artist at a time, a few seconds apart; backs off for half an hour when
 // YouTube Music pushes back (HTTP 429/403). Only artists known when the
@@ -122,6 +127,11 @@ export function parseArtistPage(json) {
   return out;
 }
 
+/** Archive order of an artist's [rank]-th song: popular artists' top songs first. */
+export function crawlWeight(subscribers, rank) {
+  return Math.round(100 * Math.log10((subscribers || 0) + 10) - 15 * rank);
+}
+
 export class ArtistCrawler {
   /**
    * @param {object} o
@@ -155,6 +165,12 @@ export class ArtistCrawler {
         songs = [...songs, ...all.filter((s) => !have.has(s.videoId))];
       }
       this.catalog.saveArtistPage(id, { ...page, songs }, this.now());
+      this.catalog.enqueue(
+        songs.map((s) => s.videoId),
+        "crawl",
+        this.now(),
+        new Map(songs.map((s, i) => [s.videoId, crawlWeight(page.subscribers, i)])),
+      );
       if (++this.done % 100 === 0) {
         const st = this.catalog.artistPageStats(this.cutoff);
         this.log.log(`[artists] ${st.fetched} pages fetched, ${st.pending} to go, ${st.songs} songs known`);

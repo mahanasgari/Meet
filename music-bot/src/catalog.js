@@ -114,6 +114,9 @@ const MIGRATIONS = [
   ALTER TABLE artists ADD COLUMN page_ok INTEGER;
   ALTER TABLE artists ADD COLUMN page_songs INTEGER;
   CREATE INDEX artists_page ON artists(page_at);`,
+  // v10: the artist crawl's songs wait last, most popular first (weight).
+  `ALTER TABLE jobs ADD COLUMN weight INTEGER NOT NULL DEFAULT 0;
+  CREATE INDEX jobs_crawl ON jobs(reason, state, weight);`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -168,7 +171,7 @@ function lyricsSig(text) {
   return `${source}|${createHash("sha1").update(words).digest("hex").slice(0, 16)}`;
 }
 
-const JOB_ORDER = ["play", "retry", "next", "interest", "prefetch"];
+const JOB_ORDER = ["play", "retry", "next", "interest", "prefetch", "crawl"];
 /** SQL rank of a job's reason (lower runs first). */
 const JOB_PRIORITY = `CASE reason ${JOB_ORDER.map((r, i) => `WHEN '${r}' THEN ${i >= 1 ? i - 1 : 0}`).join(" ")} ELSE 9 END`;
 const jobPriority = (reason) => Math.max(0, JOB_ORDER.indexOf(reason) - 1);
@@ -353,23 +356,32 @@ export class Catalog {
   nextJobs(server, limit = 2, now = Date.now(), { urgentOnly = false } = {}) {
     return this.#tx(() => {
       this.#reap(now);
+      // The artist crawl's songs (hundreds of thousands) are looked at only
+      // when nothing else waits, through their own index.
       const rows = this.#sql(`SELECT * FROM jobs WHERE state='queued' AND next_at<=?
+        AND COALESCE(reason,'')<>'crawl'
         ${urgentOnly ? "AND reason IN ('play','retry','next')" : ""}
         ORDER BY ${JOB_PRIORITY},
           CASE WHEN reason IN ('next','interest') THEN -created_at ELSE created_at END, rowid`).all(now);
       const picked = [];
-      for (const job of rows) {
-        if (picked.length >= limit) break;
-        if (this.#blocked(job, now).includes(server)) continue;
+      const take = (job) => {
+        if (picked.length >= limit || this.#blocked(job, now).includes(server)) return;
         this.#sql(`UPDATE jobs SET state='running', server=?, lease_until=?, updated_at=? WHERE video_id=?`)
           .run(server, now + LEASE_MS, now, job.video_id);
         picked.push(job.video_id);
+      };
+      for (const job of rows) take(job);
+      if (picked.length < limit && !urgentOnly) {
+        const crawl = this.#sql(`SELECT * FROM jobs WHERE reason='crawl' AND state='queued' AND next_at<=?
+          ORDER BY weight DESC, rowid LIMIT ?`).all(now, (limit - picked.length) * 10 + 20);
+        for (const job of crawl) take(job);
       }
       return picked;
     });
   }
 
-  enqueue(videoIds, reason = "prefetch", now = Date.now()) {
+  /** [weights]: video id → weight (crawl jobs: higher goes first). */
+  enqueue(videoIds, reason = "prefetch", now = Date.now(), weights = null) {
     return this.#tx(() => {
       let n = 0;
       for (const id of new Set(videoIds)) {
@@ -382,8 +394,8 @@ export class Catalog {
           continue;
         }
         this.#ensureSong(id, now);
-        this.#sql(`INSERT INTO jobs(video_id,state,reason,created_at,updated_at)
-          VALUES(?, 'queued', ?, ?, ?)`).run(id, reason, now, now);
+        this.#sql(`INSERT INTO jobs(video_id,state,reason,created_at,updated_at,weight)
+          VALUES(?, 'queued', ?, ?, ?, ?)`).run(id, reason, now, now, Math.round(weights?.get?.(id) ?? 0));
         n++;
       }
       return n;

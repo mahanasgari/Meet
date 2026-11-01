@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "9");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "10");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "9");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "10");
   c.close();
 });
 
@@ -388,6 +388,7 @@ test("v2 database upgrades to v3 in place and keeps data", () => {
   const db = new DatabaseSync(file);
   for (const t of ["tracks", "artists", "song_artists", "artist_related", "albums", "crawl"]) db.exec(`DROP TABLE ${t}`);
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
+  db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;"); // v10
   db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
   db.close();
   const c2 = new Catalog(file);
@@ -438,6 +439,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   // ...and the later v9 artist-page columns, which a v3 DB never had.
   db.exec("DROP INDEX artists_page; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
+  db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;");
   db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
   db.close();
   const c = new Catalog(file);
@@ -620,4 +622,16 @@ test("archivedIds: only stored songs, junk and repeats ignored", () => {
   assert.deepEqual(c.archivedIds(["vid00000001", "vid00000002", "vid00000003", "vid00000001", "bad"]), ["vid00000001"]);
   assert.deepEqual(c.archivedIds([]), []);
   c.close();
+});
+
+test("crawl jobs wait behind everything else, most popular first, never urgent", () => {
+  const c = open();
+  c.enqueue(["crawllow000", "crawlhigh00"], "crawl", NOW, new Map([["crawllow000", 100], ["crawlhigh00", 600]]));
+  c.enqueue(["prefetch000"], "prefetch", NOW);
+  assert.deepEqual(c.nextJobs("s1", 1, NOW, { urgentOnly: true }), [], "crawl is never urgent");
+  assert.deepEqual(c.nextJobs("s1", 3, NOW), ["prefetch000", "crawlhigh00", "crawllow000"]);
+  // Asked for again with a real reason, a crawl song moves up.
+  c.enqueue(["crawlagain0"], "crawl", NOW, new Map([["crawlagain0", 900]]));
+  assert.equal(c.enqueue(["crawlagain0"], "interest", NOW + 1), 1);
+  assert.equal(c.db.prepare("SELECT reason FROM jobs WHERE video_id='crawlagain0'").get().reason, "interest");
 });

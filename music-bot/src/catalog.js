@@ -117,6 +117,22 @@ const MIGRATIONS = [
   // v10: the artist crawl's songs wait last, most popular first (weight).
   `ALTER TABLE jobs ADD COLUMN weight INTEGER NOT NULL DEFAULT 0;
   CREATE INDEX jobs_crawl ON jobs(reason, state, weight);`,
+  // v11: Spotify metadata per song (spotify_id NULL = looked, no match).
+  `CREATE TABLE spotify_tracks (
+    video_id TEXT PRIMARY KEY, spotify_id TEXT, isrc TEXT, popularity INTEGER, explicit INTEGER,
+    release_date TEXT, album_id TEXT, album_name TEXT, album_type TEXT, track_number INTEGER,
+    score REAL, checked_at INTEGER
+  );
+  CREATE TABLE spotify_artists (
+    spotify_id TEXT PRIMARY KEY, name TEXT, genres_json TEXT, popularity INTEGER,
+    followers INTEGER, fetched_at INTEGER
+  );
+  CREATE TABLE spotify_track_artists (
+    video_id TEXT, spotify_artist_id TEXT, position INTEGER,
+    PRIMARY KEY (video_id, spotify_artist_id)
+  );
+  CREATE INDEX spotify_tracks_id ON spotify_tracks(spotify_id);
+  CREATE INDEX spotify_tracks_isrc ON spotify_tracks(isrc);`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -920,6 +936,67 @@ export class Catalog {
           error: r.error, nextAt: r.next_at,
           excluded: parse(r.excluded_json, []).map((e) => e.server),
         })),
+    };
+  }
+
+  /** Tracks not yet looked up on Spotify: archived + most played first, then the rest. */
+  nextSpotifyTracks(limit) {
+    return this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
+      FROM tracks t
+      LEFT JOIN spotify_tracks st ON st.video_id = t.video_id
+      LEFT JOIN songs s ON s.video_id = t.video_id
+      LEFT JOIN (SELECT video_id, COUNT(*) n FROM plays GROUP BY video_id) p ON p.video_id = t.video_id
+      WHERE st.video_id IS NULL AND t.title IS NOT NULL AND t.title != ''
+      ORDER BY (s.status = 'stored') DESC, COALESCE(p.n, 0) DESC, t.first_seen
+      LIMIT ?`).all(limit).map((r) => ({
+      videoId: r.video_id, title: r.title,
+      artist: parse(r.artists_json, [])[0]?.name ?? null, durationS: r.duration_s,
+    }));
+  }
+
+  /** [match]: null = looked, nothing found (not looked up again). */
+  saveSpotifyTrack(videoId, match, now = Date.now()) {
+    this.#tx(() => {
+      if (!match) {
+        this.#sql("INSERT OR REPLACE INTO spotify_tracks(video_id, checked_at) VALUES(?, ?)").run(videoId, now);
+        return;
+      }
+      this.#sql(`INSERT OR REPLACE INTO spotify_tracks(video_id, spotify_id, isrc, popularity, explicit,
+        release_date, album_id, album_name, album_type, track_number, score, checked_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        videoId, match.id, match.isrc ?? null, match.popularity ?? null, match.explicit ? 1 : 0,
+        match.releaseDate ?? null, match.albumId ?? null, match.albumName ?? null,
+        match.albumType ?? null, match.trackNumber ?? null, match.score ?? null, now);
+      (match.artists ?? []).forEach((a, i) => {
+        this.#sql("INSERT OR IGNORE INTO spotify_artists(spotify_id, name) VALUES(?, ?)").run(a.id, a.name ?? null);
+        this.#sql("INSERT OR REPLACE INTO spotify_track_artists(video_id, spotify_artist_id, position) VALUES(?,?,?)").run(videoId, a.id, i);
+      });
+    });
+  }
+
+  spotifyArtistsToFetch(limit) {
+    return this.#sql("SELECT spotify_id FROM spotify_artists WHERE fetched_at IS NULL LIMIT ?").all(limit).map((r) => r.spotify_id);
+  }
+
+  saveSpotifyArtists(list, now = Date.now()) {
+    this.#tx(() => {
+      for (const a of list) {
+        this.#sql(`INSERT INTO spotify_artists(spotify_id, name, genres_json, popularity, followers, fetched_at)
+          VALUES(?,?,?,?,?,?) ON CONFLICT(spotify_id) DO UPDATE SET
+          name=COALESCE(excluded.name, name), genres_json=excluded.genres_json,
+          popularity=excluded.popularity, followers=excluded.followers, fetched_at=excluded.fetched_at`)
+          .run(a.id, a.name ?? null, JSON.stringify(a.genres ?? []), a.popularity ?? null, a.followers ?? null, now);
+      }
+    });
+  }
+
+  spotifyStats() {
+    const n = (q) => this.#sql(q).get().n;
+    return {
+      checked: n("SELECT COUNT(*) n FROM spotify_tracks"),
+      matched: n("SELECT COUNT(*) n FROM spotify_tracks WHERE spotify_id IS NOT NULL"),
+      artists: n("SELECT COUNT(*) n FROM spotify_artists"),
+      artistsFetched: n("SELECT COUNT(*) n FROM spotify_artists WHERE fetched_at IS NOT NULL"),
     };
   }
 

@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "10");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "11");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "10");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "11");
   c.close();
 });
 
@@ -388,7 +388,8 @@ test("v2 database upgrades to v3 in place and keeps data", () => {
   const db = new DatabaseSync(file);
   for (const t of ["tracks", "artists", "song_artists", "artist_related", "albums", "crawl"]) db.exec(`DROP TABLE ${t}`);
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
-  db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;"); // v10
+  db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;");
+  db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists;"); // v11
   db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
   db.close();
   const c2 = new Catalog(file);
@@ -440,6 +441,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   // ...and the later v9 artist-page columns, which a v3 DB never had.
   db.exec("DROP INDEX artists_page; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
   db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;");
+  db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists;"); // v11
   db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
   db.close();
   const c = new Catalog(file);

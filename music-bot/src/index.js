@@ -42,6 +42,7 @@ import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
+import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -653,6 +654,20 @@ if (catalog) {
       }).catch((e) => console.error("[artists]", e.message));
     }, every);
     timer.unref();
+  }
+
+  // Spotify metadata (popularity, ISRC, genres) for catalog songs, one lookup
+  // per tick; needs an app's client id/secret.
+  if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
+    const spotify = new SpotifyEnricher({
+      catalog,
+      client: new SpotifyClient({ clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET }),
+    });
+    setInterval(() => {
+      spotify.tick().catch((e) => console.error("[spotify]", e.message));
+    }, (Number(process.env.SPOTIFY_EVERY_S) || 3) * 1000).unref();
+  } else {
+    console.log("[spotify] off (no SPOTIFY_CLIENT_ID/SECRET)");
   }
 
   // Grow the archive around what friends like: every song of the artists

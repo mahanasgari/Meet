@@ -644,6 +644,12 @@ if (catalog) {
       catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('crawl_queue_backfill','1')").run();
       console.log(`[artists] queued ${n} songs of artists crawled earlier`);
     }
+    // Once: re-fetch crawled pages, now also read for their official videos.
+    if (!catalog.db.prepare("SELECT value FROM meta WHERE key='artist_videos_pass'").get()) {
+      const n = catalog.db.prepare("UPDATE artists SET page_at=NULL, page_ok=NULL WHERE page_ok=1").run().changes;
+      catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_videos_pass','1')").run();
+      console.log(`[artists] re-fetching ${n} pages for their videos`);
+    }
     const every = (Number(process.env.ARTIST_CRAWL_EVERY_S) || 8) * 1000;
     const timer = setInterval(() => {
       artistCrawler.tick().then((more) => {
@@ -912,6 +918,31 @@ async function resolveVideo(id) {
     );
   }
   return videoMapInflight.get(id);
+}
+// Match songs to their music videos ahead of time, most played first, slowly.
+if (catalog) {
+  let batch = [];
+  let running = false;
+  let done = 0;
+  const step = async () => {
+    if (running) return;
+    running = true;
+    try {
+      if (!batch.length) batch = catalog.nextVideoMatches(100);
+      const id = batch.shift();
+      if (!id) return;
+      await resolveVideo(id);
+      if (++done % 100 === 0) console.log(`[video] ahead: ${done} matched so far this run`);
+    } catch (e) {
+      console.error("[video] ahead:", e.message);
+    } finally {
+      running = false;
+    }
+  };
+  setTimeout(() => {
+    step();
+    setInterval(step, (Number(process.env.VIDEO_MATCH_EVERY_S) || 20) * 1000).unref();
+  }, 5 * 60_000).unref();
 }
 if (archive && catalog) {
   archive.home.resolveVideo = resolveVideo;

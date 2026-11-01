@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
+import { similarity, splitUploadTitle } from "./song_meta.js";
 import { dirname } from "node:path";
 
 const MIN = 6e4;
@@ -590,6 +591,46 @@ export class Catalog {
     this.#sql(`INSERT INTO video_map(video_id, src_id, title, checked_at) VALUES(?,?,?,?)
       ON CONFLICT(video_id) DO UPDATE SET src_id=excluded.src_id, title=excluded.title, checked_at=excluded.checked_at`)
       .run(videoId, srcId, title, now);
+  }
+
+  /**
+   * Official videos from an artist's page → video matches for that artist's
+   * songs with the same title. Never overrides an existing match or a
+   * rejected video. Returns how many songs got a match.
+   */
+  matchArtistVideos(artistId, videos, now = Date.now()) {
+    if (!videos?.length) return 0;
+    const name = this.#sql("SELECT name FROM artists WHERE id=?").get(artistId)?.name || "";
+    const songs = this.#sql(`SELECT t.video_id id, t.title FROM song_artists sa JOIN tracks t ON t.video_id=sa.video_id
+      WHERE sa.artist_id=?`).all(artistId);
+    let n = 0;
+    this.#tx(() => {
+      for (const v of videos) {
+        const want = splitUploadTitle(v.title, name).title;
+        let best = null;
+        let bestScore = 0.85;
+        for (const s of songs) {
+          const sc = similarity(s.title, want);
+          if (sc >= bestScore) [best, bestScore] = [s, sc];
+        }
+        if (!best || best.id === v.videoId) continue;
+        const cur = this.videoMapGet(best.id);
+        if (cur?.srcId || cur?.rejected.includes(v.videoId)) continue;
+        this.#sql(`INSERT INTO video_map(video_id, src_id, title, checked_at) VALUES(?,?,?,?)
+          ON CONFLICT(video_id) DO UPDATE SET src_id=excluded.src_id, title=excluded.title, checked_at=excluded.checked_at`)
+          .run(best.id, v.videoId, v.title, now);
+        n++;
+      }
+    });
+    return n;
+  }
+
+  /** Stored YouTube Music songs with no video match yet, most played first. */
+  nextVideoMatches(limit = 100) {
+    return this.#sql(`SELECT s.video_id FROM songs s LEFT JOIN plays p ON p.video_id=s.video_id
+      WHERE s.status='stored' AND s.source_kind='ytm_track'
+        AND NOT EXISTS (SELECT 1 FROM video_map m WHERE m.video_id=s.video_id)
+      GROUP BY s.video_id ORDER BY COUNT(p.id) DESC, s.stored_at DESC LIMIT ?`).all(limit).map((r) => r.video_id);
   }
 
   // --- Shared lyrics ----------------------------------------------------

@@ -78,7 +78,7 @@ export function parseSongList(json) {
  * page), songsPlaylist ("See all", VL…), albums, related }.
  */
 export function parseArtistPage(json) {
-  const out = { name: null, subscribers: null, description: null, songs: [], songsPlaylist: null, albums: [], related: [] };
+  const out = { name: null, subscribers: null, description: null, songs: [], songsPlaylist: null, albums: [], related: [], videos: [] };
   const h = json?.header?.musicImmersiveHeaderRenderer ?? json?.header?.musicVisualHeaderRenderer ?? json?.header?.musicHeaderRenderer;
   if (h) {
     out.name = textOf(h.title) || null;
@@ -112,6 +112,11 @@ export function parseArtistPage(json) {
       const tr = n.musicTwoRowItemRenderer;
       const id = tr.navigationEndpoint?.browseEndpoint?.browseId ?? bid(runsOf(tr.title)[0]);
       const sub = textOf(tr.subtitle);
+      // YouTube's own "official music video" label.
+      const we = tr.navigationEndpoint?.watchEndpoint;
+      if (/^[\w-]{11}$/.test(we?.videoId ?? "") && we.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig?.musicVideoType === "MUSIC_VIDEO_TYPE_OMV") {
+        out.videos.push({ videoId: we.videoId, title: textOf(tr.title) });
+      }
       if (isArtistId(id) && !seenRel.has(id)) {
         seenRel.add(id);
         out.related.push({ id, name: textOf(tr.title) || null, subscribers: /subscriber/i.test(sub) ? parseCount(sub) : null, rank: out.related.length });
@@ -167,6 +172,8 @@ export class ArtistCrawler {
         songs = [...songs, ...all.filter((s) => !have.has(s.videoId))];
       }
       this.catalog.saveArtistPage(id, { ...page, songs }, this.now());
+      // Official videos on the page → their songs' video matches, no search needed.
+      this.catalog.matchArtistVideos(id, page.videos || [], this.now());
       this.catalog.enqueue(
         // Not concerts, mixes or full albums (over 15 minutes).
         songs.filter((s) => !(s.durationS > MAX_SONG_S)).map((s) => s.videoId),

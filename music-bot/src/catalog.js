@@ -134,6 +134,13 @@ const MIGRATIONS = [
   );
   CREATE INDEX spotify_tracks_id ON spotify_tracks(spotify_id);
   CREATE INDEX spotify_tracks_isrc ON spotify_tracks(isrc);`,
+  // v12: Deezer + iTunes info per song (NULL ids = looked, no match).
+  `CREATE TABLE song_info (
+    video_id TEXT PRIMARY KEY, deezer_id INTEGER, isrc TEXT, rank INTEGER, bpm REAL,
+    release_date TEXT, genre TEXT, album TEXT, itunes_id INTEGER,
+    deezer_score REAL, itunes_score REAL, checked_at INTEGER
+  );
+  CREATE INDEX song_info_isrc ON song_info(isrc);`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -1043,6 +1050,49 @@ export class Catalog {
       matched: n("SELECT COUNT(*) n FROM spotify_tracks WHERE spotify_id IS NOT NULL"),
       artists: n("SELECT COUNT(*) n FROM spotify_artists"),
       artistsFetched: n("SELECT COUNT(*) n FROM spotify_artists WHERE fetched_at IS NOT NULL"),
+    };
+  }
+
+  /** Tracks without Deezer/iTunes info yet: archived + most played first, then the rest. */
+  nextSongInfo(limit) {
+    return this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
+      FROM tracks t
+      LEFT JOIN song_info si ON si.video_id = t.video_id
+      LEFT JOIN songs s ON s.video_id = t.video_id
+      LEFT JOIN (SELECT video_id, COUNT(*) n FROM plays GROUP BY video_id) p ON p.video_id = t.video_id
+      WHERE si.video_id IS NULL AND t.title IS NOT NULL AND t.title != ''
+      ORDER BY (s.status = 'stored') DESC, COALESCE(p.n, 0) DESC, t.first_seen
+      LIMIT ?`).all(limit).map((r) => ({
+      videoId: r.video_id, title: r.title,
+      artist: parse(r.artists_json, [])[0]?.name ?? null, durationS: r.duration_s,
+    }));
+  }
+
+  /** [deezer]/[itunes]: null = looked, nothing found (not looked up again). */
+  saveSongInfo(videoId, { deezer = null, itunes = null } = {}, now = Date.now()) {
+    this.#sql(`INSERT OR REPLACE INTO song_info(video_id, deezer_id, isrc, rank, bpm, release_date,
+      genre, album, itunes_id, deezer_score, itunes_score, checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      videoId, deezer?.deezerId ?? null, deezer?.isrc ?? null, deezer?.rank ?? null, deezer?.bpm ?? null,
+      deezer?.releaseDate ?? itunes?.releaseDate ?? null, itunes?.genre ?? null,
+      deezer?.album ?? itunes?.album ?? null, itunes?.itunesId ?? null,
+      deezer?.score ?? null, itunes?.score ?? null, now);
+  }
+
+  songInfo(videoId) {
+    const r = this.#sql("SELECT * FROM song_info WHERE video_id = ?").get(videoId);
+    if (!r) return null;
+    return {
+      isrc: r.isrc, rank: r.rank, bpm: r.bpm, releaseDate: r.release_date, genre: r.genre,
+      album: r.album, deezerId: r.deezer_id, itunesId: r.itunes_id,
+    };
+  }
+
+  songInfoStats() {
+    const n = (q) => this.#sql(q).get().n;
+    return {
+      checked: n("SELECT COUNT(*) n FROM song_info"),
+      deezer: n("SELECT COUNT(*) n FROM song_info WHERE deezer_id IS NOT NULL"),
+      itunes: n("SELECT COUNT(*) n FROM song_info WHERE itunes_id IS NOT NULL"),
     };
   }
 

@@ -43,6 +43,7 @@ import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
+import { DeezerClient, ItunesClient, SongInfoEnricher } from "./song_info.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -674,6 +675,15 @@ if (catalog) {
     }, (Number(process.env.SPOTIFY_EVERY_S) || 3) * 1000).unref();
   } else {
     console.log("[spotify] off (no SPOTIFY_CLIENT_ID/SECRET)");
+  }
+
+  // Deezer + iTunes info (ISRC, tempo, release date, genre) for catalog songs;
+  // free and keyless, one lookup per tick.
+  if (process.env.SONG_INFO !== "0") {
+    const songInfo = new SongInfoEnricher({ catalog, deezer: new DeezerClient(), itunes: new ItunesClient() });
+    setInterval(() => {
+      songInfo.tick().catch((e) => console.error("[song-info]", e.message));
+    }, (Number(process.env.SONG_INFO_EVERY_S) || 4) * 1000).unref();
   }
 
   // Grow the archive around what friends like: every song of the artists
@@ -4044,6 +4054,22 @@ const server = http.createServer(async (req, res) => {
         console.error("[releases]", e.message);
         sendJson(res, 502, { error: "releases_failed" });
       }
+      return;
+    }
+
+    // --- Deezer/iTunes info of one song (ISRC, tempo, release date, genre).
+    if (req.method === "GET" && url.pathname === "/song/info") {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      sendJson(res, 200, catalog.songInfo(id) || {});
       return;
     }
 

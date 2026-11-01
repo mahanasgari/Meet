@@ -109,6 +109,11 @@ const MIGRATIONS = [
     video_id TEXT PRIMARY KEY, body TEXT, sig TEXT, picked INTEGER NOT NULL DEFAULT 0,
     rejected_json TEXT, updated_at INTEGER NOT NULL
   );`,
+  // v9: artist pages fetched (the artist crawler): when, ok, songs found.
+  `ALTER TABLE artists ADD COLUMN page_at INTEGER;
+  ALTER TABLE artists ADD COLUMN page_ok INTEGER;
+  ALTER TABLE artists ADD COLUMN page_songs INTEGER;
+  CREATE INDEX artists_page ON artists(page_at);`,
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -676,6 +681,59 @@ export class Catalog {
       ON CONFLICT(id) DO UPDATE SET name=COALESCE(excluded.name,name),
         subscribers=COALESCE(excluded.subscribers,subscribers), last_seen=excluded.last_seen`)
       .run(a.id, a.name ?? null, a.subscribers ?? null, now, now);
+  }
+
+  // ---- Artist pages (artist_crawl.js) ----
+
+  /** Artists known since before [cutoff] whose page hasn't been fetched. */
+  nextArtistPages(limit = 1, cutoff = Date.now()) {
+    return this.#sql(`SELECT id FROM artists WHERE page_at IS NULL AND first_seen<=?
+      ORDER BY first_seen, rowid LIMIT ?`).all(cutoff, limit).map((r) => r.id);
+  }
+
+  /** One artist page: its details, songs, albums and similar artists. */
+  saveArtistPage(id, { name = null, subscribers = null, description = null, songs = [], albums = [], related = [] } = {}, now = Date.now()) {
+    this.#tx(() => {
+      this.#upsertArtist({ id, name, subscribers }, now);
+      if (description) this.#sql("UPDATE artists SET description=? WHERE id=?").run(description, id);
+      for (const t of songs) {
+        if (!t?.videoId) continue;
+        this.#upsertTrack(t, now);
+        // The page's own artist, even when the song credits another channel.
+        const at = (t.artists ?? []).findIndex((a) => a?.id === id);
+        this.#sql("INSERT OR IGNORE INTO song_artists(video_id,artist_id,position) VALUES(?,?,?)")
+          .run(t.videoId, id, at >= 0 ? at : 9);
+      }
+      for (const al of albums) {
+        if (!al?.id) continue;
+        this.#sql(`INSERT INTO albums(id,title,kind,year,artist_id) VALUES(?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET title=COALESCE(excluded.title,title), kind=COALESCE(excluded.kind,kind),
+            year=COALESCE(excluded.year,year), artist_id=COALESCE(artist_id,excluded.artist_id)`)
+          .run(al.id, al.title ?? null, al.kind ?? null, al.year ?? null, id);
+      }
+      for (const [i, a] of related.entries()) {
+        if (!a?.id || a.id === id) continue;
+        this.#upsertArtist(a, now);
+        this.#sql("INSERT OR REPLACE INTO artist_related(artist_id,related_id,rank,seen_at) VALUES(?,?,?,?)")
+          .run(id, a.id, a.rank ?? i, now);
+      }
+      this.#sql("UPDATE artists SET page_at=?, page_ok=1, page_songs=? WHERE id=?").run(now, songs.length, id);
+    });
+  }
+
+  markArtistPageFailed(id, now = Date.now()) {
+    this.#sql("UPDATE artists SET page_at=?, page_ok=0 WHERE id=?").run(now, id);
+  }
+
+  artistPageStats(cutoff = Date.now()) {
+    const n = (sql, ...a) => this.#sql(sql).get(...a).n;
+    return {
+      fetched: n("SELECT COUNT(*) n FROM artists WHERE page_ok=1"),
+      failed: n("SELECT COUNT(*) n FROM artists WHERE page_ok=0"),
+      pending: n("SELECT COUNT(*) n FROM artists WHERE page_at IS NULL AND first_seen<=?", cutoff),
+      artists: n("SELECT COUNT(*) n FROM artists"),
+      songs: n("SELECT COUNT(*) n FROM tracks"),
+    };
   }
 
   // Store one crawl result atomically.

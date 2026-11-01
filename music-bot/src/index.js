@@ -41,6 +41,7 @@ import { Recommender } from "./recommend.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
+import { ArtistCrawler } from "./artist_crawl.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
@@ -621,6 +622,27 @@ if (catalog) {
   if (process.env.GRAPH !== "0") {
     setTimeout(() => void graph.tick(), 4 * 60_000).unref();
     setInterval(() => void graph.tick(), (Number(process.env.GRAPH_EVERY_S) || 90) * 1000).unref();
+  }
+
+  // Every artist's YouTube Music page and songs (details only), artists
+  // known when it first started; about 3 days for ~33k artists.
+  if (process.env.ARTIST_CRAWL !== "0") {
+    let cutoff = Number(catalog.db.prepare("SELECT value FROM meta WHERE key='artist_crawl_cutoff'").get()?.value);
+    if (!cutoff) {
+      cutoff = Date.now();
+      catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_crawl_cutoff',?)").run(String(cutoff));
+    }
+    const artistCrawler = new ArtistCrawler({ catalog, transport: graph.transport, cutoff });
+    const every = (Number(process.env.ARTIST_CRAWL_EVERY_S) || 8) * 1000;
+    const timer = setInterval(() => {
+      artistCrawler.tick().then((more) => {
+        if (more) return;
+        clearInterval(timer);
+        const st = catalog.artistPageStats(cutoff);
+        console.log(`[artists] done: ${st.fetched} pages, ${st.failed} failed, ${st.songs} songs known`);
+      }).catch((e) => console.error("[artists]", e.message));
+    }, every);
+    timer.unref();
   }
 
   // Grow the archive around what friends like: every song of the artists

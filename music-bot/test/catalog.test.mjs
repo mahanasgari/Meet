@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "8");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "9");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "8");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "9");
   c.close();
 });
 
@@ -436,6 +436,8 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   // Roll the schema back to v3 by dropping the v4 additions.
   const db = new DatabaseSync(file);
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
+  // ...and the later v9 artist-page columns, which a v3 DB never had.
+  db.exec("DROP INDEX artists_page; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
   db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
   db.close();
   const c = new Catalog(file);

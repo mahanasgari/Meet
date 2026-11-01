@@ -193,6 +193,8 @@ const JOB_ORDER = ["play", "retry", "next", "interest", "prefetch", "crawl"];
 const JOB_PRIORITY = `CASE reason ${JOB_ORDER.map((r, i) => `WHEN '${r}' THEN ${i >= 1 ? i - 1 : 0}`).join(" ")} ELSE 9 END`;
 const jobPriority = (reason) => Math.max(0, JOB_ORDER.indexOf(reason) - 1);
 
+const OTHER_VERSION_RE = /\b(live|unplugged|acoustic|remix|cover|karaoke|teaser|trailer|behind the scenes)\b|لایو|آنپلاگد|ریمیکس|کاور|تیزر/i;
+
 export class Catalog {
   constructor(file) {
     mkdirSync(dirname(file), { recursive: true });
@@ -607,9 +609,12 @@ export class Catalog {
     this.#tx(() => {
       for (const v of videos) {
         const want = splitUploadTitle(v.title, name).title;
+        // A live / unplugged / remix video isn't the studio song's video.
+        const version = OTHER_VERSION_RE.test(v.title);
         let best = null;
         let bestScore = 0.85;
         for (const s of songs) {
+          if (version && !OTHER_VERSION_RE.test(s.title || "")) continue;
           const sc = similarity(s.title, want);
           if (sc >= bestScore) [best, bestScore] = [s, sc];
         }

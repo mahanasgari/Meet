@@ -106,7 +106,7 @@ test("crawler pauses when YouTube Music pushes back, without marking the artist 
 test("official videos from an artist page become video matches, never overriding", () => {
   const catalog = new Catalog(join(mkdtempSync(join(tmpdir(), "ac-")), "c.db"));
   const song = (videoId, title) => ({ videoId, title, artists: [{ id: A, name: "Reza Pishro" }] });
-  catalog.saveArtistPage(A, { name: "Reza Pishro", songs: [song("aaaaaaaaaa1", "Bazam Kalan"), song("aaaaaaaaaa2", "Khoda"), song("aaaaaaaaaa3", "Rejected Song"), song("aaaaaaaaaa4", "Kept Song")] }, 1000);
+  catalog.saveArtistPage(A, { name: "Reza Pishro", songs: [song("aaaaaaaaaa1", "Bazam Kalan"), song("aaaaaaaaaa2", "Khoda"), song("aaaaaaaaaa3", "Rejected Song"), song("aaaaaaaaaa4", "Kept Song"), song("aaaaaaaaaa5", "Paye Sabeti")] }, 1000);
   catalog.videoMapReject("aaaaaaaaaa3", 1000);
   catalog.videoMapReject("aaaaaaaaaa3", 1000); // idempotent
   catalog.db.prepare("UPDATE video_map SET rejected_json=? WHERE video_id=?").run('["vvvvvvvvvv3"]', "aaaaaaaaaa3");
@@ -116,12 +116,14 @@ test("official videos from an artist page become video matches, never overriding
     { videoId: "vvvvvvvvvv9", title: "Reza Pishro - Something Else (Official Video)" },
     { videoId: "vvvvvvvvvv3", title: "Reza Pishro - Rejected Song (Official Video)" },
     { videoId: "vvvvvvvvvv4", title: "Reza Pishro - Kept Song (Official Video)" },
+    { videoId: "vvvvvvvvvv5", title: "Paye Sabeti Unplugged (Official Video)" },
   ], 9000);
   assert.equal(n, 1);
   assert.equal(catalog.videoMapGet("aaaaaaaaaa1").srcId, "vvvvvvvvvv1");
   assert.equal(catalog.videoMapGet("aaaaaaaaaa2"), null);
   assert.equal(catalog.videoMapGet("aaaaaaaaaa3").srcId, null);
   assert.equal(catalog.videoMapGet("aaaaaaaaaa4").srcId, "oldoldold01");
+  assert.equal(catalog.videoMapGet("aaaaaaaaaa5"), null, "an unplugged video isn't the studio song's");
 });
 
 test("nextVideoMatches: stored YouTube Music songs without a match, most played first", () => {

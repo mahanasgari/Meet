@@ -199,8 +199,12 @@ const MIGRATIONS = [
   // v19: the dashboard's "failed downloads" list walked all ~834k jobs.
   `CREATE INDEX IF NOT EXISTS jobs_problems ON jobs(updated_at) WHERE state='failed' OR (state='queued' AND attempts>0);`,
   // v20: the artist crawl's next pick sorted every not-yet-fetched artist.
-  `CREATE INDEX IF NOT EXISTS artists_page_todo ON artists(first_seen) WHERE page_at IS NULL;`
+  `CREATE INDEX IF NOT EXISTS artists_page_todo ON artists(first_seen) WHERE page_at IS NULL;`,
+  // v21: /mood/songs filters song_analysis by one mood probability (partial = only usable rows).
+  ["happy", "sad", "relaxed", "aggressive", "party", "danceability", "energy"].map((c) =>
+    `CREATE INDEX IF NOT EXISTS song_analysis_${c} ON song_analysis(${c}) WHERE analyzed_at IS NOT NULL AND error IS NULL;`).join("\n  ")
 ];
+export const MOOD_COLUMNS = { happy: "happy", sad: "sad", relaxed: "relaxed", aggressive: "aggressive", party: "party", dance: "danceability", energy: "energy" };
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
 const CTX_RE = /^[a-z_]{1,20}$/;
@@ -1829,6 +1833,30 @@ export class Catalog {
           archived: s?.status === "stored", plays: s?.plays ?? 0, listeners: L.get(id)?.listeners ?? 0,
         });
       }
+    }
+    return out;
+  }
+
+  /**
+   * Candidates for a mood shelf: analyzed songs whose probability for [mood] is at least [min],
+   * best first (probability, then archived, then plays). Returns up to [n] cards. Uses the partial
+   * index of that column; only the rows above the threshold are read.
+   */
+  moodSongs(mood, n, min = 0.55) {
+    const col = MOOD_COLUMNS[mood];
+    if (!col) return [];
+    // Best 50x candidates by probability straight off the index, then joined to songs by primary key.
+    const rows = this.#sql(`SELECT a.video_id id, a.p p, s.status status, s.plays plays FROM
+      (SELECT video_id, ${col} p FROM song_analysis WHERE ${col} >= ? AND analyzed_at IS NOT NULL AND error IS NULL
+        ORDER BY ${col} DESC LIMIT ?) a LEFT JOIN songs s ON s.video_id = a.video_id`).all(min, Math.max(500, n * 50));
+    const score = (r) => r.p + (r.status === "stored" ? 0.15 : 0) + Math.min(0.2, Math.log10(1 + (r.plays ?? 0)) * 0.07);
+    rows.sort((x, y) => score(y) - score(x));
+    const cards = this.songCards(rows.slice(0, n * 2).map((r) => r.id));
+    const out = [];
+    for (const r of rows.slice(0, n * 2)) {
+      const c = cards.get(r.id);
+      if (c?.title) out.push(c);
+      if (out.length >= n) break;
     }
     return out;
   }

@@ -50,6 +50,7 @@ import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
 import { DiscogsClient, DiscogsEnricher } from "./discogs.js";
 import { SongLinks as ExtSongLinks, OdesliBusy } from "./odesli.js";
 import { smartSearch } from "./smart_search.js";
+import { moodShelf, isMood } from "./mood_songs.js";
 import { handleAnalysis } from "./analysis_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
@@ -4340,6 +4341,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, smartSearch(catalog, url.searchParams.get("q") || "", Number(url.searchParams.get("limit")) || 30));
+      return;
+    }
+
+    // --- Mood shelf: analyzed songs that fit a mood, reshuffled daily.
+    if (req.method === "GET" && url.pathname === "/mood/songs") {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const mood = String(url.searchParams.get("mood") || "");
+      if (!isMood(mood)) {
+        sendJson(res, 400, { error: "invalid_mood" });
+        return;
+      }
+      const seed = url.searchParams.get("seed");
+      sendJson(res, 200, moodShelf(catalog, mood, Number(url.searchParams.get("limit")) || 40, seed == null || seed === "" ? undefined : Number(seed)));
       return;
     }
 

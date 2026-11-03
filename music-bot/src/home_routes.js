@@ -13,7 +13,7 @@ const HOME_ONLY = [
   /^\/artists\/search$/,
   /^\/search\/smart$/,
   /^\/song\/links$/,
-  /^\/mood\/songs$/,
+  /^\/mood\/(songs|vote)$/,
   /^\/share\/song$/,
   /^\/s\/[A-Za-z2-9]{8}(\/(audio|cover))?$/, // song links only
   /^\/recommend(\/|$)/,

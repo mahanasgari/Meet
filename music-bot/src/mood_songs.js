@@ -1,10 +1,10 @@
 // Mood shelves: ranking lives in Catalog.moodSongs; here the daily deterministic shuffle and a 30 min cache.
-import { MOOD_COLUMNS } from "./catalog.js";
+import { MOOD_FELT } from "./mood_model.js";
 
 const TTL_MS = 30 * 60_000;
 const cache = new Map();
 
-export const isMood = (m) => Object.hasOwn(MOOD_COLUMNS, m);
+export const isMood = (m) => Object.hasOwn(MOOD_FELT, m);
 
 /** Day number since the epoch: the default seed, so the shelf changes daily. */
 export const dayNumber = (now = Date.now()) => Math.floor(now / 86_400_000);

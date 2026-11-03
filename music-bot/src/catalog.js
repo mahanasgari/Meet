@@ -5,7 +5,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { similarity, splitUploadTitle } from "./song_meta.js";
 import { dirname } from "node:path";
-import { normSearch, cleanTag, MOODS } from "./search_text.js";
+import { normSearch, cleanTag } from "./search_text.js";
+import { MoodModel, MOOD_FELT, FELT_TAG } from "./mood_model.js";
 
 const MIN = 6e4;
 const HOUR = 36e5;
@@ -202,7 +203,10 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS artists_page_todo ON artists(first_seen) WHERE page_at IS NULL;`,
   // v21: /mood/songs filters song_analysis by one mood probability (partial = only usable rows).
   ["happy", "sad", "relaxed", "aggressive", "party", "danceability", "energy"].map((c) =>
-    `CREATE INDEX IF NOT EXISTS song_analysis_${c} ON song_analysis(${c}) WHERE analyzed_at IS NOT NULL AND error IS NULL;`).join("\n  ")
+    `CREATE INDEX IF NOT EXISTS song_analysis_${c} ON song_analysis(${c}) WHERE analyzed_at IS NOT NULL AND error IS NULL;`).join("\n  "),
+  // v22: listeners' own answer to "how does this song feel" (one per user and song).
+  `CREATE TABLE mood_votes (video_id TEXT NOT NULL, uid TEXT NOT NULL, mood TEXT NOT NULL, at INTEGER, PRIMARY KEY (video_id, uid));
+  CREATE INDEX mood_votes_video ON mood_votes(video_id);`
 ];
 export const MOOD_COLUMNS = { happy: "happy", sad: "sad", relaxed: "relaxed", aggressive: "aggressive", party: "party", dance: "danceability", energy: "energy" };
 const VIDEO_LEASE_MS = 10 * MIN;
@@ -1585,7 +1589,8 @@ export class Catalog {
         electronic=excluded.electronic, instrumental=excluded.instrumental, valence=excluded.valence,
         arousal=excluded.arousal, genres_json=excluded.genres_json, model=excluded.model, server=excluded.server,
         analyzed_at=excluded.analyzed_at, lease_until=NULL, error=NULL`).run(videoId, ...row);
-    this.#analysisTags(videoId, genres, { happy: p("happy"), sad: p("sad"), relaxed: p("relaxed"), aggressive: p("aggressive"), party: p("party") });
+    this.mood.invalidate(videoId);
+    this.#analysisTags(videoId, genres);
     });
   }
 
@@ -1640,14 +1645,82 @@ export class Catalog {
     this.#setTags(videoId, "lastfm", tags.map((tag, i) => ({ tag, weight: n > 1 ? 1 - (0.7 * i) / (n - 1) : 1 })));
   }
 
-  #analysisTags(videoId, genres, moods) {
+  #analysisTags(videoId, genres) {
     // Essentia genres read "Hip Hop---Trap": tag both the family and the style.
     const tags = (genres ?? []).flatMap((g) =>
       String(g?.name ?? "").split("---").map((t) => t.trim()).filter(Boolean).map((tag) => ({ tag, weight: g.p })));
     this.#setTags(videoId, "analysis", tags);
-    let best = null;
-    for (const m of MOODS) if ((moods?.[m] ?? 0) >= 0.6 && (!best || moods[m] > moods[best])) best = m;
-    this.#setTags(videoId, "mood", best ? [{ tag: best, weight: moods[best] }] : []);
+    // The mood tag is the felt label (title, tags, lyrics, votes and the catalog's own percentiles).
+    const f = this.mood.feltFor(videoId);
+    this.#setTags(videoId, "mood", f && f.label !== "mixed" ? [{ tag: FELT_TAG[f.label], weight: f[f.label] }] : []);
+  }
+
+  // ------------------------------------------------------------ felt mood
+
+  get mood() { return (this.#moodModel ??= new MoodModel({ catalog: this })); }
+  #moodModel = null;
+
+  /** Raw numbers of every analyzed song (calibration and candidate lists). */
+  analysisMoodRows(cap = 10_000) {
+    // Above [cap] rows only every stride-th rowid is read, so the pass stays bounded (a sample is plenty for percentiles).
+    const stride = Math.max(1, Math.ceil((this.#sql("SELECT MAX(rowid) m FROM song_analysis").get().m ?? 0) / cap));
+    return this.#sql(`SELECT video_id id, sad, happy, relaxed, aggressive, party, danceability, energy, valence, arousal, scale
+      FROM song_analysis WHERE analyzed_at IS NOT NULL AND error IS NULL AND rowid % ? = 0`.replace("rowid % ? = 0", stride > 1 ? "rowid % ? = 0" : "? > 0")).all(stride);
+  }
+
+  /** What the felt model reads about one song; null without analysis. */
+  moodInputs(videoId) {
+    const row = this.#sql(`SELECT video_id id, sad, happy, relaxed, aggressive, party, danceability, energy, valence, arousal, scale
+      FROM song_analysis WHERE video_id=? AND analyzed_at IS NOT NULL AND error IS NULL`).get(videoId);
+    if (!row) return null;
+    const s = this.#sql("SELECT title FROM songs WHERE video_id=?").get(videoId) ?? this.#sql("SELECT title FROM tracks WHERE video_id=?").get(videoId);
+    const tags = this.#sql("SELECT tag, weight, src FROM song_tags WHERE video_id=? LIMIT 50").all(videoId);
+    const l = this.#sql("SELECT body FROM lyrics WHERE video_id=? AND body IS NOT NULL").get(videoId);
+    let lyrics = null;
+    if (l) {
+      const lines = parse(l.body, {})?.lines;
+      if (Array.isArray(lines)) lyrics = lines.map((x) => String(x?.x ?? x?.text ?? "")).join("\n");
+    }
+    return { row, title: s?.title ?? "", tags, lyrics };
+  }
+
+  /** {counts, mine} of the votes on a song; [uid] = the asker. */
+  moodVotes(videoId, uid = null) {
+    const counts = {};
+    let mine = null;
+    for (const r of this.#sql("SELECT uid, mood FROM mood_votes WHERE video_id=?").all(videoId)) {
+      counts[r.mood] = (counts[r.mood] ?? 0) + 1;
+      if (uid && r.uid === uid) mine = r.mood;
+    }
+    return Object.keys(counts).length ? { counts, mine } : null;
+  }
+
+  /** One vote per user and song (a new one replaces the old). */
+  voteMood(videoId, uid, mood, now = Date.now()) {
+    if (!["sad", "happy", "chill", "energetic", "dance"].includes(mood) || !uid) throw new Error("invalid_vote");
+    this.#sql(`INSERT INTO mood_votes(video_id, uid, mood, at) VALUES(?,?,?,?)
+      ON CONFLICT(video_id, uid) DO UPDATE SET mood=excluded.mood, at=excluded.at`).run(videoId, String(uid), mood, now);
+    this.mood.invalidate(videoId);
+    if (this.analysisInfo(videoId)) this.#tx(() => this.#analysisTags(videoId, parse(this.#sql("SELECT genres_json FROM song_analysis WHERE video_id=?").get(videoId)?.genres_json, [])));
+  }
+
+  /** One slice of the one-off re-tag of analyzed songs with the felt label: { done, n }. */
+  retagMoods(limit = 500) {
+    const key = "mood_retag_v1";
+    const st = parse(this.#sql("SELECT value FROM meta WHERE key=?").get(key)?.value, { a: 0, d: false });
+    if (st.d) return { done: true, n: 0 };
+    let n = 0;
+    this.#tx(() => {
+      const maxA = this.#sql("SELECT MAX(rowid) m FROM song_analysis").get().m ?? 0;
+      if (st.a < maxA) {
+        const rows = this.#sql(`SELECT video_id, genres_json FROM song_analysis
+          WHERE rowid > ? AND rowid <= ? AND analyzed_at IS NOT NULL AND error IS NULL`).all(st.a, st.a + limit);
+        for (const r of rows) { this.#analysisTags(r.video_id, parse(r.genres_json, [])); n++; }
+        st.a += limit;
+      } else st.d = true;
+      this.#sql("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)").run(key, JSON.stringify(st));
+    });
+    return { done: st.d, n };
   }
 
   tagsOf(videoId) {
@@ -1692,7 +1765,7 @@ export class Catalog {
         if (st.a < maxA) {
           const rows = this.#sql(`SELECT video_id, genres_json, happy, sad, relaxed, aggressive, party FROM song_analysis
             WHERE rowid > ? AND rowid <= ? AND analyzed_at IS NOT NULL AND error IS NULL`).all(st.a, st.a + limit);
-          for (const r of rows) { this.#analysisTags(r.video_id, parse(r.genres_json, []), r); n++; }
+          for (const r of rows) { this.#analysisTags(r.video_id, parse(r.genres_json, [])); n++; }
           st.a += limit;
         } else st.d = true;
       }
@@ -1838,17 +1911,21 @@ export class Catalog {
   }
 
   /**
-   * Candidates for a mood shelf: analyzed songs whose probability for [mood] is at least [min],
-   * best first (probability, then archived, then plays). Returns up to [n] cards. Uses the partial
-   * index of that column; only the rows above the threshold are read.
+   * Candidates for a mood shelf: analyzed songs whose FELT score for [mood] is at least [min], best first
+   * (score, then archived, then plays). Candidate lists come from the model's calibration pass (in memory);
+   * only the best few hundred are re-scored with title, tags, lyrics and votes.
    */
   moodSongs(mood, n, min = 0.55) {
-    const col = MOOD_COLUMNS[mood];
-    if (!col) return [];
-    // Best 50x candidates by probability straight off the index, then joined to songs by primary key.
-    const rows = this.#sql(`SELECT a.video_id id, a.p p, s.status status, s.plays plays FROM
-      (SELECT video_id, ${col} p FROM song_analysis WHERE ${col} >= ? AND analyzed_at IS NOT NULL AND error IS NULL
-        ORDER BY ${col} DESC LIMIT ?) a LEFT JOIN songs s ON s.video_id = a.video_id`).all(min, Math.max(500, n * 50));
+    const felt = MOOD_FELT[mood];
+    if (!felt) return [];
+    const top = this.mood.candidates(felt).slice(0, Math.max(200, n * 4));
+    const rows = [];
+    for (const c of top) {
+      const f = this.mood.feltFor(c.id);
+      if (!f || f[felt] < min) continue;
+      const s = this.#sql("SELECT status, plays FROM songs WHERE video_id=?").get(c.id);
+      rows.push({ id: c.id, p: f[felt], status: s?.status, plays: s?.plays });
+    }
     const score = (r) => r.p + (r.status === "stored" ? 0.15 : 0) + Math.min(0.2, Math.log10(1 + (r.plays ?? 0)) * 0.07);
     rows.sort((x, y) => score(y) - score(x));
     const cards = this.songCards(rows.slice(0, n * 2).map((r) => r.id));

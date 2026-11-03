@@ -51,6 +51,7 @@ import { DiscogsClient, DiscogsEnricher } from "./discogs.js";
 import { SongLinks as ExtSongLinks, OdesliBusy } from "./odesli.js";
 import { smartSearch } from "./smart_search.js";
 import { moodShelf, isMood } from "./mood_songs.js";
+import { FELT_MOODS, labelName } from "./mood_model.js";
 import { handleAnalysis } from "./analysis_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
@@ -771,6 +772,7 @@ if (catalog) {
       setTimeout(step, everyMs).unref();
     };
     batch("song-tags-backfill", (n) => catalog.backfillSongTags(n), 1000, 2000);
+    batch("mood-retag", (n) => catalog.retagMoods(n), 500, 2000);
     batch("search-fts", (n) => catalog.ftsFill(n), 2000, 2000);
   }
 
@@ -4318,6 +4320,10 @@ const server = http.createServer(async (req, res) => {
       const info = catalog.songInfo(id) || {};
       const lastfm = catalog.lastfmInfo(id);
       const analysis = catalog.analysisInfo(id);
+      if (analysis) {
+        const f = catalog.mood.feltFor(id, { uid: req.mpUser || (isMasterToken(req) ? ownerUid() : null) });
+        if (f) analysis.felt = { ...f, label: labelName(f.label) };
+      }
       sendJson(res, 200, { ...info, ...(lastfm ? { lastfm } : {}), ...catalog.mbInfo(id), ...(analysis ? { analysis } : {}) });
       return;
     }
@@ -4358,6 +4364,36 @@ const server = http.createServer(async (req, res) => {
       }
       const seed = url.searchParams.get("seed");
       sendJson(res, 200, moodShelf(catalog, mood, Number(url.searchParams.get("limit")) || 40, seed == null || seed === "" ? undefined : Number(seed)));
+      return;
+    }
+
+    // --- "Feels like": one listener's answer; returns the song's new felt mood.
+    if (req.method === "POST" && url.pathname === "/mood/vote") {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const uid = req.mpUser || (isMasterToken(req) ? ownerUid() : null);
+      if (!uid) {
+        sendJson(res, 403, { error: "no_identity" });
+        return;
+      }
+      let body;
+      try { body = await readBody(req); } catch { body = null; }
+      const id = String(body?.videoId || "").replace(/^yt_/, "");
+      const mood = String(body?.mood || "");
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id) || !FELT_MOODS.includes(mood)) {
+        sendJson(res, 400, { error: "invalid_vote" });
+        return;
+      }
+      if (!catalog.analysisInfo(id)) {
+        sendJson(res, 404, { error: "not_analyzed" });
+        return;
+      }
+      catalog.voteMood(id, uid, mood);
+      const f = catalog.mood.feltFor(id, { uid });
+      sendJson(res, 200, { felt: { ...f, label: labelName(f.label) } });
       return;
     }
 

@@ -191,7 +191,11 @@ const MIGRATIONS = [
   CREATE TABLE song_tags (tag TEXT NOT NULL, video_id TEXT NOT NULL, weight REAL, src TEXT,
     PRIMARY KEY (tag, video_id));
   CREATE INDEX song_tags_video ON song_tags(video_id);
-  CREATE INDEX song_tags_tag_w ON song_tags(tag, weight DESC);`
+  CREATE INDEX song_tags_tag_w ON song_tags(tag, weight DESC);`,
+  // v18: the recommender looks up songs by artist name and plays by listener;
+  // without these each lookup read all ~840k songs (up to 30 s, server frozen).
+  `CREATE INDEX IF NOT EXISTS songs_artist ON songs(artist);
+  CREATE INDEX IF NOT EXISTS plays_uid ON plays(uid, at);`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;

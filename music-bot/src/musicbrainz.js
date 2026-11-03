@@ -184,11 +184,15 @@ export class MusicBrainzEnricher {
     this.catalog = catalog; this.mb = mb; this.lb = lb; this.log = log; this.now = now;
   }
 
+  #strikes = 0;
+
+  /** Rate limited: back off 30 s, doubling per strike in a row, up to 15 min. */
   #rate(e, undo) {
     if (!/rate/i.test(e.message)) return false;
-    this.#pauseUntil = this.now() + PAUSE_MS;
+    const ms = Math.min(PAUSE_MS, 30_000 * 2 ** this.#strikes++);
+    this.#pauseUntil = this.now() + ms;
     undo?.();
-    this.log.error?.("[musicbrainz] rate limited, pausing 15 min");
+    this.log.error?.(`[musicbrainz] rate limited, pausing ${Math.round(ms / 1000)} s`);
     return true;
   }
 
@@ -267,6 +271,7 @@ export class MusicBrainzEnricher {
       delete rec.artist; delete rec.artistId; delete rec.lbSimilar; delete rec.lbArtistSimilar;
     }
     this.catalog.saveMusicBrainz(rec, this.now());
+    this.#strikes = 0;
     this.#n++;
     if (rec.recording?.mbid) this.#found++;
     if (this.#n % 500 === 0) this.log.log?.(`[musicbrainz] ${this.#n} checked, ${this.#found} found`);

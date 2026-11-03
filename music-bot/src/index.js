@@ -46,6 +46,9 @@ import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { AccountStore } from "./accounts.js";
 import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
+import { DiscogsClient, DiscogsEnricher } from "./discogs.js";
+import { SongLinks as ExtSongLinks, OdesliBusy } from "./odesli.js";
+import { smartSearch } from "./smart_search.js";
 import { handleAnalysis } from "./analysis_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
@@ -511,6 +514,7 @@ const ARCHIVE_ON =
   process.env.ARCHIVE !== "0" &&
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_STORE_BOT_TOKEN && process.env.TG_STORE_CHANNEL);
 const catalog = ARCHIVE_ON && !HOME_URL ? new Catalog(joinPath(SHARES, "catalog", "catalog.db")) : null;
+const extLinks = catalog ? new ExtSongLinks({ catalog }) : null;
 const errorReports = catalog ? new ReportStore({ file: joinPath(SHARES, "reports.jsonl") }) : null;
 /** Healthy music servers for peer hand-offs, best first (home only). */
 function healthyPeers() {
@@ -713,6 +717,33 @@ if (catalog) {
     setInterval(() => {
       mbz.tick().catch((e) => console.error("[musicbrainz]", e.message));
     }, (Number(process.env.MUSICBRAINZ_EVERY_S) || 3) * 1000).unref();
+  }
+
+  // Discogs: release year, genres, styles (needs DISCOGS_TOKEN). One request per 1.1 s.
+  if (process.env.DISCOGS_TOKEN) {
+    console.log("[discogs] on");
+    const discogs = new DiscogsEnricher({ catalog, client: new DiscogsClient({ token: process.env.DISCOGS_TOKEN }) });
+    setInterval(() => {
+      discogs.tick().catch((e) => console.error("[discogs]", e.message));
+    }, (Number(process.env.DISCOGS_EVERY_S) || 3) * 1000).unref();
+  } else {
+    console.log("[discogs] off (no DISCOGS_TOKEN)");
+  }
+
+  // Background copies into the search tables, small batches (2000 / 1000 rows) so the loop never stalls:
+  // song_tags from old Last.fm / analysis rows, and the smart-search text index over tracks.
+  {
+    const batch = (name, fn, everyMs) => {
+      const t = setInterval(() => {
+        try {
+          const r = fn();
+          if (r.done) { clearInterval(t); console.log(`[${name}] done`); }
+        } catch (e) { console.error(`[${name}]`, e.message); }
+      }, everyMs);
+      t.unref();
+    };
+    batch("song-tags-backfill", () => catalog.backfillSongTags(1000), 2000);
+    batch("search-fts", () => catalog.ftsFill(2000), 2000);
   }
 
   // Grow the archive around what friends like: every song of the artists
@@ -4255,6 +4286,41 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, catalog.artistsByAlias(String(url.searchParams.get("q") || "").slice(0, 100)));
+      return;
+    }
+
+    // --- Smart search: songs by text/tag/mood, artists by name or alias.
+    if (req.method === "GET" && url.pathname === "/search/smart") {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      sendJson(res, 200, smartSearch(catalog, url.searchParams.get("q") || "", Number(url.searchParams.get("limit")) || 30));
+      return;
+    }
+
+    // --- Links to the same song on other platforms (Odesli, cached 30 days).
+    if (req.method === "GET" && url.pathname === "/song/links") {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!extLinks) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      try {
+        sendJson(res, 200, await extLinks.get(id));
+      } catch (e) {
+        if (e instanceof OdesliBusy) sendJson(res, 503, { busy: true });
+        else {
+          console.error("[odesli]", id, e.message);
+          sendJson(res, 502, { error: "links_failed" });
+        }
+      }
       return;
     }
 

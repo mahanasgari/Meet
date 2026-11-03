@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { similarity, splitUploadTitle } from "./song_meta.js";
 import { dirname } from "node:path";
+import { normSearch, cleanTag, MOODS } from "./search_text.js";
 
 const MIN = 6e4;
 const HOUR = 36e5;
@@ -180,7 +181,17 @@ const MIGRATIONS = [
     loudness REAL, energy REAL, danceability REAL, happy REAL, sad REAL, relaxed REAL, aggressive REAL, party REAL,
     acoustic REAL, electronic REAL, instrumental REAL, valence REAL, arousal REAL, genres_json TEXT,
     model TEXT, server TEXT, lease_until INTEGER, analyzed_at INTEGER, error TEXT);
-  CREATE INDEX song_analysis_lease ON song_analysis(lease_until) WHERE analyzed_at IS NULL;`
+  CREATE INDEX song_analysis_lease ON song_analysis(lease_until) WHERE analyzed_at IS NULL;`,
+  // v17: Discogs, Odesli links, tags per song. Empty tables only (no backfill here: background tickers fill them).
+  // search_fts is created outside the migrations (see #initFts) because its tokenizer depends on the SQLite build.
+  `CREATE TABLE discogs_releases (video_id TEXT PRIMARY KEY, release_id INTEGER, master_id INTEGER, year INTEGER,
+    genres_json TEXT, styles_json TEXT, country TEXT, label TEXT, checked_at INTEGER);
+  CREATE TABLE discogs_artists (artist_id TEXT PRIMARY KEY, discogs_id INTEGER, profile TEXT, checked_at INTEGER);
+  CREATE TABLE song_links_ext (video_id TEXT PRIMARY KEY, page_url TEXT, links_json TEXT, fetched_at INTEGER);
+  CREATE TABLE song_tags (tag TEXT NOT NULL, video_id TEXT NOT NULL, weight REAL, src TEXT,
+    PRIMARY KEY (tag, video_id));
+  CREATE INDEX song_tags_video ON song_tags(video_id);
+  CREATE INDEX song_tags_tag_w ON song_tags(tag, weight DESC);`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -244,11 +255,33 @@ const jobPriority = (reason) => Math.max(0, JOB_ORDER.indexOf(reason) - 1);
 const OTHER_VERSION_RE = /\b(live|unplugged|acoustic|remix|cover|karaoke|teaser|trailer|behind the scenes)\b|لایو|آنپلاگد|ریمیکس|کاور|تیزر/i;
 
 export class Catalog {
-  constructor(file) {
+  /** ftsTokenizer: override (tests) e.g. "unicode61 remove_diacritics 2" to force the fallback. */
+  constructor(file, { ftsTokenizer } = {}) {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.#migrate();
+    this.#initFts(ftsTokenizer);
+  }
+
+  /** "trigram", "unicode61" or null (no fts5). Chosen at runtime, remembered by the table's own SQL. */
+  ftsMode = null;
+  #ftsDone = false;
+
+  #initFts(want) {
+    const db = this.db;
+    const exists = db.prepare("SELECT sql FROM sqlite_master WHERE name='search_fts'").get();
+    const mode = (sql) => (/trigram/i.test(sql) ? "trigram" : "unicode61");
+    if (exists) { this.ftsMode = mode(exists.sql); return; }
+    const tries = want ? [want] : ["trigram", "unicode61 remove_diacritics 2"];
+    if (!want || want === "trigram") tries.push("unicode61 remove_diacritics 2");
+    for (const tok of tries) {
+      try {
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(video_id UNINDEXED, title, artists, tokenize='${tok}')`);
+        this.ftsMode = mode(tok);
+        return;
+      } catch { /* try the next tokenizer */ }
+    }
   }
 
   #migrate() {
@@ -786,6 +819,7 @@ export class Catalog {
   }
 
   #upsertTrack(t, now) {
+    const old = this.ftsMode ? this.#sql("SELECT title, artists_json FROM tracks WHERE video_id=?").get(t.videoId) : null;
     this.#sql(`INSERT INTO tracks(video_id,title,artists_json,album,album_id,year,duration_s,first_seen,last_seen)
       VALUES(?,?,?,?,?,?,?,?,?)
       ON CONFLICT(video_id) DO UPDATE SET title=COALESCE(excluded.title,title),
@@ -794,6 +828,10 @@ export class Catalog {
         duration_s=COALESCE(excluded.duration_s,duration_s), last_seen=excluded.last_seen`)
       .run(t.videoId, t.title ?? null, t.artists?.length ? json(t.artists) : null, t.album?.name ?? null,
         t.album?.id ?? null, t.year ?? null, t.durationS ?? null, now, now);
+    if (this.ftsMode) {
+      const r = this.#sql("SELECT rowid r, title, artists_json FROM tracks WHERE video_id=?").get(t.videoId);
+      if (r && (!old || old.title !== r.title || old.artists_json !== r.artists_json)) this.#ftsPut(r.r, t.videoId, r.title, r.artists_json);
+    }
     for (const [i, a] of (t.artists ?? []).entries()) {
       if (!a?.id) continue;
       this.#upsertArtist(a, now);
@@ -1253,6 +1291,7 @@ export class Catalog {
       this.#sql(`INSERT OR REPLACE INTO lastfm_tracks(video_id,mbid,listeners,playcount,tags_json,lf_artist,lf_title,checked_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(videoId, track?.mbid ?? null, track?.listeners ?? null, track?.playcount ?? null,
         track ? json(track.tags ?? []) : null, track?.artist ?? null, track?.title ?? null, now);
+      if (track?.tags?.length) this.#lastfmTags(videoId, track.tags);
       this.#sql("DELETE FROM lastfm_similar WHERE video_id=?").run(videoId);
       this.#sql("DELETE FROM lastfm_similar_names WHERE video_id=?").run(videoId);
       for (const s of similar) this.#sql("INSERT OR REPLACE INTO lastfm_similar(video_id,similar_id,match) VALUES(?,?,?)").run(videoId, s.id, s.match);
@@ -1481,6 +1520,7 @@ export class Catalog {
       p("aggressive"), p("party"), p("acoustic"), p("electronic"), p("instrumental"), p("valence"), p("arousal"),
       genres ? JSON.stringify(genres) : null, r.model == null ? null : String(r.model).slice(0, 80),
       String(server || "?").slice(0, 40), now];
+    this.#tx(() => {
     this.#sql(`INSERT INTO song_analysis(video_id, bpm, key, scale, key_strength, loudness, energy, danceability, happy,
       sad, relaxed, aggressive, party, acoustic, electronic, instrumental, valence, arousal, genres_json, model, server,
       analyzed_at, lease_until, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
@@ -1491,6 +1531,8 @@ export class Catalog {
         electronic=excluded.electronic, instrumental=excluded.instrumental, valence=excluded.valence,
         arousal=excluded.arousal, genres_json=excluded.genres_json, model=excluded.model, server=excluded.server,
         analyzed_at=excluded.analyzed_at, lease_until=NULL, error=NULL`).run(videoId, ...row);
+    this.#analysisTags(videoId, genres, { happy: p("happy"), sad: p("sad"), relaxed: p("relaxed"), aggressive: p("aggressive"), party: p("party") });
+    });
   }
 
   /** The song could not be analyzed: marked done so it is not offered again. */
@@ -1520,6 +1562,230 @@ export class Catalog {
       failed: n("SELECT COUNT(*) n FROM song_analysis WHERE error IS NOT NULL"),
       leased: n("SELECT COUNT(*) n FROM song_analysis WHERE analyzed_at IS NULL AND lease_until >= ?", now),
     };
+  }
+
+  // ------------------------------------------------------------ tags per song (song_tags)
+
+  /** Replace what [src] said about a song; tags already given by another source keep the higher weight. */
+  #setTags(videoId, src, list) {
+    this.#sql("DELETE FROM song_tags WHERE video_id=? AND src=?").run(videoId, src);
+    const ins = this.#sql(`INSERT INTO song_tags(tag,video_id,weight,src) VALUES(?,?,?,?)
+      ON CONFLICT(tag,video_id) DO UPDATE SET weight=MAX(COALESCE(weight,0),COALESCE(excluded.weight,0))`);
+    const seen = new Set();
+    for (const { tag, weight } of list) {
+      const t = cleanTag(tag);
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      ins.run(t, videoId, weight, src);
+    }
+  }
+
+  /** Last.fm tags in order: weight 1 for the first down to 0.3 for the last. */
+  #lastfmTags(videoId, tags) {
+    const n = tags.length;
+    this.#setTags(videoId, "lastfm", tags.map((tag, i) => ({ tag, weight: n > 1 ? 1 - (0.7 * i) / (n - 1) : 1 })));
+  }
+
+  #analysisTags(videoId, genres, moods) {
+    // Essentia genres read "Hip Hop---Trap": tag both the family and the style.
+    const tags = (genres ?? []).flatMap((g) =>
+      String(g?.name ?? "").split("---").map((t) => t.trim()).filter(Boolean).map((tag) => ({ tag, weight: g.p })));
+    this.#setTags(videoId, "analysis", tags);
+    let best = null;
+    for (const m of MOODS) if ((moods?.[m] ?? 0) >= 0.6 && (!best || moods[m] > moods[best])) best = m;
+    this.#setTags(videoId, "mood", best ? [{ tag: best, weight: moods[best] }] : []);
+  }
+
+  tagsOf(videoId) {
+    return this.#sql("SELECT tag, weight, src FROM song_tags WHERE video_id=? ORDER BY weight DESC LIMIT 50").all(videoId);
+  }
+
+  tagExists(tag) { return !!this.#sql("SELECT 1 FROM song_tags WHERE tag=? LIMIT 1").get(tag); }
+
+  /** Songs having [tag], at most [cap] counted (index song_tags_tag_w). */
+  tagCount(tag, cap = 2001) {
+    return this.#sql("SELECT COUNT(*) n FROM (SELECT 1 FROM song_tags WHERE tag=? LIMIT ?)").get(tag, cap).n;
+  }
+
+  /** Best weighted songs of a tag (index song_tags_tag_w). */
+  tagTop(tag, limit) {
+    return this.#sql("SELECT video_id, weight FROM song_tags WHERE tag=? ORDER BY weight DESC LIMIT ?").all(tag, limit)
+      .map((r) => ({ videoId: r.video_id, weight: r.weight }));
+  }
+
+  hasTag(tag, videoId) { return !!this.#sql("SELECT 1 FROM song_tags WHERE tag=? AND video_id=?").get(tag, videoId); }
+
+  /**
+   * One slice of the one-off copy of old Last.fm tags and analysis into song_tags:
+   * a window of [limit] rowids per call, progress remembered in meta. { done, n }.
+   */
+  backfillSongTags(limit = 1000) {
+    const key = "song_tags_backfill";
+    const st = parse(this.#sql("SELECT value FROM meta WHERE key=?").get(key)?.value, { l: 0, a: 0, d: false });
+    if (st.d) return { done: true, n: 0 };
+    let n = 0;
+    this.#tx(() => {
+      const maxL = this.#sql("SELECT MAX(rowid) m FROM lastfm_tracks").get().m ?? 0;
+      if (st.l < maxL) {
+        const rows = this.#sql(`SELECT video_id, tags_json FROM lastfm_tracks WHERE rowid > ? AND rowid <= ?`).all(st.l, st.l + limit);
+        for (const r of rows) {
+          const tags = parse(r.tags_json, []);
+          if (Array.isArray(tags) && tags.length) { this.#lastfmTags(r.video_id, tags); n++; }
+        }
+        st.l += limit;
+      } else {
+        const maxA = this.#sql("SELECT MAX(rowid) m FROM song_analysis").get().m ?? 0;
+        if (st.a < maxA) {
+          const rows = this.#sql(`SELECT video_id, genres_json, happy, sad, relaxed, aggressive, party FROM song_analysis
+            WHERE rowid > ? AND rowid <= ? AND analyzed_at IS NOT NULL AND error IS NULL`).all(st.a, st.a + limit);
+          for (const r of rows) { this.#analysisTags(r.video_id, parse(r.genres_json, []), r); n++; }
+          st.a += limit;
+        } else st.d = true;
+      }
+      this.#sql("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)").run(key, JSON.stringify(st));
+    });
+    return { done: st.d, n };
+  }
+
+  // ------------------------------------------------------------ Discogs
+
+  /** Songs not yet looked up on Discogs: archived + most played first, then a rowid cursor over tracks. */
+  nextDiscogs(limit) {
+    const row = (r) => ({
+      videoId: r.video_id, title: r.title,
+      artist: parse(r.artists_json, [])[0]?.name ?? r.artist ?? null,
+    });
+    const out = this.#sql(`SELECT s.video_id, COALESCE(s.title, t.title) title, s.artist, COALESCE(s.artists_json, t.artists_json) artists_json
+      FROM songs s LEFT JOIN tracks t ON t.video_id = s.video_id
+      WHERE s.status = 'stored' AND COALESCE(s.title, t.title, '') != ''
+        AND NOT EXISTS (SELECT 1 FROM discogs_releases x WHERE x.video_id = s.video_id)
+      ORDER BY s.plays DESC
+      LIMIT ?`).all(limit).map(row);
+    if (out.length >= limit || Date.now() < (this.#cursorIdle.discogs ?? 0)) return out;
+    const seen = new Set(out.map((t) => t.videoId));
+    const rest = this.#sql(`SELECT t.rowid r, t.video_id, t.title, t.artists_json
+      FROM tracks t
+      WHERE t.rowid > ? AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM discogs_releases x WHERE x.video_id = t.video_id)
+      ORDER BY t.rowid LIMIT ?`).all(this.#cursor.discogs ?? 0, limit - out.length);
+    if (rest.length) this.#cursor.discogs = rest.at(-1).r;
+    else {
+      this.#cursor.discogs = 0;
+      this.#cursorIdle.discogs = Date.now() + 30 * 60_000;
+    }
+    for (const r of rest) if (!seen.has(r.video_id)) out.push(row(r));
+    return out;
+  }
+
+  /** release null = looked, nothing found. Genres and styles also become song tags. */
+  saveDiscogs(videoId, release, now = Date.now()) {
+    this.#tx(() => {
+      this.#sql(`INSERT OR REPLACE INTO discogs_releases(video_id,release_id,master_id,year,genres_json,styles_json,country,label,checked_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(videoId, release?.releaseId ?? null, release?.masterId ?? null, release?.year ?? null,
+        release ? json(release.genres ?? []) : null, release ? json(release.styles ?? []) : null,
+        release?.country ?? null, release?.label ?? null, now);
+      if (release) this.#setTags(videoId, "discogs", [...(release.genres ?? []), ...(release.styles ?? [])].map((tag) => ({ tag, weight: 1 })));
+    });
+  }
+
+  discogsInfo(videoId) {
+    const r = this.#sql("SELECT * FROM discogs_releases WHERE video_id=?").get(videoId);
+    if (!r || r.release_id == null) return null;
+    return { releaseId: r.release_id, masterId: r.master_id, year: r.year, genres: parse(r.genres_json, []),
+      styles: parse(r.styles_json, []), country: r.country, label: r.label };
+  }
+
+  discogsStats() {
+    const n = (q) => this.#sql(q).get().n;
+    return {
+      checked: n("SELECT COUNT(*) n FROM discogs_releases"),
+      found: n("SELECT COUNT(*) n FROM discogs_releases WHERE release_id IS NOT NULL"),
+    };
+  }
+
+  // ------------------------------------------------------------ Odesli links
+
+  linksExt(videoId) {
+    const r = this.#sql("SELECT page_url, links_json, fetched_at FROM song_links_ext WHERE video_id=?").get(videoId);
+    return r ? { pageUrl: r.page_url, links: parse(r.links_json, {}), fetchedAt: r.fetched_at } : null;
+  }
+
+  saveLinksExt(videoId, pageUrl, links, now = Date.now()) {
+    this.#sql("INSERT OR REPLACE INTO song_links_ext(video_id,page_url,links_json,fetched_at) VALUES(?,?,?,?)")
+      .run(videoId, pageUrl ?? null, JSON.stringify(links ?? {}), now);
+  }
+
+  // ------------------------------------------------------------ smart search (search_fts)
+
+  #ftsPut(rowid, videoId, title, artistsJson) {
+    this.#sql("DELETE FROM search_fts WHERE rowid=?").run(rowid);
+    if (!title) return;
+    const artists = parse(artistsJson, []).map((a) => a?.name).filter(Boolean).join(" ");
+    this.#sql("INSERT INTO search_fts(rowid,video_id,title,artists) VALUES(?,?,?,?)")
+      .run(rowid, videoId, normSearch(title), normSearch(artists));
+  }
+
+  /** Index one slice of tracks (rowid cursor in meta search_fts_cursor). { n, done }. */
+  ftsFill(limit = 2000) {
+    if (!this.ftsMode || this.#ftsDone) return { n: 0, done: true };
+    const cur = Number(this.#sql("SELECT value FROM meta WHERE key='search_fts_cursor'").get()?.value) || 0;
+    const rows = this.#sql("SELECT rowid r, video_id, title, artists_json FROM tracks WHERE rowid > ? ORDER BY rowid LIMIT ?").all(cur, limit);
+    if (!rows.length) { this.#ftsDone = true; return { n: 0, done: true }; }
+    this.#tx(() => {
+      for (const r of rows) this.#ftsPut(r.r, r.video_id, r.title, r.artists_json);
+      this.#sql("INSERT OR REPLACE INTO meta(key,value) VALUES('search_fts_cursor',?)").run(String(rows.at(-1).r));
+    });
+    return { n: rows.length, done: false };
+  }
+
+  ftsStats() {
+    const cursor = Number(this.#sql("SELECT value FROM meta WHERE key='search_fts_cursor'").get()?.value) || 0;
+    const max = this.#sql("SELECT MAX(rowid) m FROM tracks").get().m ?? 0;
+    return { mode: this.ftsMode, cursor, maxRowid: max, done: cursor >= max };
+  }
+
+  /** Raw FTS hits for a MATCH expression: { videoId, title, artists, rank }. Ordered by bm25 only when asked. */
+  ftsSearch(expr, limit, ranked = true) {
+    if (!this.ftsMode) return [];
+    const q = ranked
+      ? "SELECT video_id, title, artists, bm25(search_fts) rank FROM search_fts WHERE search_fts MATCH ? ORDER BY rank LIMIT ?"
+      : "SELECT video_id, title, artists, 0 rank FROM search_fts WHERE search_fts MATCH ? LIMIT ?";
+    try {
+      return this.#sql(q).all(expr, limit).map((r) => ({ videoId: r.video_id, title: r.title, artists: r.artists, rank: r.rank }));
+    } catch { return []; } // malformed expression
+  }
+
+  /** Cards for result songs by primary key lookups: tracks + songs + Last.fm listeners. */
+  songCards(videoIds) {
+    const out = new Map();
+    for (const id of videoIds) {
+      const t = this.#sql("SELECT title, artists_json, album, duration_s FROM tracks WHERE video_id=?").get(id);
+      const s = this.#sql("SELECT status, plays, title, artists_json, album, duration_s FROM songs WHERE video_id=?").get(id);
+      if (!t && !s) continue;
+      const l = this.#sql("SELECT listeners FROM lastfm_tracks WHERE video_id=?").get(id);
+      const src = t ?? s;
+      out.set(id, {
+        videoId: id, title: s?.title ?? t?.title ?? null, artists: parse(s?.artists_json ?? t?.artists_json, []).map((a) => ({ id: a?.id ?? null, name: a?.name })),
+        album: src.album ?? s?.album ?? null, durationS: src.duration_s ?? s?.duration_s ?? null,
+        archived: s?.status === "stored", plays: s?.plays ?? 0, listeners: l?.listeners ?? 0,
+      });
+    }
+    return out;
+  }
+
+  /** Artists whose name starts with the query, any case (index artists_name_nocase). */
+  artistsByNamePrefix(query, limit = 20) {
+    const q = String(query ?? "").trim();
+    if (q.length < 2) return [];
+    return this.#sql(`SELECT id, name, subscribers FROM artists
+      WHERE name COLLATE NOCASE >= ? AND name COLLATE NOCASE < ? || char(0x10FFFF) LIMIT 200`).all(q, q)
+      .sort((a, b) => (b.subscribers ?? 0) - (a.subscribers ?? 0)).slice(0, limit)
+      .map((a) => ({ id: a.id, name: a.name, alias: null, subscribers: a.subscribers }));
+  }
+
+  /** A few songs of an artist (index song_artists_artist). */
+  songIdsOfArtist(artistId, limit = 100) {
+    return this.#sql("SELECT video_id FROM song_artists WHERE artist_id=? LIMIT ?").all(artistId, limit).map((r) => r.video_id);
   }
 
   close() { this.db.close(); }

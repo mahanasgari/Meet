@@ -195,7 +195,9 @@ const MIGRATIONS = [
   // v18: the recommender looks up songs by artist name and plays by listener;
   // without these each lookup read all ~840k songs (up to 30 s, server frozen).
   `CREATE INDEX IF NOT EXISTS songs_artist ON songs(artist);
-  CREATE INDEX IF NOT EXISTS plays_uid ON plays(uid, at);`
+  CREATE INDEX IF NOT EXISTS plays_uid ON plays(uid, at);`,
+  // v19: the dashboard's "failed downloads" list walked all ~834k jobs.
+  `CREATE INDEX IF NOT EXISTS jobs_problems ON jobs(updated_at) WHERE state='failed' OR (state='queued' AND attempts>0);`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -294,7 +296,14 @@ function watchSlowQueries(db) {
 
 export class Catalog {
   /** ftsTokenizer: override (tests) e.g. "unicode61 remove_diacritics 2" to force the fallback. */
-  constructor(file, { ftsTokenizer } = {}) {
+  constructor(file, { ftsTokenizer, readOnly = false } = {}) {
+    if (readOnly) {
+      // A second, read-only connection (stats worker): no migrations, no writes.
+      this.db = new DatabaseSync(file, { readOnly: true });
+      const fts = this.db.prepare("SELECT sql FROM sqlite_master WHERE name='search_fts'").get();
+      this.ftsMode = fts ? (/trigram/i.test(fts.sql) ? "trigram" : "unicode61") : null;
+      return;
+    }
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");

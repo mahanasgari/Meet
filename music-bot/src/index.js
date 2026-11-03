@@ -1244,6 +1244,28 @@ function dashboardPage() {
 }
 
 const dataCache = new Map();
+
+// Archive stats come from a worker thread (see stats_worker.js), refreshed at
+// most every 10 minutes; the dashboard shows the last result meanwhile.
+const archiveStatsCache = new Map(); // days -> { at, data, busy }
+function archiveStats(days) {
+  const c = archiveStatsCache.get(days) ?? { at: 0, data: null, busy: false };
+  archiveStatsCache.set(days, c);
+  if (!c.busy && Date.now() - c.at > 10 * 60_000) {
+    c.busy = true;
+    const w = new Worker(new URL("./stats_worker.js", import.meta.url), {
+      workerData: { file: joinPath(SHARES, "catalog", "catalog.db"), days, channels: backupChannels() },
+    });
+    w.once("message", (m) => {
+      if (m.ok) { c.data = m.data; c.at = Date.now(); dataCache.delete(days); }
+      else console.error("[stats] archive:", m.error);
+    });
+    w.once("error", (e) => console.error("[stats] archive:", e.message));
+    w.once("exit", () => { c.busy = false; });
+  }
+  return c.data;
+}
+
 /** Everything the dashboard shows, for the last [days] days. */
 function dashboardData(days) {
   const hit = dataCache.get(days);
@@ -1326,13 +1348,7 @@ function dashboardData(days) {
     alerts: monitor ? monitor.alerts.slice(0, 200) : [],
     backup: backupStatus(),
     archive: catalog
-      ? {
-          ...catalog.stats(days),
-          graph: catalog.graphStats(),
-          videos: catalog.videoStats(),
-          backupChannel: backupChannels().length > 0,
-          backups: catalog.backupStats(backupChannels()),
-        }
+      ? { ...(archiveStats(days) ?? { computing: true }), backupChannel: backupChannels().length > 0 }
       : null,
   };
   dataCache.set(days, { at: Date.now(), data });

@@ -14,6 +14,7 @@ const HISTORY_DAYS = 90;
 const WINDOW = 5; // positions looked ahead when counting co-occurrence
 const MAX_NEIGHBORS = 50;
 const HALF_LIFE_DAYS = 14;
+const LB_WEIGHT = 0.5; // ListenBrainz similar recordings (score normalised to 0..1)
 const LASTFM_WEIGHT = 0.6; // Last.fm similarity (0..1) scale next to related 1.0 and co-listening 1.5*sim
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
 const SAME_LISTEN_MS = 15 * MIN;
@@ -335,6 +336,18 @@ export class Recommender {
       add(r.id, LASTFM_WEIGHT * (r.match ?? 0), `Similar to ${seedTitle} on Last.fm`);
     }
 
+    // 2c. ListenBrainz similar recordings, both directions, normalised by the song's best score.
+    const lbMax = this.#q("SELECT MAX(score) m FROM lb_similar WHERE video_id=?").get(seed)?.m;
+    if (lbMax > 0) {
+      for (const r of this.#q("SELECT similar_id id, score FROM lb_similar WHERE video_id=?").all(seed)) {
+        add(r.id, LB_WEIGHT * Math.min(1, (r.score ?? 0) / lbMax), `Similar to ${seedTitle} on ListenBrainz`);
+      }
+    }
+    for (const r of this.#q("SELECT video_id id, score FROM lb_similar WHERE similar_id=? LIMIT 100").all(seed)) {
+      const m = this.#q("SELECT MAX(score) m FROM lb_similar WHERE video_id=?").get(r.id)?.m;
+      if (m > 0) add(r.id, LB_WEIGHT * Math.min(1, (r.score ?? 0) / m), `Similar to ${seedTitle} on ListenBrainz`);
+    }
+
     // 3. Same artist and similar artists.
     const { ids, names } = this.#artistsOf(seed);
     const label = names[0] ?? "this artist";
@@ -375,12 +388,29 @@ export class Recommender {
         }
       }
     }
+    // ListenBrainz similar artists (forward lookup, normalised by the best score).
+    for (const aid of ids) {
+      const rows = this.#q("SELECT similar_id id, score FROM lb_artist_similar WHERE artist_id=? ORDER BY score DESC LIMIT 20").all(aid);
+      const max = rows[0]?.score;
+      if (!(max > 0)) continue;
+      for (const r of rows) {
+        if (seenArtists.has(r.id)) continue;
+        seenArtists.add(r.id);
+        const name = this.#q("SELECT name FROM artists WHERE id=?").get(r.id)?.name ?? null;
+        const w = 0.25 * Math.min(1, (r.score ?? 0) / max);
+        for (const id of byArtist([r.id], name, 10)) {
+          add(id, w, name ? `By ${name}, similar to ${label} on ListenBrainz` : `Similar to ${label} on ListenBrainz`);
+        }
+      }
+    }
     return cands;
   }
 
-  /** 0..1 log-scaled Last.fm listeners of a song (0 when unknown). */
+  /** 0..1 log-scaled listeners (max of Last.fm listeners and ListenBrainz users) of a song (0 when unknown). */
   #lfPop(id) {
-    const l = this.#q("SELECT listeners FROM lastfm_tracks WHERE video_id=?").get(id)?.listeners;
+    const a = this.#q("SELECT listeners FROM lastfm_tracks WHERE video_id=?").get(id)?.listeners;
+    const b = this.#q("SELECT lb_users FROM mb_recordings WHERE video_id=?").get(id)?.lb_users;
+    const l = Math.max(a ?? 0, b ?? 0);
     return l ? Math.min(1, Math.log10(1 + l) / 7) : 0;
   }
 

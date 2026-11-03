@@ -155,7 +155,23 @@ const MIGRATIONS = [
     tags_json TEXT, checked_at INTEGER);
   CREATE TABLE lastfm_artist_similar (artist_id TEXT NOT NULL, similar_id TEXT NOT NULL, match REAL,
     PRIMARY KEY (artist_id, similar_id));
-  CREATE INDEX IF NOT EXISTS artists_name_nocase ON artists(name COLLATE NOCASE);`
+  CREATE INDEX IF NOT EXISTS artists_name_nocase ON artists(name COLLATE NOCASE);`,
+  // v15: MusicBrainz + ListenBrainz (mbid NULL = looked, no match), artist aliases for search.
+  `CREATE TABLE mb_recordings (video_id TEXT PRIMARY KEY, mbid TEXT, artist_mbids_json TEXT, title TEXT,
+    first_release TEXT, length_ms INTEGER, isrcs_json TEXT, score INTEGER,
+    lb_listens INTEGER, lb_users INTEGER, lb_checked_at INTEGER, checked_at INTEGER);
+  CREATE INDEX mb_recordings_mbid ON mb_recordings(mbid);
+  CREATE INDEX mb_recordings_lb ON mb_recordings(checked_at) WHERE mbid IS NOT NULL AND lb_checked_at IS NULL;
+  CREATE TABLE mb_artists (artist_id TEXT PRIMARY KEY, mbid TEXT, name TEXT, sort_name TEXT, type TEXT, country TEXT,
+    begin TEXT, end TEXT, aliases_json TEXT, genres_json TEXT, checked_at INTEGER);
+  CREATE INDEX mb_artists_mbid ON mb_artists(mbid);
+  CREATE TABLE mb_aliases (alias_norm TEXT NOT NULL, artist_id TEXT NOT NULL, alias TEXT, locale TEXT,
+    PRIMARY KEY (alias_norm, artist_id));
+  CREATE TABLE lb_similar (video_id TEXT NOT NULL, similar_id TEXT NOT NULL, score REAL, PRIMARY KEY (video_id, similar_id));
+  CREATE INDEX lb_similar_rev ON lb_similar(similar_id);
+  CREATE TABLE lb_artist_similar (artist_id TEXT NOT NULL, similar_id TEXT NOT NULL, score REAL, PRIMARY KEY (artist_id, similar_id));
+  CREATE INDEX lb_artist_similar_rev ON lb_artist_similar(similar_id);
+  CREATE INDEX IF NOT EXISTS lastfm_artist_similar_rev ON lastfm_artist_similar(similar_id);`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -1252,6 +1268,141 @@ export class Catalog {
     return {
       checked: n("SELECT COUNT(*) n FROM lastfm_tracks"),
       found: n("SELECT COUNT(*) n FROM lastfm_tracks WHERE listeners IS NOT NULL"),
+    };
+  }
+
+  // ------------------------------------------------------------ MusicBrainz / ListenBrainz
+
+  /** Songs not yet looked up on MusicBrainz: archived + most played first, then a rowid cursor over tracks. */
+  nextMbRecordings(limit) {
+    const row = (r) => ({
+      videoId: r.video_id, title: r.title,
+      artist: parse(r.artists_json, [])[0]?.name ?? r.artist ?? null,
+    });
+    const out = this.#sql(`SELECT s.video_id, COALESCE(s.title, t.title) title, s.artist, COALESCE(s.artists_json, t.artists_json) artists_json
+      FROM songs s LEFT JOIN tracks t ON t.video_id = s.video_id
+      WHERE s.status = 'stored' AND COALESCE(s.title, t.title, '') != ''
+        AND NOT EXISTS (SELECT 1 FROM mb_recordings x WHERE x.video_id = s.video_id)
+      ORDER BY s.plays DESC
+      LIMIT ?`).all(limit).map(row);
+    if (out.length >= limit || Date.now() < (this.#cursorIdle.musicbrainz ?? 0)) return out;
+    const seen = new Set(out.map((t) => t.videoId));
+    const rest = this.#sql(`SELECT t.rowid r, t.video_id, t.title, t.artists_json
+      FROM tracks t
+      WHERE t.rowid > ? AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM mb_recordings x WHERE x.video_id = t.video_id)
+      ORDER BY t.rowid LIMIT ?`).all(this.#cursor.musicbrainz ?? 0, limit - out.length);
+    if (rest.length) this.#cursor.musicbrainz = rest.at(-1).r;
+    else {
+      this.#cursor.musicbrainz = 0;
+      this.#cursorIdle.musicbrainz = Date.now() + 30 * 60_000;
+    }
+    for (const r of rest) if (!seen.has(r.video_id)) out.push(row(r));
+    return out;
+  }
+
+  hasMbArtist(artistId) {
+    return !!this.#sql("SELECT 1 FROM mb_artists WHERE artist_id=?").get(artistId);
+  }
+
+  /** Our songs with a MusicBrainz recording id (few per id). */
+  videoIdsByMbid(mbid) {
+    return this.#sql("SELECT video_id FROM mb_recordings WHERE mbid=? LIMIT 3").all(mbid).map((r) => r.video_id);
+  }
+
+  artistIdsByMbid(mbid) {
+    return this.#sql("SELECT artist_id FROM mb_artists WHERE mbid=? LIMIT 3").all(mbid).map((r) => r.artist_id);
+  }
+
+  /** Recordings waiting for listen counts (partial index mb_recordings_lb). */
+  mbPopularityBatch(limit) {
+    return this.#sql(`SELECT video_id, mbid FROM mb_recordings
+      WHERE mbid IS NOT NULL AND lb_checked_at IS NULL ORDER BY checked_at LIMIT ?`).all(limit);
+  }
+
+  /** Store listen counts for [mbids]; ones missing from [pop] are marked checked with NULL counts. */
+  saveMbPopularity(mbids, pop, now = Date.now()) {
+    this.#tx(() => {
+      const up = this.#sql("UPDATE mb_recordings SET lb_listens=?, lb_users=?, lb_checked_at=? WHERE mbid=?");
+      for (const m of mbids) {
+        const p = pop.get(m);
+        up.run(p?.listens ?? null, p?.users ?? null, now, m);
+      }
+    });
+  }
+
+  /** Write everything one MusicBrainz tick learned, in one transaction. */
+  saveMusicBrainz({ videoId, recording, artistId = null, artist = null, lbSimilar = null, lbArtistSimilar = null }, now = Date.now()) {
+    this.#tx(() => {
+      const r = recording;
+      this.#sql(`INSERT OR REPLACE INTO mb_recordings(video_id,mbid,artist_mbids_json,title,first_release,length_ms,isrcs_json,score,
+        lb_listens,lb_users,lb_checked_at,checked_at) VALUES(?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)`).run(
+        videoId, r?.mbid ?? null, r ? json(r.artistMbids ?? []) : null, r?.title ?? null, r?.firstRelease ?? null,
+        r?.lengthMs ?? null, r ? json(r.isrcs ?? []) : null, r?.score ?? null, now);
+      if (lbSimilar) {
+        this.#sql("DELETE FROM lb_similar WHERE video_id=?").run(videoId);
+        for (const s of lbSimilar) this.#sql("INSERT OR REPLACE INTO lb_similar(video_id,similar_id,score) VALUES(?,?,?)").run(videoId, s.id, s.score);
+      }
+      if (artistId) {
+        this.#sql(`INSERT OR REPLACE INTO mb_artists(artist_id,mbid,name,sort_name,type,country,begin,end,aliases_json,genres_json,checked_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(artistId, artist?.mbid ?? null, artist?.name ?? null, artist?.sortName ?? null,
+          artist?.type ?? null, artist?.country ?? null, artist?.begin ?? null, artist?.end ?? null,
+          artist ? json(artist.aliases ?? []) : null, artist ? json(artist.genres ?? []) : null, now);
+        if (artist) {
+          const ins = this.#sql("INSERT OR IGNORE INTO mb_aliases(alias_norm,artist_id,alias,locale) VALUES(?,?,?,?)");
+          const all = [...(artist.aliases ?? []), { name: artist.name }, { name: artist.sortName }];
+          for (const a of all) {
+            const norm = a?.name ? normTitle(a.name) : "";
+            if (norm) ins.run(norm, artistId, a.name, a.locale ?? null);
+          }
+        }
+        if (lbArtistSimilar) {
+          this.#sql("DELETE FROM lb_artist_similar WHERE artist_id=?").run(artistId);
+          for (const s of lbArtistSimilar) this.#sql("INSERT OR REPLACE INTO lb_artist_similar(artist_id,similar_id,score) VALUES(?,?,?)").run(artistId, s.id, s.score);
+        }
+      }
+    });
+  }
+
+  /** What /song/info shows: the recording and, for the first artist, country/type/genres/aliases. */
+  mbInfo(videoId) {
+    const r = this.#sql("SELECT mbid, first_release, lb_listens, lb_users FROM mb_recordings WHERE video_id=?").get(videoId);
+    const out = {};
+    if (r?.mbid) out.mb = { mbid: r.mbid, firstRelease: r.first_release, listens: r.lb_listens, users: r.lb_users };
+    const aid = this.firstArtistId(videoId);
+    const a = aid ? this.#sql("SELECT mbid, country, type, begin, genres_json, aliases_json FROM mb_artists WHERE artist_id=?").get(aid) : null;
+    if (a?.mbid) {
+      out.artist = {
+        country: a.country, type: a.type, begin: a.begin, genres: parse(a.genres_json, []),
+        aliases: parse(a.aliases_json, []).map((x) => x?.name).filter(Boolean).slice(0, 10),
+      };
+    }
+    return out;
+  }
+
+  /** Artists whose name or alias (any script) equals or starts with the query; PK prefix of mb_aliases. */
+  artistsByAlias(query) {
+    const q = normTitle(query);
+    if (!q) return [];
+    const exact = this.#sql("SELECT artist_id, alias FROM mb_aliases WHERE alias_norm = ? LIMIT 20").all(q);
+    const prefix = this.#sql(`SELECT artist_id, alias FROM mb_aliases
+      WHERE alias_norm >= ? AND alias_norm < ? || char(0x10FFFF) LIMIT 20`).all(q, q);
+    const seen = new Set(), out = [];
+    for (const r of [...exact, ...prefix]) {
+      if (seen.has(r.artist_id)) continue;
+      seen.add(r.artist_id);
+      const a = this.#sql("SELECT id, name, subscribers FROM artists WHERE id=?").get(r.artist_id);
+      if (a) out.push({ id: a.id, name: a.name, alias: r.alias, subscribers: a.subscribers });
+      if (out.length >= 20) break;
+    }
+    return out;
+  }
+
+  mbStats() {
+    const n = (q) => this.#sql(q).get().n;
+    return {
+      checked: n("SELECT COUNT(*) n FROM mb_recordings"),
+      found: n("SELECT COUNT(*) n FROM mb_recordings WHERE mbid IS NOT NULL"),
     };
   }
 

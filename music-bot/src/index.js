@@ -40,6 +40,7 @@ import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
 import { LastfmClient, LastfmEnricher } from "./lastfm.js";
+import { MusicBrainzClient, ListenBrainzClient, MusicBrainzEnricher } from "./musicbrainz.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
@@ -701,6 +702,16 @@ if (catalog) {
     }, (Number(process.env.LASTFM_EVERY_S) || 2.5) * 1000).unref();
   } else {
     console.log("[lastfm] off (no LASTFM_API_KEY)");
+  }
+
+  // MusicBrainz + ListenBrainz: canonical ids, artist aliases, listen counts, similar songs/artists.
+  // No keys; each client paces itself to one request per second.
+  if (process.env.MUSICBRAINZ !== "0") {
+    console.log("[musicbrainz] on");
+    const mbz = new MusicBrainzEnricher({ catalog, mb: new MusicBrainzClient(), lb: new ListenBrainzClient() });
+    setInterval(() => {
+      mbz.tick().catch((e) => console.error("[musicbrainz]", e.message));
+    }, (Number(process.env.MUSICBRAINZ_EVERY_S) || 3) * 1000).unref();
   }
 
   // Grow the archive around what friends like: every song of the artists
@@ -4222,7 +4233,18 @@ const server = http.createServer(async (req, res) => {
       }
       const info = catalog.songInfo(id) || {};
       const lastfm = catalog.lastfmInfo(id);
-      sendJson(res, 200, lastfm ? { ...info, lastfm } : info);
+      sendJson(res, 200, { ...info, ...(lastfm ? { lastfm } : {}), ...catalog.mbInfo(id) });
+      return;
+    }
+
+    // --- Artist search by name or alias in any script (MusicBrainz aliases).
+    if (req.method === "GET" && url.pathname === "/artists/search") {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      sendJson(res, 200, catalog.artistsByAlias(String(url.searchParams.get("q") || "").slice(0, 100)));
       return;
     }
 

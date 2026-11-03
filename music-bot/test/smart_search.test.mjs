@@ -132,3 +132,34 @@ for (const tok of [undefined, "unicode61 remove_diacritics 2"]) {
     assert.equal(p.artists[0].name, "Googoosh"); // name prefix, NOCASE
   });
 }
+
+test("ranking: artist name/alias match puts that artist's songs first, stored first", () => {
+  const c = seeded();
+  c.db.prepare("INSERT INTO mb_aliases(alias_norm,artist_id,alias,locale) VALUES(?,?,?,?)").run("ابی", "a1", "ابی", "fa");
+  c.saveArtistPage("a3", { songs: [song(20, "Ebi Tribute", [{ id: "a3", name: "Led Zeppelin" }]), song(21, "قابیل", [{ id: "a3", name: "Led Zeppelin" }])] });
+  c.stored(id(2), { title: "خلیج فارس" }, 5);
+  const r = smartSearch(c, "ابی");
+  assert.deepEqual(r.songs.slice(0, 2).map((s) => s.videoId), [id(2), id(1)]); // archived Ebi song, then the other
+  assert.ok(r.songs.findIndex((s) => s.videoId === id(21)) > 1); // substring of قابیل is far behind
+  const e = smartSearch(c, "ebi");
+  assert.deepEqual(e.songs.slice(0, 2).map((s) => s.videoId).sort(), [id(1), id(2)]);
+});
+
+test("ranking: whole word beats substring", () => {
+  const c = mk();
+  c.saveArtistPage("a1", { songs: [song(1, "Baranak Night", [{ id: "a1", name: "X" }]), song(2, "Bezan Baran", [{ id: "a1", name: "X" }])] });
+  const r = smartSearch(c, "baran");
+  assert.equal(r.songs[0].videoId, id(2));
+});
+
+test("ranking: several words need all of them; OR fallback only when nothing matches, weak results dropped", () => {
+  const c = mk();
+  c.saveArtistPage("a1", { songs: [
+    song(1, "Khalij Fars", [{ id: "a1", name: "X" }]), song(2, "Persian Gulf Fars", [{ id: "a1", name: "X" }]),
+    song(3, "Totally Unrelated Khalij", [{ id: "a1", name: "X" }]),
+  ] });
+  let r = smartSearch(c, "khalij fars");
+  assert.deepEqual(r.songs.map((s) => s.videoId), [id(1)]); // not the one-word matches
+  r = smartSearch(c, "khalij mars");
+  assert.deepEqual(r.songs.map((s) => s.videoId).sort(), [id(1), id(3)]); // OR fallback
+});

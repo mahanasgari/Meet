@@ -4,7 +4,8 @@
 
 import { normSearch, persianFold, MOOD_WORDS } from "./search_text.js";
 
-const FTS_LIMIT = 100;
+const FTS_LIMIT = 200; // unranked: reading few index pages matters more than bm25 (cold disk)
+const ARTIST_SONGS = 300;
 const TAG_LIMIT = 50;
 const ALIAS_SONGS = 30;
 
@@ -46,13 +47,15 @@ function tagSongs(catalog, tags) {
 }
 
 export function smartSearch(catalog, query, limit = 30) {
+  const t0 = performance.now();
   const raw = String(query ?? "").slice(0, 100).trim();
   const lim = Math.min(Math.max(Math.floor(Number(limit)) || 30, 1), 100);
   const empty = { songs: [], artists: [], tags: [] };
   const norm = normSearch(raw);
   if (!norm) return empty;
   const tri = catalog.ftsMode === "trigram";
-  const words = norm.split(" ").filter((w) => w.length >= (tri ? 3 : 2)).slice(0, 6);
+  const minLen = tri ? 3 : 2;
+  const words = norm.split(" ").filter((w) => w.length >= minLen).slice(0, 6);
 
   // a. artists
   const artists = [], seenA = new Set();
@@ -63,47 +66,64 @@ export function smartSearch(catalog, query, limit = 30) {
     if (artists.length >= 20) break;
   }
 
-  // b. song text
   const cand = new Map(); // videoId -> { score, why }
   const add = (id, score, why) => {
     const c = cand.get(id);
     if (!c || score > c.score) cand.set(id, { score, why });
   };
+
+  // b. song text: unranked FTS reads (cheap), ranked here with whole-word matches far ahead of substrings
+  const q = (w) => (tri ? `"${w}"` : `"${w}"*`);
   const hits = new Map();
   const take = (rows) => { for (const r of rows) if (!hits.has(r.videoId)) hits.set(r.videoId, r); };
-  const q = (w) => (tri ? `"${w}"` : `"${w}"*`);
-  if (norm.length >= (tri ? 3 : 2)) take(catalog.ftsSearch(tri ? `"${norm}"` : `"${norm}" *`, FTS_LIMIT, true));
-  if (hits.size < 30 && words.length > 1) take(catalog.ftsSearch(words.map(q).join(" AND "), FTS_LIMIT, false));
-  if (hits.size < 30 && words.length > 1) take(catalog.ftsSearch(words.map(q).join(" OR "), FTS_LIMIT, false));
-  if (hits.size < 30 && words.length === 1 && words[0] !== norm) take(catalog.ftsSearch(q(words[0]), FTS_LIMIT, false));
-  for (const h of hits.values()) {
-    const text = `${h.title} ${h.artists}`;
-    const inTitle = words.filter((w) => h.title.includes(w)).length;
-    const got = words.filter((w) => text.includes(w)).length;
-    const phrase = text.includes(norm);
-    let s = phrase ? 100 : got === words.length && words.length ? 60 : 30 * (words.length ? got / words.length : 0);
-    if (h.title.includes(norm)) s += 30;
-    else if (inTitle) s += 10 * (inTitle / Math.max(1, words.length));
-    s += Math.min(10, Math.max(0, -h.rank));
-    add(h.videoId, s, h.title.includes(norm) || inTitle >= got / 2 ? "title" : "artist");
-  }
+  if (norm.length >= minLen) take(catalog.ftsSearch(tri ? `"${norm}"` : `"${norm}" *`, FTS_LIMIT, false));
+  if (words.length > 1) take(catalog.ftsSearch(words.map(q).join(" AND "), FTS_LIMIT, false));
+  const scoreHit = (h) => {
+    const T = ` ${h.title} `, A = ` ${h.artists} `, both = T + A, sp = ` ${norm} `;
+    const sub = words.filter((w) => both.includes(w)).length;
+    const whole = words.filter((w) => both.includes(` ${w} `)).length;
+    const inTitle = T.includes(sp) ? 30 : h.title.includes(norm) ? 15 : 0;
+    let s, full = true;
+    if (both.includes(sp)) s = 120 + inTitle;
+    else if (words.length > 1 && whole === words.length) s = 90 + inTitle * 0.7;
+    else if (both.includes(norm)) s = 55 + inTitle * 0.5;
+    else if (words.length && sub === words.length) s = 45;
+    else { s = words.length ? 20 * (sub / words.length) : 0; full = false; }
+    return { s, full, why: h.title.includes(norm) || words.some((w) => h.title.includes(w)) ? "title" : "artist" };
+  };
+  const score = (rows) => {
+    let best = 0;
+    for (const h of rows) { const r = scoreHit(h); h.r = r; if (r.full) best = Math.max(best, r.s); }
+    return best;
+  };
+  let rows = [...hits.values()];
+  score(rows);
+  // Several words: all of them must match, unless nothing does; then a loose OR whose weak results are dropped.
+  if (!rows.some((h) => h.r.full) && words.length > 1 && performance.now() - t0 < 80) {
+    const or = catalog.ftsSearch(words.map(q).join(" OR "), FTS_LIMIT, false);
+    rows = or; score(rows);
+    const top = Math.max(0, ...rows.map((h) => h.r.s));
+    rows = rows.filter((h) => h.r.s >= top * 0.5);
+  } else if (words.length > 1) rows = rows.filter((h) => h.r.full);
+  for (const h of rows) add(h.videoId, h.r.s, h.r.why);
 
   // c. tags and moods
-  const tags = matchTags(catalog, raw, words);
+  const tags = performance.now() - t0 < 100 ? matchTags(catalog, raw, words) : [];
   const tagHits = tagSongs(catalog, tags);
-  const pending = tagHits.map((r) => r.videoId);
 
-  // alias artists: their songs
-  const aliasArtists = artists.filter((a) => a.alias).slice(0, 2);
-  const aliasIds = [];
-  for (const a of aliasArtists) for (const id of catalog.songIdsOfArtist(a.id, ALIAS_SONGS)) aliasIds.push(id);
-
-  const cards = catalog.songCards([...cand.keys(), ...pending, ...aliasIds]);
-  for (const r of tagHits) {
-    const c = cards.get(r.videoId);
-    if (c) add(r.videoId, 40 + (r.weight ?? 0) * 20, `tag:${r.tag}`);
+  // artists matching the query by name or alias: their songs, ahead of text matches
+  const strong = [], weak = [];
+  for (const a of artists) {
+    if (normSearch(a.alias ?? a.name) === norm || normSearch(a.name) === norm) strong.push(a);
+    else if (a.alias) weak.push(a);
   }
-  for (const id of aliasIds) add(id, 70, "alias");
+  const artistIds = [];
+  for (const a of strong.slice(0, 3)) for (const r of catalog.songIdsOfArtist(a.id, ARTIST_SONGS)) artistIds.push([r.videoId, r.position === 0 ? 200 : 150, a.alias ? "alias" : "artist"]);
+  for (const a of weak.slice(0, 2)) for (const r of catalog.songIdsOfArtist(a.id, ALIAS_SONGS)) artistIds.push([r.videoId, 70, "alias"]);
+
+  const cards = catalog.songCards([...cand.keys(), ...tagHits.map((r) => r.videoId), ...artistIds.map((x) => x[0])]);
+  for (const r of tagHits) if (cards.has(r.videoId)) add(r.videoId, 40 + (r.weight ?? 0) * 20, `tag:${r.tag}`);
+  for (const [id, sc, why] of artistIds) add(id, sc, why);
 
   const songs = [];
   for (const [id, c] of cand) {

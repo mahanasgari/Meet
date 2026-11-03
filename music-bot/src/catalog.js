@@ -1755,20 +1755,30 @@ export class Catalog {
     } catch { return []; } // malformed expression
   }
 
-  /** Cards for result songs by primary key lookups: tracks + songs + Last.fm listeners. */
+  /** Cards for result songs: three batched primary key lookups (tracks, songs, lastfm_tracks). */
   songCards(videoIds) {
     const out = new Map();
-    for (const id of videoIds) {
-      const t = this.#sql("SELECT title, artists_json, album, duration_s FROM tracks WHERE video_id=?").get(id);
-      const s = this.#sql("SELECT status, plays, title, artists_json, album, duration_s FROM songs WHERE video_id=?").get(id);
-      if (!t && !s) continue;
-      const l = this.#sql("SELECT listeners FROM lastfm_tracks WHERE video_id=?").get(id);
-      const src = t ?? s;
-      out.set(id, {
-        videoId: id, title: s?.title ?? t?.title ?? null, artists: parse(s?.artists_json ?? t?.artists_json, []).map((a) => ({ id: a?.id ?? null, name: a?.name })),
-        album: src.album ?? s?.album ?? null, durationS: src.duration_s ?? s?.duration_s ?? null,
-        archived: s?.status === "stored", plays: s?.plays ?? 0, listeners: l?.listeners ?? 0,
-      });
+    const ids = [...new Set(videoIds)];
+    const rows = (table, cols, chunk) => {
+      const q = `SELECT video_id, ${cols} FROM ${table} WHERE video_id IN (${chunk.map(() => "?").join(",")})`;
+      return this.db.prepare(q).all(...chunk);
+    };
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400);
+      const T = new Map(rows("tracks", "title, artists_json, album, duration_s", chunk).map((r) => [r.video_id, r]));
+      const S = new Map(rows("songs", "status, plays, title, artists_json, album, duration_s", chunk).map((r) => [r.video_id, r]));
+      const L = new Map(rows("lastfm_tracks", "listeners", chunk).map((r) => [r.video_id, r]));
+      for (const id of chunk) {
+        const t = T.get(id), s = S.get(id);
+        if (!t && !s) continue;
+        const src = t ?? s;
+        out.set(id, {
+          videoId: id, title: s?.title ?? t?.title ?? null,
+          artists: parse(s?.artists_json ?? t?.artists_json, []).map((a) => ({ id: a?.id ?? null, name: a?.name })),
+          album: src.album ?? s?.album ?? null, durationS: src.duration_s ?? s?.duration_s ?? null,
+          archived: s?.status === "stored", plays: s?.plays ?? 0, listeners: L.get(id)?.listeners ?? 0,
+        });
+      }
     }
     return out;
   }
@@ -1785,7 +1795,8 @@ export class Catalog {
 
   /** A few songs of an artist (index song_artists_artist). */
   songIdsOfArtist(artistId, limit = 100) {
-    return this.#sql("SELECT video_id FROM song_artists WHERE artist_id=? LIMIT ?").all(artistId, limit).map((r) => r.video_id);
+    return this.#sql("SELECT video_id, position FROM song_artists WHERE artist_id=? LIMIT ?").all(artistId, limit)
+      .map((r) => ({ videoId: r.video_id, position: r.position ?? 0 }));
   }
 
   close() { this.db.close(); }

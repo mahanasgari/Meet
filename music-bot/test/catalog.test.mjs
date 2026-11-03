@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "15");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "16");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "15");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "16");
   c.close();
 });
 
@@ -392,6 +392,7 @@ test("v2 database upgrades to v3 in place and keeps data", () => {
   db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists; DROP TABLE song_info;"); // v11-12
   db.exec("DROP TABLE lastfm_tracks; DROP TABLE lastfm_similar; DROP TABLE lastfm_similar_names; DROP TABLE lastfm_artists; DROP TABLE lastfm_artist_similar;"); // v14
   db.exec("DROP TABLE mb_recordings; DROP TABLE mb_artists; DROP TABLE mb_aliases; DROP TABLE lb_similar; DROP TABLE lb_artist_similar;"); // v15
+  db.exec("DROP TABLE song_analysis;"); // v16
   db.exec("UPDATE meta SET value='2' WHERE key='schema_version'");
   db.close();
   const c2 = new Catalog(file);
@@ -446,6 +447,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists; DROP TABLE song_info;"); // v11-12
   db.exec("DROP TABLE lastfm_tracks; DROP TABLE lastfm_similar; DROP TABLE lastfm_similar_names; DROP TABLE lastfm_artists; DROP TABLE lastfm_artist_similar;"); // v14
   db.exec("DROP TABLE mb_recordings; DROP TABLE mb_artists; DROP TABLE mb_aliases; DROP TABLE lb_similar; DROP TABLE lb_artist_similar;"); // v15
+  db.exec("DROP TABLE song_analysis;"); // v16
   db.prepare("UPDATE meta SET value='3' WHERE key='schema_version'").run();
   db.close();
   const c = new Catalog(file);

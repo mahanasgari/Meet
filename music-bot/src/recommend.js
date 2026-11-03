@@ -25,6 +25,8 @@ const parse = (s, fallback = null) => {
   try { return JSON.parse(s); } catch { return fallback; }
 };
 
+const SOUND_FEATURES = ["energy", "danceability", "happy", "sad", "relaxed", "aggressive", "party", "valence", "arousal"];
+
 export class Recommender {
   #catalog;
   #usersDir;
@@ -427,11 +429,36 @@ export class Recommender {
     return (1 - 0.7 * rate) / (1 + after);
   }
 
+  /** Sound-alike 0..1 between two analyzed songs (null when either has no analysis). */
+  #soundSim(a, b) {
+    if (!a || !b) return null;
+    let sum = 0, n = 0;
+    for (const f of SOUND_FEATURES) {
+      if (a[f] == null || b[f] == null) continue;
+      sum += Math.abs(a[f] - b[f]);
+      n++;
+    }
+    return n ? 1 - sum / n : null;
+  }
+
+  #analysisRow(id) {
+    return this.#q(`SELECT energy, danceability, happy, sad, relaxed, aggressive, party, valence, arousal
+      FROM song_analysis WHERE video_id=? AND analyzed_at IS NOT NULL AND error IS NULL`).get(id);
+  }
+
   /** Songs like this one: graph edges, co-listening and artist links merged into a 0..1 score. */
   similarTo(videoId, { limit = 20 } = {}) {
     const cands = this.#candidates(videoId);
     // Popular songs (Last.fm listeners, log-scaled) win ties by up to 5%.
     for (const [id, c] of cands) c.score *= this.#skipFactor(id, videoId) * (1 + 0.05 * this.#lfPop(id));
+    // Songs that sound alike (energy, mood...) win ties by up to 15%.
+    const seedSound = this.#analysisRow(videoId);
+    if (seedSound) {
+      for (const [id, c] of cands) {
+        const sim = this.#soundSim(seedSound, this.#analysisRow(id));
+        if (sim != null) c.score *= 1 + 0.15 * sim;
+      }
+    }
     let top = 0;
     for (const c of cands.values()) top = Math.max(top, c.score);
     const out = [];

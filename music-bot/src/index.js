@@ -46,6 +46,7 @@ import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { AccountStore } from "./accounts.js";
 import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
+import { handleAnalysis } from "./analysis_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
 import { DeezerClient, ItunesClient, SongInfoEnricher } from "./song_info.js";
@@ -3657,6 +3658,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- Audio analysis: analyzer containers (any server) lease songs from home,
+    // fetch the stored audio and post results. Same credential as the archive
+    // workers (MUSIC_API_TOKEN).
+    if (url.pathname.startsWith("/analysis/")) {
+      await handleAnalysis({ req, res, url, catalog, archive, isMaster: isMasterToken(req), readBody, sendJson });
+      return;
+    }
+
     // --- Song archive: what the other servers ask the home server.
     if (req.method === "POST" && url.pathname.startsWith("/archive/")) {
       if (!isMasterToken(req)) {
@@ -4233,7 +4242,8 @@ const server = http.createServer(async (req, res) => {
       }
       const info = catalog.songInfo(id) || {};
       const lastfm = catalog.lastfmInfo(id);
-      sendJson(res, 200, { ...info, ...(lastfm ? { lastfm } : {}), ...catalog.mbInfo(id) });
+      const analysis = catalog.analysisInfo(id);
+      sendJson(res, 200, { ...info, ...(lastfm ? { lastfm } : {}), ...catalog.mbInfo(id), ...(analysis ? { analysis } : {}) });
       return;
     }
 

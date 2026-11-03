@@ -1,0 +1,15 @@
+# Audio analyzer on a mirror server:
+#   docker compose -f analyzer-compose.yml up -d
+# Uses the same env file as the mirror's music-bot (HOME_URL, MUSIC_API_TOKEN),
+# as written by deploy/update-worker.sh.
+services:
+  music-analyzer:
+    image: ghcr.io/mahanasgari/music-analyzer:latest
+    container_name: music-analyzer
+    restart: unless-stopped
+    mem_limit: 900m
+    cpus: 0.8
+    env_file:
+      - /root/music-bot.current.env
+    environment:
+      ANALYZER_BATCH: "2"

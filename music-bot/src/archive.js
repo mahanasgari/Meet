@@ -361,8 +361,23 @@ export class Archive {
     return false;
   }
 
+  /**
+   * Audio of a stored song for the analyzer (GET /analysis/audio): disk copy
+   * or the channel, never YouTube, no play counted, no disk-cache fill.
+   * Returns false when the song is not stored here.
+   */
+  async serveForAnalysis(req, res, id) {
+    if (this.cache.has(id)) {
+      serveFile(req, res, this.cache.path(id), { mime: "audio/mp4", extraHeaders: { "X-MP-Source": `disk:${this.serverId}` } });
+      return true;
+    }
+    const song = await this.home.lookup(id).catch(() => null);
+    if (song?.status !== "stored" || !song.msgId) return false;
+    return this.serveFromTelegram(req, res, id, song, { noCache: true });
+  }
+
   /** Streams an archived song from the channel (Range-aware), filling the disk cache. */
-  async serveFromTelegram(req, res, id, song) {
+  async serveFromTelegram(req, res, id, song, { noCache = false } = {}) {
     let f;
     try {
       if (!this.tg.ready) await this.tg.connect();
@@ -393,7 +408,7 @@ export class Archive {
       return true;
     }
     // A full read also fills the disk cache, even if the listener leaves.
-    const tmp = whole ? this.cache.tmpPath(id) : null;
+    const tmp = whole && !noCache ? this.cache.tmpPath(id) : null;
     const file = tmp ? createWriteStream(tmp) : null;
     let gone = false;
     req.on("close", () => (gone = true));

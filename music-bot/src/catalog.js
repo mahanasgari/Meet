@@ -17,6 +17,9 @@ const SOURCES = ["disk", "telegram", "youtube", "peer"];
 const KINDS = ["ytm_track", "ytm_video", "youtube"];
 
 // Ordered migrations; index + 1 is the schema version.
+const ANALYSIS_LEASE_MS = 30 * 60_000;
+const ANALYSIS_MAX_S = 15 * 60;
+
 const MIGRATIONS = [
   `CREATE TABLE songs (
     video_id TEXT PRIMARY KEY,
@@ -171,7 +174,13 @@ const MIGRATIONS = [
   CREATE INDEX lb_similar_rev ON lb_similar(similar_id);
   CREATE TABLE lb_artist_similar (artist_id TEXT NOT NULL, similar_id TEXT NOT NULL, score REAL, PRIMARY KEY (artist_id, similar_id));
   CREATE INDEX lb_artist_similar_rev ON lb_artist_similar(similar_id);
-  CREATE INDEX IF NOT EXISTS lastfm_artist_similar_rev ON lastfm_artist_similar(similar_id);`
+  CREATE INDEX IF NOT EXISTS lastfm_artist_similar_rev ON lastfm_artist_similar(similar_id);`,
+  // v16: audio analysis by the analyzer containers (BPM, key, mood, genres); lease_until = job handed out.
+  `CREATE TABLE song_analysis (video_id TEXT PRIMARY KEY, bpm REAL, key TEXT, scale TEXT, key_strength REAL,
+    loudness REAL, energy REAL, danceability REAL, happy REAL, sad REAL, relaxed REAL, aggressive REAL, party REAL,
+    acoustic REAL, electronic REAL, instrumental REAL, valence REAL, arousal REAL, genres_json TEXT,
+    model TEXT, server TEXT, lease_until INTEGER, analyzed_at INTEGER, error TEXT);
+  CREATE INDEX song_analysis_lease ON song_analysis(lease_until) WHERE analyzed_at IS NULL;`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -1403,6 +1412,113 @@ export class Catalog {
     return {
       checked: n("SELECT COUNT(*) n FROM mb_recordings"),
       found: n("SELECT COUNT(*) n FROM mb_recordings WHERE mbid IS NOT NULL"),
+    };
+  }
+
+  // ------------------------------------------------------------ audio analysis
+
+  /**
+   * Hand [n] stored songs to analyzer [server]: expired leases first, then
+   * never-offered songs, most played first. Skips songs over 15 minutes.
+   */
+  leaseAnalysis(server, n, now = Date.now()) {
+    n = Math.max(1, Math.min(Math.floor(Number(n)) || 1, 10));
+    const until = now + ANALYSIS_LEASE_MS;
+    return this.#tx(() => {
+      const out = this.#sql(`SELECT a.video_id, s.duration_s FROM song_analysis a JOIN songs s ON s.video_id = a.video_id
+        WHERE a.analyzed_at IS NULL AND a.lease_until < ? AND s.status = 'stored'
+          AND (s.duration_s IS NULL OR s.duration_s <= ?)
+        ORDER BY a.lease_until LIMIT ?`).all(now, ANALYSIS_MAX_S, n);
+      if (out.length < n) {
+        out.push(...this.#sql(`SELECT s.video_id, s.duration_s FROM songs s
+          WHERE s.status = 'stored' AND (s.duration_s IS NULL OR s.duration_s <= ?)
+            AND NOT EXISTS (SELECT 1 FROM song_analysis x WHERE x.video_id = s.video_id)
+          ORDER BY s.plays DESC LIMIT ?`).all(ANALYSIS_MAX_S, n - out.length));
+      }
+      const up = this.#sql(`INSERT INTO song_analysis(video_id, server, lease_until) VALUES(?,?,?)
+        ON CONFLICT(video_id) DO UPDATE SET server=excluded.server, lease_until=excluded.lease_until`);
+      for (const r of out) up.run(r.video_id, String(server || "?").slice(0, 40), until);
+      return out.map((r) => ({ videoId: r.video_id, durationS: r.duration_s ?? null }));
+    });
+  }
+
+  /** Store an analyzer's result; throws Error("invalid_...") on bad values. */
+  saveAnalysis(videoId, result, server, now = Date.now()) {
+    const r = result || {};
+    const num = (v, lo, hi, name, { clamp = false, required = false } = {}) => {
+      if (v == null) {
+        if (required) throw new Error(`invalid_${name}`);
+        return null;
+      }
+      const x = Number(v);
+      if (typeof v === "boolean" || !Number.isFinite(x)) throw new Error(`invalid_${name}`);
+      if (clamp) return Math.min(hi, Math.max(lo, x));
+      if (x < lo || x > hi) throw new Error(`invalid_${name}`);
+      return x;
+    };
+    const p = (name) => num(r[name], 0, 1, name, { clamp: true });
+    const bpm = num(r.bpm, 30, 300, "bpm");
+    const strength = num(r.keyStrength, 0, 1, "keyStrength", { clamp: true });
+    const loudness = num(r.loudness, -100, 20, "loudness");
+    let key = null, scale = null;
+    if (r.key != null) {
+      if (!/^[A-G][#b]?$/.test(String(r.key))) throw new Error("invalid_key");
+      key = String(r.key);
+    }
+    if (r.scale != null) {
+      if (r.scale !== "major" && r.scale !== "minor") throw new Error("invalid_scale");
+      scale = r.scale;
+    }
+    let genres = null;
+    if (r.genres != null) {
+      if (!Array.isArray(r.genres)) throw new Error("invalid_genres");
+      genres = r.genres.slice(0, 5).map((g) => ({
+        name: String(g?.name ?? "").slice(0, 100),
+        p: Math.min(1, Math.max(0, Number(g?.p) || 0)),
+      })).filter((g) => g.name);
+    }
+    const row = [bpm, key, scale, strength, loudness, p("energy"), p("danceability"), p("happy"), p("sad"), p("relaxed"),
+      p("aggressive"), p("party"), p("acoustic"), p("electronic"), p("instrumental"), p("valence"), p("arousal"),
+      genres ? JSON.stringify(genres) : null, r.model == null ? null : String(r.model).slice(0, 80),
+      String(server || "?").slice(0, 40), now];
+    this.#sql(`INSERT INTO song_analysis(video_id, bpm, key, scale, key_strength, loudness, energy, danceability, happy,
+      sad, relaxed, aggressive, party, acoustic, electronic, instrumental, valence, arousal, genres_json, model, server,
+      analyzed_at, lease_until, error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
+      ON CONFLICT(video_id) DO UPDATE SET bpm=excluded.bpm, key=excluded.key, scale=excluded.scale,
+        key_strength=excluded.key_strength, loudness=excluded.loudness, energy=excluded.energy,
+        danceability=excluded.danceability, happy=excluded.happy, sad=excluded.sad, relaxed=excluded.relaxed,
+        aggressive=excluded.aggressive, party=excluded.party, acoustic=excluded.acoustic,
+        electronic=excluded.electronic, instrumental=excluded.instrumental, valence=excluded.valence,
+        arousal=excluded.arousal, genres_json=excluded.genres_json, model=excluded.model, server=excluded.server,
+        analyzed_at=excluded.analyzed_at, lease_until=NULL, error=NULL`).run(videoId, ...row);
+  }
+
+  /** The song could not be analyzed: marked done so it is not offered again. */
+  saveAnalysisError(videoId, error, now = Date.now()) {
+    this.#sql(`INSERT INTO song_analysis(video_id, analyzed_at, error) VALUES(?,?,?)
+      ON CONFLICT(video_id) DO UPDATE SET analyzed_at=excluded.analyzed_at, error=excluded.error, lease_until=NULL`)
+      .run(videoId, now, String(error || "error").slice(0, 300));
+  }
+
+  /** null until analyzed successfully. */
+  analysisInfo(videoId) {
+    const r = this.#sql("SELECT * FROM song_analysis WHERE video_id=?").get(videoId);
+    if (!r || r.analyzed_at == null || r.error != null) return null;
+    return {
+      bpm: r.bpm, key: r.key, scale: r.scale, keyStrength: r.key_strength, loudness: r.loudness,
+      energy: r.energy, danceability: r.danceability,
+      mood: { happy: r.happy, sad: r.sad, relaxed: r.relaxed, aggressive: r.aggressive, party: r.party },
+      valence: r.valence, arousal: r.arousal, acoustic: r.acoustic, electronic: r.electronic,
+      instrumental: r.instrumental, genres: parse(r.genres_json, []),
+    };
+  }
+
+  analysisStats(now = Date.now()) {
+    const n = (q, ...a) => this.#sql(q).get(...a).n;
+    return {
+      analyzed: n("SELECT COUNT(*) n FROM song_analysis WHERE analyzed_at IS NOT NULL AND error IS NULL"),
+      failed: n("SELECT COUNT(*) n FROM song_analysis WHERE error IS NOT NULL"),
+      leased: n("SELECT COUNT(*) n FROM song_analysis WHERE analyzed_at IS NULL AND lease_until >= ?", now),
     };
   }
 

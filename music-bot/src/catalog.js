@@ -304,6 +304,27 @@ function watchSlowQueries(db) {
   };
 }
 
+/**
+ * A song's artists for cards: the tracks table's [{name, id}] first (YouTube
+ * Music, with channel ids); archived songs keep plain names ["A", "B"] from
+ * yt-dlp. Unnamed and repeated entries are dropped.
+ */
+function cardArtists(tracksJson, songsJson) {
+  const out = [];
+  const seen = new Set();
+  for (const src of [tracksJson, songsJson]) {
+    for (const a of parse(src, [])) {
+      const name = typeof a === "string" ? a : a?.name;
+      const key = String(name ?? "").trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push({ id: typeof a === "object" ? a?.id ?? null : null, name: String(name).trim() });
+    }
+    if (out.length) break;
+  }
+  return out.slice(0, 6);
+}
+
 export class Catalog {
   /** ftsTokenizer: override (tests) e.g. "unicode61 remove_diacritics 2" to force the fallback. */
   constructor(file, { ftsTokenizer, readOnly = false } = {}) {
@@ -1901,7 +1922,7 @@ export class Catalog {
         const src = t ?? s;
         out.set(id, {
           videoId: id, title: s?.title ?? t?.title ?? null,
-          artists: parse(s?.artists_json ?? t?.artists_json, []).map((a) => ({ id: a?.id ?? null, name: a?.name })),
+          artists: cardArtists(t?.artists_json, s?.artists_json),
           album: src.album ?? s?.album ?? null, durationS: src.duration_s ?? s?.duration_s ?? null,
           archived: s?.status === "stored", plays: s?.plays ?? 0, listeners: L.get(id)?.listeners ?? 0,
         });

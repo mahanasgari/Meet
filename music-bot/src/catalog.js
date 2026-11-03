@@ -232,6 +232,8 @@ export class Catalog {
   }
 
   #q = new Map();
+  #cursor = {}; // per enricher: last tracks rowid handed out
+  #cursorIdle = {};
   #sql(text) {
     let s = this.#q.get(text);
     if (!s) this.#q.set(text, (s = this.db.prepare(text)));
@@ -993,19 +995,38 @@ export class Catalog {
   }
 
   /** Tracks not yet looked up on Spotify: archived + most played first, then the rest. */
+  // Picks without sorting the whole catalog (the artist crawl makes it
+  // hundreds of thousands of songs; a full sort froze the server for a
+  // minute): archived songs first, most played first, then the rest in
+  // insertion order from where the last pick stopped.
   nextSpotifyTracks(limit) {
-    return this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
-      FROM tracks t
-      LEFT JOIN spotify_tracks st ON st.video_id = t.video_id
-      LEFT JOIN songs s ON s.video_id = t.video_id
-      LEFT JOIN (SELECT video_id, COUNT(*) n FROM plays GROUP BY video_id) p ON p.video_id = t.video_id
-      WHERE st.video_id IS NULL AND t.title IS NOT NULL AND t.title != ''
-      ORDER BY (s.status = 'stored') DESC, COALESCE(p.n, 0) DESC, t.first_seen
-      LIMIT ?`).all(limit).map((r) => ({
+    const row = (r) => ({
       videoId: r.video_id, title: r.title,
       artist: parse(r.artists_json, [])[0]?.name ?? null, durationS: r.duration_s,
-    }));
+    });
+    const out = this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
+      FROM songs s JOIN tracks t ON t.video_id = s.video_id
+      WHERE s.status = 'stored' AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM spotify_tracks x WHERE x.video_id = t.video_id)
+      ORDER BY (SELECT COUNT(*) FROM plays p WHERE p.video_id = s.video_id) DESC
+      LIMIT ?`).all(limit).map(row);
+    if (out.length >= limit || Date.now() < (this.#cursorIdle.spotify_tracks ?? 0)) return out;
+    const seen = new Set(out.map((t) => t.videoId));
+    const rest = this.#sql(`SELECT t.rowid r, t.video_id, t.title, t.artists_json, t.duration_s
+      FROM tracks t
+      WHERE t.rowid > ? AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM spotify_tracks x WHERE x.video_id = t.video_id)
+      ORDER BY t.rowid LIMIT ?`).all(this.#cursor.spotify_tracks ?? 0, limit - out.length);
+    if (rest.length) this.#cursor.spotify_tracks = rest.at(-1).r;
+    else {
+      // Reached the end: start over later, for songs added since.
+      this.#cursor.spotify_tracks = 0;
+      this.#cursorIdle.spotify_tracks = Date.now() + 30 * 60_000;
+    }
+    for (const r of rest) if (!seen.has(r.video_id)) out.push(row(r));
+    return out;
   }
+
 
   /** [match]: null = looked, nothing found (not looked up again). */
   saveSpotifyTrack(videoId, match, now = Date.now()) {
@@ -1054,19 +1075,38 @@ export class Catalog {
   }
 
   /** Tracks without Deezer/iTunes info yet: archived + most played first, then the rest. */
+  // Picks without sorting the whole catalog (the artist crawl makes it
+  // hundreds of thousands of songs; a full sort froze the server for a
+  // minute): archived songs first, most played first, then the rest in
+  // insertion order from where the last pick stopped.
   nextSongInfo(limit) {
-    return this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
-      FROM tracks t
-      LEFT JOIN song_info si ON si.video_id = t.video_id
-      LEFT JOIN songs s ON s.video_id = t.video_id
-      LEFT JOIN (SELECT video_id, COUNT(*) n FROM plays GROUP BY video_id) p ON p.video_id = t.video_id
-      WHERE si.video_id IS NULL AND t.title IS NOT NULL AND t.title != ''
-      ORDER BY (s.status = 'stored') DESC, COALESCE(p.n, 0) DESC, t.first_seen
-      LIMIT ?`).all(limit).map((r) => ({
+    const row = (r) => ({
       videoId: r.video_id, title: r.title,
       artist: parse(r.artists_json, [])[0]?.name ?? null, durationS: r.duration_s,
-    }));
+    });
+    const out = this.#sql(`SELECT t.video_id, t.title, t.artists_json, t.duration_s
+      FROM songs s JOIN tracks t ON t.video_id = s.video_id
+      WHERE s.status = 'stored' AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM song_info x WHERE x.video_id = t.video_id)
+      ORDER BY (SELECT COUNT(*) FROM plays p WHERE p.video_id = s.video_id) DESC
+      LIMIT ?`).all(limit).map(row);
+    if (out.length >= limit || Date.now() < (this.#cursorIdle.song_info ?? 0)) return out;
+    const seen = new Set(out.map((t) => t.videoId));
+    const rest = this.#sql(`SELECT t.rowid r, t.video_id, t.title, t.artists_json, t.duration_s
+      FROM tracks t
+      WHERE t.rowid > ? AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM song_info x WHERE x.video_id = t.video_id)
+      ORDER BY t.rowid LIMIT ?`).all(this.#cursor.song_info ?? 0, limit - out.length);
+    if (rest.length) this.#cursor.song_info = rest.at(-1).r;
+    else {
+      // Reached the end: start over later, for songs added since.
+      this.#cursor.song_info = 0;
+      this.#cursorIdle.song_info = Date.now() + 30 * 60_000;
+    }
+    for (const r of rest) if (!seen.has(r.video_id)) out.push(row(r));
+    return out;
   }
+
 
   /** [deezer]/[itunes]: null = looked, nothing found (not looked up again). */
   saveSongInfo(videoId, { deezer = null, itunes = null } = {}, now = Date.now()) {

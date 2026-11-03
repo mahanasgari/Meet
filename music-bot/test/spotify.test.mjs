@@ -111,12 +111,16 @@ function seeded() {
 
 test("catalog round trip", () => {
   const cat = seeded();
-  assert.deepEqual(cat.nextSpotifyTracks(10).map((t) => t.videoId), ["stored", "played", "old", "new"]);
-  assert.deepEqual(cat.nextSpotifyTracks(1)[0], { videoId: "stored", title: "Stored", artist: "A3", durationS: 300 });
-  assert.equal(cat.nextSpotifyTracks(10).find((t) => t.videoId === "new").artist, null);
+  // Archived songs first, then the rest in the order they were added; each
+  // pick continues after the last one (no full sort of the catalog).
+  const first = cat.nextSpotifyTracks(10);
+  assert.deepEqual(first.map((t) => t.videoId), ["stored", "old", "new", "played"]);
+  assert.deepEqual(first[0], { videoId: "stored", title: "Stored", artist: "A3", durationS: 300 });
+  assert.equal(first.find((t) => t.videoId === "new").artist, null);
+  assert.deepEqual(cat.nextSpotifyTracks(10).map((t) => t.videoId), ["stored"], "the rest was handed out; only the archived one again until saved");
   cat.saveSpotifyTrack("stored", { id: "s1", isrc: "I", popularity: 40, explicit: true, releaseDate: "2020", albumId: "al", albumName: "N", albumType: "single", trackNumber: 1, score: 0.9, artists: [{ id: "a1", name: "One" }, { id: "a2", name: "Two" }] }, 5);
   cat.saveSpotifyTrack("played", null, 6);
-  assert.deepEqual(cat.nextSpotifyTracks(10).map((t) => t.videoId), ["old", "new"]);
+  assert.deepEqual(cat.nextSpotifyTracks(10), [], "end reached: waits before starting over");
   assert.deepEqual(cat.spotifyStats(), { checked: 2, matched: 1, artists: 2, artistsFetched: 0 });
   assert.deepEqual(cat.spotifyArtistsToFetch(10).sort(), ["a1", "a2"]);
   cat.saveSpotifyArtists([{ id: "a1", name: "One", genres: ["pop"], popularity: 7, followers: 99 }], 9);

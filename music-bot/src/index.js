@@ -33,6 +33,7 @@ import { Monitor, parseServices, slug } from "./monitor.js";
 import { TelegramBot, escHtml } from "./telegram_bot.js";
 import { updateYtdlp } from "./ytdlp_update.js";
 import { dailyReport, weeklyReport } from "./reports.js";
+import { ReportStore } from "./error_reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
@@ -41,6 +42,8 @@ import { Recommender } from "./recommend.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
+import { AccountStore } from "./accounts.js";
+import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
 import { DeezerClient, ItunesClient, SongInfoEnricher } from "./song_info.js";
@@ -162,6 +165,7 @@ const userLimiter = new RateLimiter(
   10 * 60_000,
 );
 const redeemLimiter = new RateLimiter(10, 10 * 60_000);
+const accountLimiter = new RateLimiter(10, 10 * 60_000);
 let remoteBlocked = new Set();
 setInterval(() => usage.save(), 60_000).unref();
 async function refreshBlocked() {
@@ -504,6 +508,7 @@ const ARCHIVE_ON =
   process.env.ARCHIVE !== "0" &&
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_STORE_BOT_TOKEN && process.env.TG_STORE_CHANNEL);
 const catalog = ARCHIVE_ON && !HOME_URL ? new Catalog(joinPath(SHARES, "catalog", "catalog.db")) : null;
+const errorReports = catalog ? new ReportStore({ file: joinPath(SHARES, "reports.jsonl") }) : null;
 /** Healthy music servers for peer hand-offs, best first (home only). */
 function healthyPeers() {
   if (!monitor) return [];
@@ -760,6 +765,7 @@ if (catalog) {
 
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
+const accounts = catalog ? new AccountStore({ dir: joinPath(SHARES, "accounts") }) : null;
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
 // New songs of the artists a friend follows or plays (Home "New from your
 // artists"): YouTube newest-first search, confirmed on YouTube Music.
@@ -1287,6 +1293,9 @@ function requireApiToken(req, res, { optional = false } = {}) {
   sendJson(res, 401, { error: "unauthorized" });
   return false;
 }
+
+const clientIp = (req) =>
+  String(req.headers["x-real-ip"] || req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
 
 /** Hosts that need yt-dlp (page URLs, not raw media files). */
 const EXTRACTOR_HOST_RE =
@@ -3275,6 +3284,20 @@ const server = http.createServer(async (req, res) => {
     trackRequest(req, res, url);
     if (corsAndPackedHeaders(req, res, url)) return;
 
+    // Mirrors have no catalog/accounts: hand home-only requests to home so
+    // phones that can't reach its domain still work.
+    if (!catalog && HOME_URL && isHomeOnlyPath(url.pathname)) {
+      await proxyToHome({
+        homeUrl: HOME_URL,
+        req,
+        res,
+        url,
+        isMaster: isMasterToken(req),
+        ip: clientIp(req),
+      });
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, {
         ok: true,
@@ -3472,6 +3495,84 @@ const server = http.createServer(async (req, res) => {
         token: makeUserToken(MUSIC_API_TOKEN, entry.uid),
         name: entry.name,
       });
+      return;
+    }
+    // --- Accounts (home only; mirrors forward /account/*).
+    if (url.pathname.startsWith("/account/")) {
+      const sub = url.pathname.slice("/account/".length);
+      if (!accounts) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      if (req.method === "POST" && ["signup", "login", "recover"].includes(sub)) {
+        if (!accountLimiter.hit(clientIp(req))) {
+          sendJson(res, 429, { error: "too_many_attempts" });
+          return;
+        }
+        if (sub === "signup" && !requireApiToken(req, res)) return;
+        const body = await readBody(req, 4_000).catch(() => ({}));
+        if (sub === "signup") {
+          if (!req.mpUser) {
+            sendJson(res, 400, { error: "no_user" });
+            return;
+          }
+          try {
+            const { recoveryCode } = accounts.signup({ username: body.username, password: body.password, uid: req.mpUser });
+            sendJson(res, 200, {
+              token: makeUserToken(MUSIC_API_TOKEN, req.mpUser),
+              username: accounts.usernameOf(req.mpUser),
+              recoveryCode,
+            });
+          } catch (e) {
+            const code = String(e.message);
+            sendJson(res, code === "taken" || code === "has_account" ? 409 : 400, { error: code });
+          }
+          return;
+        }
+        const uid =
+          sub === "login"
+            ? accounts.login({ username: body.username, password: body.password })
+            : accounts.recover({ username: body.username, recoveryCode: body.recoveryCode, newPassword: body.newPassword });
+        if (!uid) {
+          sendJson(res, 401, { error: sub === "login" ? "wrong_login" : "wrong_recovery" });
+          return;
+        }
+        if (isBlocked(uid)) {
+          sendJson(res, 403, { error: "blocked" });
+          return;
+        }
+        const username = accounts.usernameOf(uid);
+        sendJson(res, 200, { token: makeUserToken(MUSIC_API_TOKEN, uid), username, ...(sub === "login" ? { uid } : {}) });
+        return;
+      }
+      if (sub === "me" && req.method === "GET") {
+        if (!requireApiToken(req, res)) return;
+        sendJson(res, 200, { username: req.mpUser ? accounts.usernameOf(req.mpUser) : null });
+        return;
+      }
+      if (sub === "data" && (req.method === "GET" || req.method === "PUT")) {
+        if (!requireApiToken(req, res)) return;
+        if (!req.mpUser || !accounts.usernameOf(req.mpUser)) {
+          sendJson(res, 403, { error: "no_account" });
+          return;
+        }
+        if (req.method === "GET") {
+          sendJson(res, 200, accounts.getData(req.mpUser));
+          return;
+        }
+        const body = await readBody(req, 2_500_000).catch(() => null);
+        if (!body || !("data" in body)) {
+          sendJson(res, 400, { error: "bad_body" });
+          return;
+        }
+        try {
+          sendJson(res, 200, { updatedAt: accounts.putData(req.mpUser, body.data) });
+        } catch {
+          sendJson(res, 413, { error: "too_big" });
+        }
+        return;
+      }
+      sendJson(res, 404, { error: "not_found" });
       return;
     }
     if (req.method === "GET" && url.pathname === "/app/revoked.json") {
@@ -4054,6 +4155,44 @@ const server = http.createServer(async (req, res) => {
         console.error("[releases]", e.message);
         sendJson(res, 502, { error: "releases_failed" });
       }
+      return;
+    }
+
+    // --- Anonymous error reports from the apps (home only).
+    if (req.method === "POST" && url.pathname === "/reports") {
+      if (!requireApiToken(req, res)) return;
+      if (!errorReports) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const body = await readBody(req, 32_768).catch(() => null);
+      if (!body || !Array.isArray(body.reports)) {
+        sendJson(res, 400, { error: "bad_request" });
+        return;
+      }
+      const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "");
+      let stored = 0;
+      for (const r of body.reports.slice(0, 20)) {
+        if (errorReports.add(r, { uid: req.mpUser || null, ip })) stored++;
+      }
+      sendJson(res, 200, { ok: true, stored });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/admin/reports") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!errorReports) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 200, 1), 1000);
+      const kind = url.searchParams.get("kind") || undefined;
+      sendJson(res, 200, {
+        latest: errorReports.latest({ limit, kind }),
+        summary24h: errorReports.summary(Date.now() - 86_400_000),
+      });
       return;
     }
 

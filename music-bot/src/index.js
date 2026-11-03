@@ -5,6 +5,7 @@
  * State is in-memory only. Failures here must not affect the Meet web app.
  */
 
+import { Worker } from "node:worker_threads";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import {
@@ -564,14 +565,30 @@ if (catalog) {
   setTimeout(seed, 10 * 60_000).unref();
   setInterval(seed, 6 * 3600_000).unref();
   // A consistent copy for the nightly backup (the live file is in WAL mode).
+  // VACUUM INTO takes minutes on home's disk: on a worker thread with its own
+  // connection, so the server keeps answering meanwhile.
+  let snapshotting = false;
   const snapshot = () => {
-    try {
-      const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
-      rmSync(out, { force: true });
-      catalog.db.exec(`VACUUM INTO '${out.replace(/'/g, "''")}'`);
-    } catch (e) {
-      console.error("[archive] snapshot:", e.message);
-    }
+    if (snapshotting) return;
+    snapshotting = true;
+    const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
+    const src = joinPath(SHARES, "catalog", "catalog.db");
+    const w = new Worker(
+      `const { workerData: d } = process.getBuiltinModule("node:worker_threads");
+       const { rmSync } = process.getBuiltinModule("node:fs");
+       const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+       rmSync(d.out, { force: true });
+       const db = new DatabaseSync(d.src, { readOnly: true });
+       db.exec("VACUUM INTO '" + d.out.replace(/'/g, "''") + "'");
+       db.close();`,
+      { eval: true, workerData: { src, out } },
+    );
+    const t = Date.now();
+    w.on("error", (e) => console.error("[archive] snapshot:", e.message));
+    w.on("exit", () => {
+      snapshotting = false;
+      console.log(`[archive] catalog snapshot in ${Math.round((Date.now() - t) / 1000)} s`);
+    });
   };
   setTimeout(snapshot, 15 * 60_000).unref();
   setInterval(snapshot, 6 * 3600_000).unref();
@@ -733,17 +750,27 @@ if (catalog) {
   // Background copies into the search tables, small batches (2000 / 1000 rows) so the loop never stalls:
   // song_tags from old Last.fm / analysis rows, and the smart-search text index over tracks.
   {
-    const batch = (name, fn, everyMs) => {
-      const t = setInterval(() => {
+    // Self-throttling: a slice slower than 100 ms (busy disk) halves the next
+    // one and doubles the wait; fast slices grow back.
+    const batch = (name, fn, maxRows, everyMs) => {
+      let rows = Math.min(500, maxRows);
+      let wait = everyMs;
+      const step = () => {
+        let done = false;
         try {
-          const r = fn();
-          if (r.done) { clearInterval(t); console.log(`[${name}] done`); }
+          const t = performance.now();
+          done = fn(rows).done;
+          const ms = performance.now() - t;
+          if (ms > 100) { rows = Math.max(50, rows >> 1); wait = Math.min(60_000, wait * 2); }
+          else if (ms < 40) { rows = Math.min(maxRows, rows * 2); wait = Math.max(everyMs, wait >> 1); }
         } catch (e) { console.error(`[${name}]`, e.message); }
-      }, everyMs);
-      t.unref();
+        if (done) console.log(`[${name}] done`);
+        else setTimeout(step, wait).unref();
+      };
+      setTimeout(step, everyMs).unref();
     };
-    batch("song-tags-backfill", () => catalog.backfillSongTags(1000), 2000);
-    batch("search-fts", () => catalog.ftsFill(2000), 2000);
+    batch("song-tags-backfill", (n) => catalog.backfillSongTags(n), 1000, 2000);
+    batch("search-fts", (n) => catalog.ftsFill(n), 2000, 2000);
   }
 
   // Grow the archive around what friends like: every song of the artists

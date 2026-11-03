@@ -258,12 +258,47 @@ const jobPriority = (reason) => Math.max(0, JOB_ORDER.indexOf(reason) - 1);
 
 const OTHER_VERSION_RE = /\b(live|unplugged|acoustic|remix|cover|karaoke|teaser|trailer|behind the scenes)\b|لایو|آنپلاگد|ریمیکس|کاور|تیزر/i;
 
+const SLOW_QUERY_MS = Number(process.env.SLOW_QUERY_MS) || 300;
+
+/**
+ * node:sqlite is synchronous: a slow statement freezes the whole server. Log
+ * every statement slower than SLOW_QUERY_MS with its SQL, so the culprit is
+ * named in the logs instead of guessed.
+ */
+function watchSlowQueries(db) {
+  const slow = (sql, ms) => console.error(`[slow-sql] ${Math.round(ms)} ms ${String(sql).replace(/\s+/g, " ").slice(0, 160)}`);
+  const prepare = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    const st = prepare(sql);
+    for (const m of ["all", "get", "run"]) {
+      const f = st[m].bind(st);
+      st[m] = (...a) => {
+        const t = performance.now();
+        try { return f(...a); } finally {
+          const ms = performance.now() - t;
+          if (ms > SLOW_QUERY_MS) slow(sql, ms);
+        }
+      };
+    }
+    return st;
+  };
+  const exec = db.exec.bind(db);
+  db.exec = (sql) => {
+    const t = performance.now();
+    try { return exec(sql); } finally {
+      const ms = performance.now() - t;
+      if (ms > SLOW_QUERY_MS) slow(sql, ms);
+    }
+  };
+}
+
 export class Catalog {
   /** ftsTokenizer: override (tests) e.g. "unicode61 remove_diacritics 2" to force the fallback. */
   constructor(file, { ftsTokenizer } = {}) {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    watchSlowQueries(this.db);
     this.#migrate();
     this.#initFts(ftsTokenizer);
   }

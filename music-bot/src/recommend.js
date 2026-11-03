@@ -14,6 +14,7 @@ const HISTORY_DAYS = 90;
 const WINDOW = 5; // positions looked ahead when counting co-occurrence
 const MAX_NEIGHBORS = 50;
 const HALF_LIFE_DAYS = 14;
+const LASTFM_WEIGHT = 0.6; // Last.fm similarity (0..1) scale next to related 1.0 and co-listening 1.5*sim
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
 const SAME_LISTEN_MS = 15 * MIN;
 const FEEDBACK = new Set(["play", "skip", "like", "dislike", "fav", "unfav"]);
@@ -326,6 +327,14 @@ export class Recommender {
       add(nb.id, 1.5 * nb.sim, `Friends who play ${seedTitle} also play this`);
     }
 
+    // 2b. Last.fm similar songs, both directions (indexed by video_id / similar_id).
+    for (const r of this.#q("SELECT similar_id id, match FROM lastfm_similar WHERE video_id=?").all(seed)) {
+      add(r.id, LASTFM_WEIGHT * (r.match ?? 0), `Similar to ${seedTitle} on Last.fm`);
+    }
+    for (const r of this.#q("SELECT video_id id, match FROM lastfm_similar WHERE similar_id=?").all(seed)) {
+      add(r.id, LASTFM_WEIGHT * (r.match ?? 0), `Similar to ${seedTitle} on Last.fm`);
+    }
+
     // 3. Same artist and similar artists.
     const { ids, names } = this.#artistsOf(seed);
     const label = names[0] ?? "this artist";
@@ -354,7 +363,25 @@ export class Recommender {
         }
       }
     }
+    // Last.fm similar artists (forward lookup by artist id).
+    for (const aid of ids) {
+      for (const r of this.#q("SELECT similar_id id, match FROM lastfm_artist_similar WHERE artist_id=? ORDER BY match DESC LIMIT 20").all(aid)) {
+        if (seenArtists.has(r.id)) continue;
+        seenArtists.add(r.id);
+        const name = this.#q("SELECT name FROM artists WHERE id=?").get(r.id)?.name ?? null;
+        const w = 0.4 * LASTFM_WEIGHT / 0.6 * (r.match ?? 0) * 0.75;
+        for (const id of byArtist([r.id], name, 10)) {
+          add(id, w, name ? `By ${name}, similar to ${label} on Last.fm` : `Similar to ${label} on Last.fm`);
+        }
+      }
+    }
     return cands;
+  }
+
+  /** 0..1 log-scaled Last.fm listeners of a song (0 when unknown). */
+  #lfPop(id) {
+    const l = this.#q("SELECT listeners FROM lastfm_tracks WHERE video_id=?").get(id)?.listeners;
+    return l ? Math.min(1, Math.log10(1 + l) / 7) : 0;
   }
 
   /**
@@ -373,7 +400,8 @@ export class Recommender {
   /** Songs like this one: graph edges, co-listening and artist links merged into a 0..1 score. */
   similarTo(videoId, { limit = 20 } = {}) {
     const cands = this.#candidates(videoId);
-    for (const [id, c] of cands) c.score *= this.#skipFactor(id, videoId);
+    // Popular songs (Last.fm listeners, log-scaled) win ties by up to 5%.
+    for (const [id, c] of cands) c.score *= this.#skipFactor(id, videoId) * (1 + 0.05 * this.#lfPop(id));
     let top = 0;
     for (const c of cands.values()) top = Math.max(top, c.score);
     const out = [];

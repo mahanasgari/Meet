@@ -39,6 +39,7 @@ import { Catalog } from "./catalog.js";
 import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
+import { LastfmClient, LastfmEnricher } from "./lastfm.js";
 import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
@@ -689,6 +690,17 @@ if (catalog) {
     setInterval(() => {
       songInfo.tick().catch((e) => console.error("[song-info]", e.message));
     }, (Number(process.env.SONG_INFO_EVERY_S) || 4) * 1000).unref();
+  }
+
+  // Last.fm: listeners, tags, similar songs and artists (needs LASTFM_API_KEY).
+  if (process.env.LASTFM_API_KEY) {
+    console.log("[lastfm] on");
+    const lastfm = new LastfmEnricher({ catalog, client: new LastfmClient({ apiKey: process.env.LASTFM_API_KEY }) });
+    setInterval(() => {
+      lastfm.tick().catch((e) => console.error("[lastfm]", e.message));
+    }, (Number(process.env.LASTFM_EVERY_S) || 2.5) * 1000).unref();
+  } else {
+    console.log("[lastfm] off (no LASTFM_API_KEY)");
   }
 
   // Grow the archive around what friends like: every song of the artists
@@ -4208,7 +4220,9 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: "invalid_id" });
         return;
       }
-      sendJson(res, 200, catalog.songInfo(id) || {});
+      const info = catalog.songInfo(id) || {};
+      const lastfm = catalog.lastfmInfo(id);
+      sendJson(res, 200, lastfm ? { ...info, lastfm } : info);
       return;
     }
 

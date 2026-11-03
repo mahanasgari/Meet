@@ -142,7 +142,20 @@ const MIGRATIONS = [
   );
   CREATE INDEX song_info_isrc ON song_info(isrc);`,
   // v13: picking the next download must not walk the crawl's ~800k jobs.
-  `CREATE INDEX IF NOT EXISTS jobs_queued_main ON jobs(next_at) WHERE state='queued' AND reason IS NOT 'crawl';`
+  `CREATE INDEX IF NOT EXISTS jobs_queued_main ON jobs(next_at) WHERE state='queued' AND reason IS NOT 'crawl';`,
+  // v14: Last.fm per song (listeners NULL = looked, not found), similar songs/artists.
+  `CREATE TABLE lastfm_tracks (video_id TEXT PRIMARY KEY, mbid TEXT, listeners INTEGER, playcount INTEGER,
+    tags_json TEXT, lf_artist TEXT, lf_title TEXT, checked_at INTEGER);
+  CREATE TABLE lastfm_similar (video_id TEXT NOT NULL, similar_id TEXT NOT NULL, match REAL,
+    PRIMARY KEY (video_id, similar_id));
+  CREATE INDEX lastfm_similar_rev ON lastfm_similar(similar_id);
+  CREATE TABLE lastfm_similar_names (video_id TEXT NOT NULL, artist TEXT NOT NULL, title TEXT NOT NULL, match REAL,
+    PRIMARY KEY (video_id, artist, title));
+  CREATE TABLE lastfm_artists (artist_id TEXT PRIMARY KEY, mbid TEXT, listeners INTEGER, playcount INTEGER,
+    tags_json TEXT, checked_at INTEGER);
+  CREATE TABLE lastfm_artist_similar (artist_id TEXT NOT NULL, similar_id TEXT NOT NULL, match REAL,
+    PRIMARY KEY (artist_id, similar_id));
+  CREATE INDEX IF NOT EXISTS artists_name_nocase ON artists(name COLLATE NOCASE);`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -150,6 +163,7 @@ const CTX_RE = /^[a-z_]{1,20}$/;
 const CRAWL_OK_MS = 30 * DAY;
 const CRAWL_FAIL_MS = DAY;
 
+import { normTitle } from "./lastfm.js";
 const parse = (s, fallback = null) => {
   if (s == null) return fallback;
   try { return JSON.parse(s); } catch { return fallback; }
@@ -1137,6 +1151,107 @@ export class Catalog {
       checked: n("SELECT COUNT(*) n FROM song_info"),
       deezer: n("SELECT COUNT(*) n FROM song_info WHERE deezer_id IS NOT NULL"),
       itunes: n("SELECT COUNT(*) n FROM song_info WHERE itunes_id IS NOT NULL"),
+    };
+  }
+
+  // ------------------------------------------------------------ Last.fm
+
+  /** Songs not yet looked up on Last.fm: archived + most played first, then a rowid cursor over tracks. */
+  nextLastfmTracks(limit) {
+    const row = (r) => ({
+      videoId: r.video_id, title: r.title,
+      artist: parse(r.artists_json, [])[0]?.name ?? r.artist ?? null,
+    });
+    const out = this.#sql(`SELECT s.video_id, COALESCE(s.title, t.title) title, s.artist, COALESCE(s.artists_json, t.artists_json) artists_json
+      FROM songs s LEFT JOIN tracks t ON t.video_id = s.video_id
+      WHERE s.status = 'stored' AND COALESCE(s.title, t.title, '') != ''
+        AND NOT EXISTS (SELECT 1 FROM lastfm_tracks x WHERE x.video_id = s.video_id)
+      ORDER BY s.plays DESC
+      LIMIT ?`).all(limit).map(row);
+    if (out.length >= limit || Date.now() < (this.#cursorIdle.lastfm ?? 0)) return out;
+    const seen = new Set(out.map((t) => t.videoId));
+    const rest = this.#sql(`SELECT t.rowid r, t.video_id, t.title, t.artists_json
+      FROM tracks t
+      WHERE t.rowid > ? AND t.title IS NOT NULL AND t.title != ''
+        AND NOT EXISTS (SELECT 1 FROM lastfm_tracks x WHERE x.video_id = t.video_id)
+      ORDER BY t.rowid LIMIT ?`).all(this.#cursor.lastfm ?? 0, limit - out.length);
+    if (rest.length) this.#cursor.lastfm = rest.at(-1).r;
+    else {
+      this.#cursor.lastfm = 0;
+      this.#cursorIdle.lastfm = Date.now() + 30 * 60_000;
+    }
+    for (const r of rest) if (!seen.has(r.video_id)) out.push(row(r));
+    return out;
+  }
+
+  /** First artist id of a song (song_artists primary key prefix: indexed). */
+  firstArtistId(videoId) {
+    return this.#sql("SELECT artist_id FROM song_artists WHERE video_id=? ORDER BY position LIMIT 1").get(videoId)?.artist_id ?? null;
+  }
+
+  hasLastfmArtist(artistId) {
+    return !!this.#sql("SELECT 1 FROM lastfm_artists WHERE artist_id=?").get(artistId);
+  }
+
+  /** Our artist ids by name (NOCASE index). */
+  artistIdsByName(name) {
+    return this.#sql("SELECT id FROM artists WHERE name = ? COLLATE NOCASE LIMIT 5").all(name).map((r) => r.id);
+  }
+
+  /**
+   * Our video_id for a (artist, title) pair: artists by name (NOCASE index),
+   * their songs via song_artists, then title comparison. Stored songs first, then most plays.
+   */
+  findSongByName(artist, title) {
+    const want = normTitle(title, artist);
+    if (!want || !artist) return null;
+    const rows = this.#sql(`SELECT sa.video_id, COALESCE(s.title, t.title) title, s.status, s.plays
+      FROM artists a JOIN song_artists sa ON sa.artist_id = a.id
+      LEFT JOIN songs s ON s.video_id = sa.video_id
+      LEFT JOIN tracks t ON t.video_id = sa.video_id
+      WHERE a.name = ? COLLATE NOCASE LIMIT 500`).all(artist);
+    let best = null;
+    for (const r of rows) {
+      const have = normTitle(r.title, artist);
+      if (!have) continue;
+      const ok = have === want || (have.length >= 4 && want.length >= 4 && (have.includes(want) || want.includes(have)));
+      if (!ok) continue;
+      const rank = [have === want ? 1 : 0, r.status === "stored" ? 1 : 0, r.plays ?? 0];
+      if (!best || rank[1] > best.rank[1] || (rank[1] === best.rank[1] && (rank[0] > best.rank[0] || (rank[0] === best.rank[0] && rank[2] > best.rank[2])))) best = { id: r.video_id, rank };
+    }
+    return best?.id ?? null;
+  }
+
+  /** Write everything one Last.fm tick learned, in one transaction. */
+  saveLastfm({ videoId, track, similar = [], names = [], artistId = null, artist = null, artistSimilar = [] }, now = Date.now()) {
+    this.#tx(() => {
+      this.#sql(`INSERT OR REPLACE INTO lastfm_tracks(video_id,mbid,listeners,playcount,tags_json,lf_artist,lf_title,checked_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(videoId, track?.mbid ?? null, track?.listeners ?? null, track?.playcount ?? null,
+        track ? json(track.tags ?? []) : null, track?.artist ?? null, track?.title ?? null, now);
+      this.#sql("DELETE FROM lastfm_similar WHERE video_id=?").run(videoId);
+      this.#sql("DELETE FROM lastfm_similar_names WHERE video_id=?").run(videoId);
+      for (const s of similar) this.#sql("INSERT OR REPLACE INTO lastfm_similar(video_id,similar_id,match) VALUES(?,?,?)").run(videoId, s.id, s.match);
+      for (const s of names.slice(0, 50)) this.#sql("INSERT OR REPLACE INTO lastfm_similar_names(video_id,artist,title,match) VALUES(?,?,?,?)").run(videoId, s.artist, s.title, s.match);
+      if (artistId) {
+        this.#sql(`INSERT OR REPLACE INTO lastfm_artists(artist_id,mbid,listeners,playcount,tags_json,checked_at)
+          VALUES(?,?,?,?,?,?)`).run(artistId, artist?.mbid ?? null, artist?.listeners ?? null, artist?.playcount ?? null,
+          artist ? json(artist.tags ?? []) : null, now);
+        for (const s of artistSimilar) this.#sql("INSERT OR REPLACE INTO lastfm_artist_similar(artist_id,similar_id,match) VALUES(?,?,?)").run(artistId, s.id, s.match);
+      }
+    });
+  }
+
+  lastfmInfo(videoId) {
+    const r = this.#sql("SELECT listeners, playcount, tags_json FROM lastfm_tracks WHERE video_id=?").get(videoId);
+    if (!r || r.listeners == null) return null;
+    return { listeners: r.listeners, playcount: r.playcount, tags: parse(r.tags_json, []) };
+  }
+
+  lastfmStats() {
+    const n = (q) => this.#sql(q).get().n;
+    return {
+      checked: n("SELECT COUNT(*) n FROM lastfm_tracks"),
+      found: n("SELECT COUNT(*) n FROM lastfm_tracks WHERE listeners IS NOT NULL"),
     };
   }
 

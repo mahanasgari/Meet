@@ -197,7 +197,9 @@ const MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS songs_artist ON songs(artist);
   CREATE INDEX IF NOT EXISTS plays_uid ON plays(uid, at);`,
   // v19: the dashboard's "failed downloads" list walked all ~834k jobs.
-  `CREATE INDEX IF NOT EXISTS jobs_problems ON jobs(updated_at) WHERE state='failed' OR (state='queued' AND attempts>0);`
+  `CREATE INDEX IF NOT EXISTS jobs_problems ON jobs(updated_at) WHERE state='failed' OR (state='queued' AND attempts>0);`,
+  // v20: the artist crawl's next pick sorted every not-yet-fetched artist.
+  `CREATE INDEX IF NOT EXISTS artists_page_todo ON artists(first_seen) WHERE page_at IS NULL;`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -899,7 +901,7 @@ export class Catalog {
 
   /** Artists known since before [cutoff] whose page hasn't been fetched. */
   nextArtistPages(limit = 1, cutoff = Date.now()) {
-    return this.#sql(`SELECT id FROM artists WHERE page_at IS NULL AND first_seen<=?
+    return this.#sql(`SELECT id FROM artists INDEXED BY artists_page_todo WHERE page_at IS NULL AND first_seen<=?
       ORDER BY first_seen, rowid LIMIT ?`).all(cutoff, limit).map((r) => r.id);
   }
 

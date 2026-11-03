@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "19");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "20");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "19");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "20");
   c.close();
 });
 
@@ -443,7 +443,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   const db = new DatabaseSync(file);
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   // ...and the later v9 artist-page columns, which a v3 DB never had.
-  db.exec("DROP INDEX artists_page; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
+  db.exec("DROP INDEX artists_page; DROP INDEX artists_page_todo; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
   db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;");
   db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists; DROP TABLE song_info;"); // v11-12
   db.exec("DROP TABLE lastfm_tracks; DROP TABLE lastfm_similar; DROP TABLE lastfm_similar_names; DROP TABLE lastfm_artists; DROP TABLE lastfm_artist_similar;"); // v14

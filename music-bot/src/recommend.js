@@ -473,6 +473,14 @@ export class Recommender {
     return out.sort((a, b) => b.score - a.score || (a.videoId < b.videoId ? -1 : 1)).slice(0, limit);
   }
 
+  /** One listener's history for "discover": played song ids and their most weighted songs. null when unknown. */
+  historyOf(uid, { top = 10 } = {}) {
+    const mine = uid ? this.#model().perUser.get(uid) : null;
+    if (!mine || !mine.size) return null;
+    const best = [...mine].sort((a, b) => b[1].weight - a[1].weight || (a[0] < b[0] ? -1 : 1)).slice(0, top).map(([id]) => id);
+    return { played: new Set(mine.keys()), top: best };
+  }
+
   // -------------------------------------------------------------- forUser
 
   /** Per-friend suggestions with reasons. */

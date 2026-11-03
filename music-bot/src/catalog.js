@@ -1954,5 +1954,36 @@ export class Catalog {
       .map((r) => ({ videoId: r.video_id, position: r.position ?? 0 }));
   }
 
+  /** Artist facts for the player's "About": artists row, MusicBrainz country/begin/genres, Last.fm listeners (PK lookups). */
+  artistBrief(artistId) {
+    const a = this.#sql("SELECT id, name, subscribers FROM artists WHERE id=?").get(artistId);
+    if (!a) return null;
+    const m = this.#sql("SELECT country, begin, genres_json FROM mb_artists WHERE artist_id=? AND mbid IS NOT NULL").get(artistId);
+    const l = this.#sql("SELECT listeners FROM lastfm_artists WHERE artist_id=?").get(artistId);
+    return {
+      id: a.id, name: a.name, subscribers: a.subscribers ?? null, listeners: l?.listeners ?? null,
+      country: m?.country ?? null, genres: parse(m?.genres_json, []).filter((g) => typeof g === "string").slice(0, 6), begin: m?.begin ?? null,
+    };
+  }
+
+  /** Similar artists: YouTube Music's related first, then Last.fm, then ListenBrainz; unique, with names. */
+  similarArtists(artistId, limit = 12) {
+    const out = [], seen = new Set([artistId]);
+    const take = (rows) => {
+      for (const r of rows) {
+        if (out.length >= limit) return;
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        const a = this.#sql("SELECT name, subscribers FROM artists WHERE id=?").get(r.id);
+        if (a?.name) out.push({ id: r.id, name: a.name, subscribers: a.subscribers ?? null });
+      }
+    };
+    const n = limit * 2;
+    take(this.#sql("SELECT related_id id FROM artist_related WHERE artist_id=? ORDER BY rank LIMIT ?").all(artistId, n));
+    take(this.#sql("SELECT similar_id id FROM lastfm_artist_similar WHERE artist_id=? ORDER BY match DESC LIMIT ?").all(artistId, n));
+    take(this.#sql("SELECT similar_id id FROM lb_artist_similar WHERE artist_id=? ORDER BY score DESC LIMIT ?").all(artistId, n));
+    return out;
+  }
+
   close() { this.db.close(); }
 }

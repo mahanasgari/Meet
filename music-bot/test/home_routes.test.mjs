@@ -5,7 +5,7 @@ import { forwardHeaders, isHomeOnlyPath, proxyToHome } from "../src/home_routes.
 
 test("home-only paths", () => {
   for (const p of ["/invite/redeem", "/app/latest.json", "/app/servers.json", "/app/files/x.apk", "/releases", "/chords",
-    "/song/info", "/share/song", "/s/ABCD2345", "/s/ABCD2345/audio", "/recommend", "/recommend/similar", "/account/login", "/reports", "/artists/search", "/search/smart", "/song/links", "/mood/songs", "/mood/vote"])
+    "/song/info", "/song/related", "/share/song", "/s/ABCD2345", "/s/ABCD2345/audio", "/recommend", "/recommend/similar", "/account/login", "/reports", "/artists/search", "/search/smart", "/song/links", "/mood/songs", "/mood/vote"])
     assert.ok(isHomeOnlyPath(p), p);
   for (const p of ["/health", "/app/revoked.json", "/share", "/stream", "/jam", "/recommendx", "/releases/x", "/account", "/sx", "/s/player/base.js"])
     assert.ok(!isHomeOnlyPath(p), p);

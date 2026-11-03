@@ -10,6 +10,7 @@ const HOME_ONLY = [
   /^\/releases$/,
   /^\/chords$/,
   /^\/song\/info$/,
+  /^\/song\/related$/,
   /^\/artists\/search$/,
   /^\/search\/smart$/,
   /^\/song\/links$/,

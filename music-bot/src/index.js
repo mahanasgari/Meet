@@ -50,6 +50,7 @@ import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
 import { DiscogsClient, DiscogsEnricher } from "./discogs.js";
 import { SongLinks as ExtSongLinks, OdesliBusy } from "./odesli.js";
 import { smartSearch } from "./smart_search.js";
+import { songRelated } from "./song_related.js";
 import { moodShelf, isMood } from "./mood_songs.js";
 import { FELT_MOODS, labelName } from "./mood_model.js";
 import { handleAnalysis } from "./analysis_routes.js";
@@ -4325,6 +4326,18 @@ const server = http.createServer(async (req, res) => {
         if (f) analysis.felt = { ...f, label: labelName(f.label) };
       }
       sendJson(res, 200, { ...info, ...(lastfm ? { lastfm } : {}), ...catalog.mbInfo(id), ...(analysis ? { analysis } : {}) });
+      return;
+    }
+
+    // --- The player's suggestions for one song (similar, mood, artist, discover).
+    if (req.method === "GET" && url.pathname === "/song/related") {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const uid = req.mpUser || (isMasterToken(req) ? ownerUid() : null);
+      sendJson(res, 200, songRelated(catalog, recommender, url.searchParams.get("id"), uid));
       return;
     }
 

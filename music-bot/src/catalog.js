@@ -141,6 +141,8 @@ const MIGRATIONS = [
     deezer_score REAL, itunes_score REAL, checked_at INTEGER
   );
   CREATE INDEX song_info_isrc ON song_info(isrc);`,
+  // v13: picking the next download must not walk the crawl's ~800k jobs.
+  `CREATE INDEX IF NOT EXISTS jobs_queued_main ON jobs(next_at) WHERE state='queued' AND reason IS NOT 'crawl';`
 ];
 const VIDEO_LEASE_MS = 10 * MIN;
 const VIDEO_RETRY_MS = HOUR;
@@ -386,8 +388,8 @@ export class Catalog {
       this.#reap(now);
       // The artist crawl's songs (hundreds of thousands) are looked at only
       // when nothing else waits, through their own index.
-      const rows = this.#sql(`SELECT * FROM jobs WHERE state='queued' AND next_at<=?
-        AND COALESCE(reason,'')<>'crawl'
+      const rows = this.#sql(`SELECT * FROM jobs INDEXED BY jobs_queued_main
+        WHERE state='queued' AND next_at<=? AND reason IS NOT 'crawl'
         ${urgentOnly ? "AND reason IN ('play','retry','next')" : ""}
         ORDER BY ${JOB_PRIORITY},
           CASE WHEN reason IN ('next','interest') THEN -created_at ELSE created_at END, rowid`).all(now);
@@ -400,8 +402,10 @@ export class Catalog {
       };
       for (const job of rows) take(job);
       if (picked.length < limit && !urgentOnly) {
-        const crawl = this.#sql(`SELECT * FROM jobs WHERE reason='crawl' AND state='queued' AND next_at<=?
-          ORDER BY weight DESC, rowid LIMIT ?`).all(now, (limit - picked.length) * 10 + 20);
+        // Straight down the (reason, state, weight) index: stops after a few rows.
+        const crawl = this.#sql(`SELECT * FROM jobs INDEXED BY jobs_crawl
+          WHERE reason='crawl' AND state='queued' AND next_at<=?
+          ORDER BY weight DESC LIMIT ?`).all(now, (limit - picked.length) * 10 + 20);
         for (const job of crawl) take(job);
       }
       return picked;

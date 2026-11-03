@@ -49,8 +49,8 @@ def top_genres(mean_probs, labels, k=3, min_p=0.1):
 
 
 # Energy: RMS level in dBFS mapped linearly, -40 dB (or quieter) -> 0, -10 dB (or louder) -> 1.
-ENERGY_DB_LO = -40.0
-ENERGY_DB_HI = -10.0
+ENERGY_DB_LO = -30.0
+ENERGY_DB_HI = -6.0
 
 
 def rms_dbfs(rms):
@@ -61,6 +61,15 @@ def rms_dbfs(rms):
 
 def energy_from_db(db):
     return clamp01((float(db) - ENERGY_DB_LO) / (ENERGY_DB_HI - ENERGY_DB_LO))
+
+
+def energy(db, arousal=None):
+    """Loudness alone saturates on modern masters; blend in the model's
+    arousal (0..1) when there is one."""
+    loud = energy_from_db(db)
+    if arousal is None:
+        return loud
+    return clamp01(0.35 * loud + 0.65 * float(arousal))
 
 
 def normalize_key(key):

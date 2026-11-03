@@ -181,11 +181,11 @@ def analyze(models, audio):
     if k and scale in ("major", "minor"):
         out["key"], out["scale"], out["keyStrength"] = k, scale, mapping.clamp01(strength)
 
-    # Energy/loudness: RMS in dBFS; energy maps -40..-10 dB linearly to 0..1.
+    # Energy: RMS loudness (-30..-6 dBFS → 0..1) blended with arousal.
     rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float64)))))
     db = mapping.rms_dbfs(rms)
     out["loudness"] = round(db, 2)
-    out["energy"] = mapping.energy_from_db(db)
+    out["energy"] = round(mapping.energy(db, out.get("arousal")), 4)
     return out
 
 

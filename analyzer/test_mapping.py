@@ -27,7 +27,9 @@ class Mapping(unittest.TestCase):
     def test_energy_mapping(self):
         self.assertEqual(m.energy_from_db(-60), 0.0)
         self.assertEqual(m.energy_from_db(-5), 1.0)
-        self.assertAlmostEqual(m.energy_from_db(-25), 0.5)
+        self.assertAlmostEqual(m.energy_from_db(-18), 0.5)
+        self.assertAlmostEqual(m.energy(-6, 0.0), 0.35)
+        self.assertEqual(m.energy(-18), 0.5)
         self.assertAlmostEqual(m.rms_dbfs(0.1), -20.0)
         self.assertLess(m.rms_dbfs(0), -100)
 

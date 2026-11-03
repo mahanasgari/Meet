@@ -36,7 +36,7 @@ test("related: shape, exclusions and fans", () => {
   _clearRelatedCache();
   const c = seeded();
   const r = songRelated(c, rec(), id(1), null);
-  assert.deepEqual(Object.keys(r).sort(), ["artist", "discover", "fansAlsoLike", "mood", "moreFromArtist", "similar"]);
+  assert.deepEqual(Object.keys(r).sort(), ["artist", "discover", "famousArtists", "fansAlsoLike", "hiddenGems", "mood", "moreFromArtist", "newArtists", "newFromArtist", "newLikeThis", "popularNow", "similar", "unknownArtists"]);
   assert.ok(r.similar.length > 0 && !r.similar.some((s) => s.videoId === id(1)));
   assert.deepEqual(Object.keys(r.similar[0]).sort(), ["album", "archived", "artists", "durationS", "title", "videoId"]);
   assert.equal(r.artist.name, "Ebi");
@@ -89,4 +89,96 @@ test("related: a throwing recommender still answers", () => {
   const r = songRelated(c, { similarTo() { throw new Error("boom"); } }, id(1), null);
   assert.deepEqual(r.similar, []);
   assert.equal(r.moreFromArtist.length, 15);
+});
+
+const iso = (daysAgo) => new Date(Date.now() - daysAgo * 86_400_000).toISOString().slice(0, 10);
+
+function rich() {
+  const c = seeded();
+  // more artists: a4 (tiny), a5 (huge), a6 (mid)
+  const mk = (aid, name, subs, from, n) => c.saveArtistPage(aid, {
+    name, subscribers: subs, songs: Array.from({ length: n }, (_, i) => song(from + i, `${name} song ${i}`, [{ id: aid, name }])),
+  });
+  mk("a4", "Tiny", 800, 100, 5); mk("a5", "Huge", 9_000_000, 200, 5); mk("a6", "Mid", 120_000, 300, 5);
+  c.db.prepare("INSERT INTO lastfm_artist_similar(artist_id,similar_id,match) VALUES('a1','a4',0.7),('a1','a5',0.6),('a1','a6',0.5)").run();
+  const si = c.db.prepare("INSERT INTO song_info(video_id,release_date) VALUES(?,?)");
+  // Ebi: 4 new songs in last 18 months, 1 old, rest unknown (song 1 is the current one)
+  si.run(id(2), iso(30)); si.run(id(3), iso(100)); si.run(id(4), iso(400)); si.run(id(5), iso(900)); si.run(id(6), "2005");
+  c.db.prepare("INSERT INTO mb_recordings(video_id,mbid,first_release,lb_users) VALUES(?,?,?,?)").run(id(7), "mbx", iso(60), 10);
+  // similar songs 21,22,23 (Googoosh), 41,42 (Hayedeh): recent + gems
+  si.run(id(21), iso(10)); si.run(id(22), iso(200)); si.run(id(23), iso(2000)); si.run(id(41), iso(5));
+  const lf = c.db.prepare("INSERT INTO lastfm_tracks(video_id,listeners) VALUES(?,?)");
+  lf.run(id(21), 500000); lf.run(id(22), 300); lf.run(id(23), 90000); lf.run(id(41), 100); lf.run(id(42), 1500);
+  c.db.prepare("INSERT INTO lastfm_artists(artist_id,listeners) VALUES('a5',2000000),('a4',300)").run();
+  return c;
+}
+
+test("related: newFromArtist is the artist's last 18 months, newest first", () => {
+  _clearRelatedCache();
+  const r = songRelated(rich(), rec(), id(1), null);
+  assert.deepEqual(r.newFromArtist.map((s) => s.videoId), [id(2), id(7), id(3), id(4)]);
+  assert.ok(r.newFromArtist.every((s) => s.artists[0].id === "a1"));
+});
+
+test("related: newLikeThis, popularNow and hiddenGems from the candidate pool", () => {
+  _clearRelatedCache();
+  const r = songRelated(rich(), rec(), id(1), null);
+  const nl = r.newLikeThis.map((s) => s.videoId);
+  assert.ok(nl.includes(id(21)) && nl.includes(id(22)) && nl.includes(id(41)) && !nl.includes(id(23)));
+  assert.ok(!nl.includes(id(1)));
+  assert.equal(r.popularNow[0].videoId, id(21));
+  assert.ok(r.popularNow.length <= 15);
+  const g = r.hiddenGems.map((s) => s.videoId);
+  assert.ok(g.includes(id(22)) && g.includes(id(41)) && g.includes(id(42)));
+  assert.ok(!g.includes(id(21)) && !g.includes(id(23)));
+  assert.ok(!r.hiddenGems.some((s) => s.artists[0]?.id === "a1"), "not the current artist");
+  const u = songRelated(rich(), rec(), id(1), "u1");
+  assert.ok(!u.hiddenGems.some((s) => s.videoId === id(41) || s.videoId === id(21)), "played songs excluded");
+});
+
+test("related: new, unknown and famous artists, no repeats, user's artists skipped", () => {
+  _clearRelatedCache();
+  const r = songRelated(rich(), rec(), id(1), null);
+  assert.ok(r.unknownArtists.some((a) => a.id === "a4"));
+  assert.ok(!r.unknownArtists.some((a) => a.id === "a5" || a.id === "a6"));
+  assert.deepEqual(r.famousArtists.map((a) => a.id), ["a5"]);
+  assert.ok(r.famousArtists.every((a) => a.subscribers >= 500_000 || a.listeners >= 100_000) || r.famousArtists.length === 0);
+  const ids = [...r.newArtists, ...r.unknownArtists, ...r.famousArtists].map((a) => a.id);
+  assert.equal(new Set(ids).size, ids.length, "no artist repeats");
+  assert.deepEqual(Object.keys(r.famousArtists[0]).sort(), ["id", "listeners", "name", "subscribers", "topSong"]);
+  assert.ok(r.famousArtists[0].topSong?.videoId);
+  const u = songRelated(rich(), rec(), id(1), "u1"); // u1 played Googoosh and Hayedeh songs
+  const all = [...u.newArtists, ...u.famousArtists].map((a) => a.id);
+  assert.ok(!all.includes("a2") && !all.includes("a3"));
+});
+
+test("related: ~100k songs answers in under 150 ms warm", () => {
+  _clearRelatedCache();
+  const c = new Catalog(join(mkdtempSync(join(tmpdir(), "relbig-")), "c.db"));
+  const N = 100_000, NA = 5_000;
+  c.db.exec("BEGIN");
+  const iA = c.db.prepare("INSERT INTO artists(id,name,subscribers) VALUES(?,?,?)");
+  const iT = c.db.prepare("INSERT INTO tracks(video_id,title,artists_json,year,duration_s) VALUES(?,?,?,?,200)");
+  const iS = c.db.prepare("INSERT INTO songs(video_id,status,title,artists_json,plays) VALUES(?,'stored',?,?,?)");
+  const iSA = c.db.prepare("INSERT INTO song_artists(video_id,artist_id,position) VALUES(?,?,0)");
+  const iL = c.db.prepare("INSERT INTO lastfm_tracks(video_id,listeners) VALUES(?,?)");
+  const iR = c.db.prepare("INSERT INTO artist_related(artist_id,related_id,rank) VALUES(?,?,?)");
+  for (let a = 0; a < NA; a++) {
+    iA.run(`art${a}`, `Artist ${a}`, a * 311);
+    for (let k = 1; k <= 12; k++) iR.run(`art${a}`, `art${(a + k * 7) % NA}`, k);
+  }
+  for (let n = 0; n < N; n++) {
+    const aid = `art${n % NA}`, aj = JSON.stringify([{ id: aid, name: `Artist ${n % NA}` }]);
+    iT.run(id(n), `Song ${n}`, aj, 2000 + (n % 26)); iS.run(id(n), `Song ${n}`, aj, n % 5); iSA.run(id(n), aid);
+    if (n % 3 === 0) iL.run(id(n), (n * 37) % 200000);
+  }
+  c.db.exec("COMMIT");
+  const sim = (v, { limit }) => Array.from({ length: limit }, (_, i) => ({ videoId: id((Number(v.slice(3)) + 1 + i * 13) % N), score: 1 - i / 100 }));
+  const r = { similarTo: sim, historyOf: () => ({ played: new Set(Array.from({ length: 1000 }, (_, i) => id(i * 7))), top: [id(7)] }) };
+  songRelated(c, r, id(12345), "u"); // cold
+  const times = [];
+  for (let i = 0; i < 5; i++) { _clearRelatedCache(); const t = performance.now(); const out = songRelated(c, r, id(20000 + i), "u"); times.push(performance.now() - t); assert.ok(out.similar.length > 0); }
+  times.sort((a, b) => a - b);
+  console.log("related timing ms", times.map((x) => x.toFixed(1)).join(" "));
+  assert.ok(times[2] < 150, `median ${times[2]}`);
 });

@@ -13,9 +13,21 @@ const toCard = (c) => ({ videoId: c.videoId, title: c.title, artists: c.artists,
 
 export const emptyRelated = () => ({
   similar: [], mood: { label: null, songs: [] }, artist: null, moreFromArtist: [], fansAlsoLike: [], discover: [],
+  newFromArtist: [], newLikeThis: [], popularNow: [], hiddenGems: [], newArtists: [], unknownArtists: [], famousArtists: [],
 });
 
-function compute(catalog, recommender, id, uid) {
+const DAY = 86_400_000;
+/** "2025", "2025-03", "2025-03-09" -> ms; a bare year counts as July 1st, a month as its 15th. null when unparsable. */
+export function releaseMs(d) {
+  const m = /^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/.exec(String(d ?? ""));
+  if (!m) return null;
+  const y = +m[1];
+  if (y < 1900 || y > 2100) return null;
+  const t = m[2] ? Date.UTC(y, +m[2] - 1, m[3] ? +m[3] : 15) : Date.UTC(y, 6, 1);
+  return Number.isFinite(t) ? t : null;
+}
+
+function compute(catalog, recommender, id, uid, now) {
   const out = emptyRelated();
   const exclude = new Set([id]);
 
@@ -65,7 +77,81 @@ function compute(catalog, recommender, id, uid) {
   if (avoidArtists.size) pool = pool.filter((c) => !c.artists.some((a) => a.id && avoidArtists.has(a.id)));
   if (!hist) pool.sort((a, b) => (a.plays - b.plays) || (a.videoId < b.videoId ? -1 : 1));
   out.discover = pool.slice(0, 10).map(toCard);
+  extras(catalog, out, { id, artistId, artistSongIds, simRaw, moodPool, hist, now });
   return out;
+}
+
+const small = (s, l) => (s == null || s < 50_000) && (l == null || l < 5_000) && ((s != null && s < 50_000) || (l != null && l < 5_000));
+const famous = (s, l) => (s ?? 0) >= 500_000 || (l ?? 0) >= 100_000;
+
+/** New releases, popular, hidden gems and the artist rows: one candidate pool, batched lookups (<= ~600 rows). */
+function extras(catalog, out, { id, artistId, artistSongIds, simRaw, moodPool, hist, now }) {
+  // Candidate pool with a similarity score: similar songs, mood songs, a few songs of each top similar artist.
+  const score = new Map();
+  simRaw.forEach((x) => score.set(x.videoId, x.score ?? 0.5));
+  for (const c of moodPool) if (!score.has(c.videoId)) score.set(c.videoId, 0.3);
+  const base = artistId ? catalog.similarArtists(artistId, 30) : [];
+  for (const a of base.slice(0, 6)) {
+    for (const r of catalog.songIdsOfArtist(a.id, 8)) if (!score.has(r.videoId)) score.set(r.videoId, 0.2);
+  }
+  score.delete(id);
+  const poolIds = [...score.keys()];
+  const mineIds = [...artistSongIds].filter((x) => x !== id);
+  const cards = catalog.songCards([...poolIds, ...mineIds]);
+  const facts = catalog.songFacts([...poolIds, ...mineIds]);
+  const ok = (vid) => (cards.get(vid)?.title ? cards.get(vid) : null);
+  const age = (vid) => { const t = releaseMs(facts.get(vid)?.date); return t == null ? null : now - t; };
+  const pop = (vid) => Math.max(cards.get(vid)?.listeners ?? 0, facts.get(vid)?.users ?? 0);
+  const within = (days) => (vid) => { const a = age(vid); return a != null && a >= -30 * DAY && a <= days * DAY; };
+  const played = (vid) => !!hist?.played.has(vid);
+  const pick = (ids, n) => ids.map(ok).filter(Boolean).slice(0, n).map(toCard);
+  const byScore = (a, b) => (score.get(b) - score.get(a)) || (a < b ? -1 : 1);
+
+  out.newFromArtist = pick(mineIds.filter(within(548)).sort((a, b) => (age(a) - age(b)) || (a < b ? -1 : 1)), 15);
+  out.newLikeThis = pick(poolIds.filter(within(365)).sort(byScore), 15);
+  const recent = within(1095);
+  const rank = (vid) => pop(vid) * (recent(vid) ? 2 : 1);
+  out.popularNow = pick([...new Set([...poolIds, ...mineIds])].sort((a, b) =>
+    (rank(b) - rank(a)) || ((cards.get(b)?.plays ?? 0) - (cards.get(a)?.plays ?? 0)) || (a < b ? -1 : 1)), 15);
+  out.hiddenGems = pick(poolIds.filter((vid) => {
+    const c = ok(vid);
+    if (!c || played(vid) || (artistId && c.artists.some((a) => a.id === artistId))) return false;
+    const p = pop(vid);
+    return p > 0 ? p < 2000 : c.plays <= 1;
+  }).sort(byScore), 10);
+
+  // Artists: first hop (YouTube Music, Last.fm, ListenBrainz), then one bounded hop from the top 3.
+  const cand = new Map(base.map((a) => [a.id, a]));
+  const first = new Set(cand.keys());
+  for (const a of base.slice(0, 3)) for (const b of catalog.similarArtists(a.id, 12)) if (b.id !== artistId && !cand.has(b.id)) cand.set(b.id, b);
+  const af = catalog.artistFacts([...cand.keys()]);
+  const playedArtists = hist ? catalog.artistIdsOfSongs(hist.played) : new Set();
+  const info = (a) => ({ ...a, subscribers: af.get(a.id)?.subscribers ?? a.subscribers ?? null, listeners: af.get(a.id)?.listeners ?? null });
+  const all = [...cand.values()].map(info);
+  const used = new Set();
+  const take = (list, n) => { const r = []; for (const a of list) { if (r.length >= n) break; if (!used.has(a.id)) { used.add(a.id); r.push(a); } } return r; };
+  const fresh = all.filter((a) => !playedArtists.has(a.id));
+  const isSmall = (a) => small(a.subscribers, a.listeners), isFamous = (a) => famous(a.subscribers, a.listeners);
+  // New artists: unplayed first-hop artists; the middle ones lead so the unknown/famous rows keep theirs.
+  const firstFresh = fresh.filter((a) => first.has(a.id));
+  const mid = firstFresh.filter((a) => !isSmall(a) && !isFamous(a));
+  const rest = firstFresh.filter((a) => isSmall(a) || isFamous(a));
+  const newA = take([...mid, ...(mid.length < 4 ? rest.slice(0, Math.floor(rest.length / 3)) : [])], 12);
+  const unknownA = take(all.filter(isSmall), 12);
+  const famousA = take(fresh.filter(isFamous), 12);
+  // Each artist's best known song (small LIMIT per artist, one batched card lookup).
+  const chosen = [...newA, ...unknownA, ...famousA];
+  const tops = new Map(chosen.map((a) => [a.id, catalog.songIdsOfArtist(a.id, 6).map((r) => r.videoId)]));
+  const tc = catalog.songCards([...tops.values()].flat());
+  const topOf = (a) => {
+    const best = (tops.get(a.id) ?? []).map((v) => tc.get(v)).filter((c) => c?.title)
+      .sort((x, y) => (y.listeners - x.listeners) || (y.plays - x.plays) || (x.videoId < y.videoId ? -1 : 1))[0];
+    return best ? toCard(best) : null;
+  };
+  const art = (a) => ({ id: a.id, name: a.name, subscribers: a.subscribers, listeners: a.listeners, topSong: topOf(a) });
+  out.newArtists = newA.map(art);
+  out.unknownArtists = unknownA.map(art);
+  out.famousArtists = famousA.map(art);
 }
 
 /** Cached per (videoId, uid); a bad id or unknown song gives empty lists, never a throw. */
@@ -76,7 +162,7 @@ export function songRelated(catalog, recommender, rawId, uid = null, now = Date.
   const hit = cache.get(key);
   if (hit && now - hit.at < TTL_MS) return hit.value;
   let value;
-  try { value = compute(catalog, recommender, id, uid); } catch (e) { console.error("[song/related]", e.message); return emptyRelated(); }
+  try { value = compute(catalog, recommender, id, uid, now); } catch (e) { console.error("[song/related]", e.message); return emptyRelated(); }
   if (cache.size >= MAX_CACHE) cache.clear();
   cache.set(key, { at: now, value });
   return value;

@@ -2006,5 +2006,50 @@ export class Catalog {
     return out;
   }
 
+  /** Release facts for result songs, batched primary key lookups: Map id -> {date: "YYYY-.."|null, users}. */
+  songFacts(videoIds) {
+    const out = new Map();
+    const ids = [...new Set(videoIds)];
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400), ph = chunk.map(() => "?").join(",");
+      const q = (sql) => this.#sql(sql.replace("?", ph)).all(...chunk);
+      const I = new Map(q("SELECT video_id, release_date FROM song_info WHERE video_id IN (?)").map((r) => [r.video_id, r]));
+      const M = new Map(q("SELECT video_id, first_release, lb_users FROM mb_recordings WHERE video_id IN (?)").map((r) => [r.video_id, r]));
+      const T = new Map(q("SELECT video_id, year FROM tracks WHERE video_id IN (?)").map((r) => [r.video_id, r]));
+      for (const id of chunk) {
+        const y = T.get(id)?.year;
+        out.set(id, {
+          date: I.get(id)?.release_date || M.get(id)?.first_release || (y ? String(y) : null) || null,
+          users: M.get(id)?.lb_users ?? 0,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Subscribers and Last.fm listeners per artist id (batched primary key lookups): Map id -> {name, subscribers, listeners}. */
+  artistFacts(artistIds) {
+    const out = new Map();
+    const ids = [...new Set(artistIds)];
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400), ph = chunk.map(() => "?").join(",");
+      const A = this.#sql(`SELECT id, name, subscribers FROM artists WHERE id IN (${ph})`).all(...chunk);
+      const L = new Map(this.#sql(`SELECT artist_id, listeners FROM lastfm_artists WHERE artist_id IN (${ph})`).all(...chunk).map((r) => [r.artist_id, r.listeners]));
+      for (const a of A) out.set(a.id, { name: a.name, subscribers: a.subscribers ?? null, listeners: L.get(a.id) ?? null });
+    }
+    return out;
+  }
+
+  /** Artist ids of the given songs (batched index lookups), for "artists the listener has played". */
+  artistIdsOfSongs(videoIds, max = 1500) {
+    const out = new Set();
+    const ids = [...videoIds].slice(0, max);
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400);
+      for (const r of this.#sql(`SELECT DISTINCT artist_id FROM song_artists WHERE video_id IN (${chunk.map(() => "?").join(",")})`).all(...chunk)) out.add(r.artist_id);
+    }
+    return out;
+  }
+
   close() { this.db.close(); }
 }

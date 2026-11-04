@@ -647,3 +647,15 @@ test("crawl jobs wait behind everything else, most popular first, never urgent",
   assert.equal(c.enqueue(["crawlagain0"], "interest", NOW + 1), 1);
   assert.equal(c.db.prepare("SELECT reason FROM jobs WHERE video_id='crawlagain0'").get().reason, "interest");
 });
+
+test("topPlayedArtists counts plays per artist across chunks, ignoring old plays", async () => {
+  const c = open();
+  const play = c.db.prepare("INSERT INTO plays(video_id,at,server,source,uid,ctx) VALUES(?,?,?,?,?,?)");
+  const link = c.db.prepare("INSERT INTO song_artists(video_id,artist_id,position) VALUES(?,?,0)");
+  for (const [id, artist] of [["s1", "A"], ["s2", "A"], ["s3", "B"], ["s4", "C"]]) link.run(id, artist);
+  link.run("s3", "A"); // a duet counts for both artists
+  for (const id of ["s1", "s1", "s2", "s3", "s3", "s3", "s4"]) play.run(id, NOW, "home", "disk", null, "");
+  for (let i = 0; i < 5; i++) play.run("s4", NOW - 30 * DAY, "home", "disk", null, ""); // too old
+  const top = await c.topPlayedArtists(NOW - 14 * DAY, { chunk: 2, pauseMs: 0 });
+  assert.deepEqual(top.map((r) => [r.id, r.n]), [["A", 6], ["B", 3]]);
+});

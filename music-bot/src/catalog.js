@@ -326,6 +326,25 @@ function cardArtists(tracksJson, songsJson) {
 }
 
 export class Catalog {
+  /**
+   * Artists with at least [min] plays since [since], most played first.
+   * Small pieces with pauses between them: as one join this froze the server
+   * for 30-80 s every hour on a cold cache, and audio streams on this thread.
+   */
+  async topPlayedArtists(since, { min = 3, limit = 40, chunk = 100, pauseMs = 50 } = {}) {
+    const songs = this.#sql("SELECT video_id id, COUNT(*) n FROM plays WHERE at > ? GROUP BY video_id").all(since);
+    const counts = new Map();
+    for (let i = 0; i < songs.length; i += chunk) {
+      const part = songs.slice(i, i + chunk);
+      const plays = new Map(part.map((s) => [s.id, s.n]));
+      const marks = part.map(() => "?").join(",");
+      const rows = this.db.prepare(`SELECT video_id, artist_id FROM song_artists WHERE video_id IN (${marks})`).all(...part.map((s) => s.id));
+      for (const r of rows) counts.set(r.artist_id, (counts.get(r.artist_id) ?? 0) + plays.get(r.video_id));
+      if (i + chunk < songs.length) await new Promise((done) => setTimeout(done, pauseMs));
+    }
+    return [...counts].filter(([, n]) => n >= min).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id, n]) => ({ id, n }));
+  }
+
   /** ftsTokenizer: override (tests) e.g. "unicode61 remove_diacritics 2" to force the fallback. */
   constructor(file, { ftsTokenizer, readOnly = false } = {}) {
     if (readOnly) {

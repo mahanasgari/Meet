@@ -801,10 +801,7 @@ if (catalog) {
   const seedArtists = async () => {
     try {
       // Artists with 3+ plays in two weeks, most played first.
-      const rows = catalog.db
-        .prepare(`SELECT sa.artist_id id, COUNT(*) n FROM plays p JOIN song_artists sa ON sa.video_id=p.video_id
-          WHERE p.at > ? GROUP BY sa.artist_id HAVING n >= 3 ORDER BY n DESC LIMIT 40`)
-        .all(Date.now() - 14 * 864e5);
+      const rows = await catalog.topPlayedArtists(Date.now() - 14 * 864e5);
       let done = 0;
       for (const { id } of rows) {
         if (done >= 8) break; // a few artist pages per hour

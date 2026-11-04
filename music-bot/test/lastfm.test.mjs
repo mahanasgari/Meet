@@ -159,3 +159,13 @@ test("recommender similarTo returns a Last.fm-only neighbour (both directions)",
   assert.ok(b.score > c.score);
   assert.ok(b.reasons.some((r) => r.includes("Last.fm")));
 });
+
+test("findSongByName uses the finished search index, misses stay cheap", () => {
+  const cat = new Catalog(":memory:");
+  cat.db.exec("INSERT INTO tracks(video_id,title,artists_json) VALUES ('aaaaaaaaaaa','Khalij Fars','[{\"name\":\"Ebi\",\"id\":\"UC1\"}]'),('bbbbbbbbbbb','Khalij Fars','[{\"name\":\"Someone Else\",\"id\":\"UC2\"}]')");
+  while (!cat.ftsFill(10).done);
+  assert.equal(cat.findSongByName("Ebi", "Khalij Fars"), "aaaaaaaaaaa");
+  assert.equal(cat.findSongByName("EBI", "khalij fars"), "aaaaaaaaaaa");
+  assert.equal(cat.findSongByName("Ebi", "Not In The Catalog"), null);
+  assert.equal(cat.findSongByName("Nobody", "Khalij Fars"), null);
+});

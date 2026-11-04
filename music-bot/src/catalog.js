@@ -1347,11 +1347,11 @@ export class Catalog {
   findSongByName(artist, title) {
     const want = normTitle(title, artist);
     if (!want || !artist) return null;
-    const rows = this.#sql(`SELECT sa.video_id, COALESCE(s.title, t.title) title, s.status, s.plays
+    const rows = this.#ftsDone ? this.#songsByNameFts(artist, title) : this.#sql(`SELECT sa.video_id, COALESCE(s.title, t.title) title, s.status, s.plays
       FROM artists a JOIN song_artists sa ON sa.artist_id = a.id
       LEFT JOIN songs s ON s.video_id = sa.video_id
       LEFT JOIN tracks t ON t.video_id = sa.video_id
-      WHERE a.name = ? COLLATE NOCASE LIMIT 500`).all(artist);
+      WHERE a.name = ? COLLATE NOCASE LIMIT 100`).all(artist);
     let best = null;
     for (const r of rows) {
       const have = normTitle(r.title, artist);
@@ -1362,6 +1362,22 @@ export class Catalog {
       if (!best || rank[1] > best.rank[1] || (rank[1] === best.rank[1] && (rank[0] > best.rank[0] || (rank[0] === best.rank[0] && rank[2] > best.rank[2])))) best = { id: r.video_id, rank };
     }
     return best?.id ?? null;
+  }
+
+  /**
+   * Candidates for findSongByName from the finished search index: a few index
+   * reads, where walking a big artist's songs took 30 s on home's disk. Most
+   * Last.fm names aren't in the catalog, so a miss must be cheap too.
+   */
+  #songsByNameFts(artist, title) {
+    const phrase = normSearch(title).replace(/"/g, " ").trim();
+    const who = normSearch(artist);
+    if (phrase.length < 3 || !who) return [];
+    const ids = this.ftsSearch(`"${phrase}"`, 60, false).filter((r) => r.artists?.includes(who)).slice(0, 20);
+    return ids.map((r) => {
+      const song = this.#sql("SELECT status, plays FROM songs WHERE video_id=?").get(r.videoId);
+      return { video_id: r.videoId, title: r.title, status: song?.status, plays: song?.plays };
+    });
   }
 
   /** Write everything one Last.fm tick learned, in one transaction. */

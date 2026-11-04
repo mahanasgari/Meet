@@ -337,7 +337,11 @@ export class Catalog {
     }
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    // synchronous=NORMAL: in WAL mode a commit no longer waits for a disk sync
+    // (only checkpoints do). On home's slow disk those syncs froze the whole
+    // server for ~30 s, cutting audio. A power cut can lose the last commits,
+    // never corrupt the database.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
     watchSlowQueries(this.db);
     this.#migrate();
     this.#initFts(ftsTokenizer);

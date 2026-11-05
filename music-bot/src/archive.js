@@ -171,7 +171,14 @@ export class HomeLink {
     return (await this.post("/archive/lookup", { id }, 4000)).song || null;
   }
   async claim(id, server) {
-    return this.catalog ? this.catalog.claim(id, server) : this.post("/archive/claim", { id, server }, 4000);
+    if (this.catalog) return this.catalog.claim(id, server);
+    try {
+      return await this.post("/archive/claim", { id, server }, 4000);
+    } catch {
+      // Home's disk can hang ~30 s. Waiting beats falling through to YouTube,
+      // which often fails here for a song the channel already has.
+      return this.post("/archive/claim", { id, server }, 15000);
+    }
   }
   async stored(id, info) {
     return this.catalog ? this.catalog.stored(id, info) : this.post("/archive/stored", { id, info }, 15000);

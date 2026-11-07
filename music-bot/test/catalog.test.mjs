@@ -671,3 +671,13 @@ test("artists a server's country refuses stop going to that server after two ref
   assert.deepEqual(picked, ["q1"]);
   assert.deepEqual(c.nextJobs("home", 5, NOW + 2).sort(), ["p3"]);
 });
+
+test("storedSince lists stored songs after a time, oldest first", () => {
+  const c = open();
+  for (const [id, at] of [["a1", NOW], ["a2", NOW + 2], ["a3", NOW + 1]]) {
+    c.claim(id, "s1", at);
+    c.stored(id, { msgId: at - NOW + 10, size: 5 }, at);
+  }
+  assert.deepEqual(c.storedSince(NOW).map((s) => s.id), ["a3", "a2"]);
+  assert.deepEqual(c.storedSince(0)[0], { id: "a1", msgId: 10, size: 5, at: NOW });
+});

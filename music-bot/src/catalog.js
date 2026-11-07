@@ -663,6 +663,18 @@ export class Catalog {
     });
   }
 
+  /**
+   * Stored songs archived after [since] (stored_at, ms), oldest first. Mirrors
+   * keep their own copy, so a song starts without asking home (whose disk can
+   * hang for 30 s).
+   */
+  storedSince(since = 0, limit = 5000) {
+    return this.#sql(`SELECT video_id, tg_msg_id, tg_size, stored_at FROM songs INDEXED BY songs_stored_at
+      WHERE stored_at > ? AND status='stored' AND tg_msg_id IS NOT NULL ORDER BY stored_at LIMIT ?`)
+      .all(since, limit)
+      .map((r) => ({ id: r.video_id, msgId: r.tg_msg_id, size: r.tg_size, at: r.stored_at }));
+  }
+
   // Stored songs not yet copied to the backup channel, oldest first.
   needsBackup(limit = 5) {
     return this.#sql(`SELECT video_id, tg_msg_id FROM songs WHERE status='stored' AND tg_msg_id IS NOT NULL

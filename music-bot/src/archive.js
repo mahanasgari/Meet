@@ -4,7 +4,7 @@
 // server — come from the local disk cache or the channel instead of YouTube.
 // A server YouTube is blocking hands its listeners to a healthy peer.
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { join } from "node:path";
 import { parseRange, serveFile } from "./disk_cache.js";
@@ -166,6 +166,12 @@ export class HomeLink {
     return r.json();
   }
 
+  /** Songs stored after [since], for the mirror's own index (see Archive.syncStored). */
+  async storedSince(since) {
+    if (this.catalog) return this.catalog.storedSince(since);
+    return (await this.post("/archive/stored-since", { since }, 30000)).songs || [];
+  }
+
   async lookup(id) {
     if (this.catalog) return this.catalog.lookup(id);
     return (await this.post("/archive/lookup", { id }, 4000)).song || null;
@@ -268,6 +274,12 @@ export class Archive {
     this.pending = new Map();
     this.warming = new Set(); // ids being fetched ahead of a play
     this.knownArchived = new Set(); // ids the catalog said are stored
+    // Mirrors: every stored song's channel message, synced from home, so a
+    // song starts without a round trip to home (a home freeze no longer
+    // delays it). video id -> { msgId, size }
+    this.stored = new Map();
+    this.storedAt = 0;
+    this.storedFile = join(o.dir, "stored-index.json");
     this.jobTimes = [];
     this.peerCache = { at: 0, list: [] };
     this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0 };
@@ -276,6 +288,11 @@ export class Archive {
 
   start() {
     this.tg.connect().catch((e) => this.log.error("[archive] telegram connect:", e.message));
+    if (!this.home.catalog) {
+      this.loadStored();
+      void this.syncStored();
+      setInterval(() => void this.syncStored(), 5 * 60_000).unref();
+    }
     setInterval(() => void this.flushPlays(), 30_000).unref();
     setInterval(() => void this.uploadTick(), 5_000).unref();
     setInterval(() => void this.jobTick(), 20_000).unref();
@@ -283,6 +300,44 @@ export class Archive {
 
   cooling() {
     return Date.now() < this.coolUntil;
+  }
+
+  loadStored() {
+    try {
+      const d = JSON.parse(readFileSync(this.storedFile, "utf8"));
+      for (const [id, msgId, size] of d.songs || []) this.stored.set(id, { msgId, size });
+      this.storedAt = Number(d.at) || 0;
+    } catch {
+      // first start: filled by the first sync
+    }
+  }
+
+  /** Pulls songs stored since the last sync from home (pages of 5000). */
+  async syncStored() {
+    if (this.syncing) return;
+    this.syncing = true;
+    try {
+      let added = 0;
+      for (let page = 0; page < 100; page++) {
+        const songs = await this.home.storedSince(this.storedAt);
+        for (const s of songs) {
+          this.stored.set(s.id, { msgId: s.msgId, size: s.size });
+          if (s.at > this.storedAt) this.storedAt = s.at;
+        }
+        added += songs.length;
+        if (songs.length < 5000) break;
+      }
+      if (added) {
+        const tmp = `${this.storedFile}.tmp`;
+        writeFileSync(tmp, JSON.stringify({ at: this.storedAt, songs: [...this.stored].map(([id, s]) => [id, s.msgId, s.size]) }));
+        renameSync(tmp, this.storedFile);
+        this.log.log(`[archive] stored index: ${this.stored.size} songs (+${added})`);
+      }
+    } catch (e) {
+      this.log.error("[archive] stored index sync:", e.message);
+    } finally {
+      this.syncing = false;
+    }
   }
 
   play(id, source, req) {
@@ -332,6 +387,14 @@ export class Archive {
     if (running) {
       await Promise.race([running, new Promise((r) => setTimeout(r, WAIT_INFLIGHT_MS).unref())]);
       if (this.cache.has(id)) return fromDisk();
+    }
+
+    // Known stored (mirror's own index): straight from the channel, no call
+    // to home. If the channel copy fails, the usual path below takes over.
+    const known = this.stored.get(id);
+    if (known?.msgId && (await this.serveFromTelegram(req, res, id, known))) {
+      this.play(id, "telegram", req);
+      return true;
     }
 
     // Blocked here: archived songs still come from the channel; anything
@@ -740,6 +803,7 @@ export class Archive {
         caption: songCaption(id, info),
       });
       await this.home.stored(id, { ...info, msgId: r.msgId, size: r.size, mime: r.mime, server: this.serverId });
+      this.stored.set(id, { msgId: r.msgId, size: r.size });
     } finally {
       if (thumb) rmSync(thumb, { force: true });
     }
@@ -906,6 +970,8 @@ export async function handleHomeRoute(path, body, { catalog, peers, resolveVideo
       const ids = (Array.isArray(body.ids) ? body.ids : []).filter((id) => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 300);
       return { queued: catalog.enqueue(ids, reason) };
     }
+    case "/archive/stored-since":
+      return { songs: catalog.storedSince(Number(body.since) || 0, Math.min(Number(body.limit) || 5000, 5000)) };
     case "/archive/archived":
       return { ids: catalog.archivedIds(Array.isArray(body.ids) ? body.ids.map(String) : []) };
     case "/archive/plays":

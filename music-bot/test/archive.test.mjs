@@ -628,3 +628,51 @@ test("jobTick: a song refused in this server's country doesn't use up the hour's
   await archive.jobTick();
   assert.equal(archive.jobTimes.length, 1, "a real download counts");
 });
+
+test("a mirror plays a song from its own stored index without asking home", async () => {
+  const dir = tmpDir();
+  const buffer = Buffer.from("abcdefghij");
+  const opened = [];
+  const tg = {
+    ready: true,
+    connect: async () => {},
+    open: async (msgId) => {
+      opened.push(msgId);
+      return { size: buffer.length, mime: "audio/mp4", read: async function* (o, l) { yield buffer.subarray(o, o + l); } };
+    },
+  };
+  const home = fakeHome();
+  const archive = makeArchive({ dir, tg, home });
+  archive.stored.set(ID, { msgId: 42, size: buffer.length });
+  const srv = await listen(async (req, res) => {
+    if (!(await archive.handleAudio(req, res, PAGE, "")) && !res.headersSent) {
+      res.writeHead(500);
+      res.end();
+    }
+  });
+  try {
+    const r = await fetch(srv.url);
+    assert.equal(r.status, 200);
+    assert.deepEqual(Buffer.from(await r.arrayBuffer()), buffer);
+    assert.deepEqual(opened, [42]);
+    assert.equal(home.calls.filter(([n]) => n === "claim" || n === "lookup").length, 0);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("the stored index syncs from home in pages and comes back after a restart", async () => {
+  const dir = tmpDir();
+  const all = Array.from({ length: 5003 }, (_, i) => ({ id: `v${String(i).padStart(10, "0")}`, msgId: i + 1, size: 10, at: 1000 + i }));
+  const asked = [];
+  const home = fakeHome({ storedSince: async (since) => (asked.push(since), all.filter((s) => s.at > since).slice(0, 5000)) });
+  const a = makeArchive({ dir, home });
+  await a.syncStored();
+  assert.equal(a.stored.size, 5003);
+  assert.deepEqual(asked, [0, 1000 + 4999]);
+  const b = makeArchive({ dir, home });
+  b.loadStored();
+  assert.equal(b.stored.size, 5003);
+  assert.equal(b.storedAt, 1000 + 5002);
+  assert.deepEqual(b.stored.get(all[7].id), { msgId: 8, size: 10 });
+});

@@ -13,6 +13,7 @@ const HOUR = 36e5;
 const DAY = 864e5;
 const LEASE_MS = 15 * MIN;
 const EXCLUDE_MS = 24 * HOUR;
+const REFUSED_RESET_MS = 24 * 3600_000;
 const MAX_ATTEMPTS = 6;
 const BACKOFF = [2 * MIN, 10 * MIN, HOUR, 6 * HOUR, 24 * HOUR];
 const SOURCES = ["disk", "telegram", "youtube", "peer"];
@@ -471,6 +472,32 @@ export class Catalog {
     return parse(job.excluded_json, []).filter((e) => e.at > now - EXCLUDE_MS).map((e) => e.server);
   }
 
+  // Artists a server's country refuses (Germany and much Persian music): after
+  // two refusals that server stops getting the artist's background songs, which
+  // otherwise use up its hour asking YouTube for songs it can't have. In memory,
+  // forgotten daily (and on restart), so an artist gets another chance.
+  #refused = new Map(); // server -> Map(artistId -> count)
+  #refusedSince = 0;
+
+  #noteRefused(server, videoId, now) {
+    if (now - this.#refusedSince > REFUSED_RESET_MS) {
+      this.#refused.clear();
+      this.#refusedSince = now;
+    }
+    const a = this.firstArtistId(videoId);
+    if (!a) return;
+    let m = this.#refused.get(server);
+    if (!m) this.#refused.set(server, (m = new Map()));
+    if (m.size < 50_000) m.set(a, (m.get(a) || 0) + 1);
+  }
+
+  #refusedFor(server, videoId) {
+    const m = this.#refused.get(server);
+    if (!m?.size) return false;
+    const a = this.firstArtistId(videoId);
+    return !!a && (m.get(a) || 0) >= 2;
+  }
+
   claim(videoId, server, now = Date.now()) {
     return this.#tx(() => {
       this.#reap(now);
@@ -522,7 +549,8 @@ export class Catalog {
     });
   }
 
-  failed(videoId, server, error, { blocked = false, unavailable = false } = {}, now = Date.now()) {
+  failed(videoId, server, error, { blocked = false, unavailable = false, refused = false } = {}, now = Date.now()) {
+    if (refused && server) this.#noteRefused(server, videoId, now);
     this.#tx(() => {
       this.#ensureSong(videoId, now);
       this.#sql(`INSERT OR IGNORE INTO jobs(video_id,state,reason,created_at,updated_at)
@@ -570,6 +598,7 @@ export class Catalog {
       const picked = [];
       const take = (job) => {
         if (picked.length >= limit || this.#blocked(job, now).includes(server)) return;
+        if ((job.reason === "crawl" || job.reason === "prefetch") && this.#refusedFor(server, job.video_id)) return;
         this.#sql(`UPDATE jobs SET state='running', server=?, lease_until=?, updated_at=? WHERE video_id=?`)
           .run(server, now + LEASE_MS, now, job.video_id);
         picked.push(job.video_id);

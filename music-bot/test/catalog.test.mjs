@@ -659,3 +659,15 @@ test("topPlayedArtists counts plays per artist across chunks, ignoring old plays
   const top = await c.topPlayedArtists(NOW - 14 * DAY, { chunk: 2, pauseMs: 0 });
   assert.deepEqual(top.map((r) => [r.id, r.n]), [["A", 6], ["B", 3]]);
 });
+
+test("artists a server's country refuses stop going to that server after two refusals", () => {
+  const c = open();
+  c.enqueue(["p1", "p2", "p3", "q1"], "prefetch", NOW);
+  const link = c.db.prepare("INSERT INTO song_artists(video_id,artist_id,position) VALUES(?,?,0)");
+  for (const id of ["p1", "p2", "p3", "q1"]) link.run(id, id[0] === "p" ? "persian" : "other");
+  c.failed("p1", "germany", "Video unavailable", { blocked: true, refused: true }, NOW);
+  c.failed("p2", "germany", "Video unavailable", { blocked: true, refused: true }, NOW);
+  const picked = c.nextJobs("germany", 5, NOW + 1);
+  assert.deepEqual(picked, ["q1"]);
+  assert.deepEqual(c.nextJobs("home", 5, NOW + 2).sort(), ["p3"]);
+});

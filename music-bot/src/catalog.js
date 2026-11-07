@@ -521,6 +521,7 @@ export class Catalog {
 
   stored(videoId, info = {}, now = Date.now()) {
     const q = info.quality ?? {};
+    this.#analysisDry = false; // a new song for the analyzer
     return this.#tx(() => {
       this.#ensureSong(videoId, now);
       // COALESCE keeps existing values where info has none.
@@ -757,11 +758,21 @@ export class Catalog {
   }
 
   /** Archived songs/videos not yet copied to [channel]: [{kind, videoId, msgId}]. */
-  needsBackupIn(channel, limit = 5) {
+  // Per channel: songs stored before this time are all copied already, so the
+  // minute-by-minute check starts there instead of walking every stored song
+  // (that walk froze home's disk for up to 50 s). In memory: after a restart
+  // the first check walks once.
+  #backupFrom = new Map();
+
+  needsBackupIn(channel, limit = 5, now = Date.now()) {
     const ch = String(channel);
-    const songs = this.#sql(`SELECT 'song' kind, video_id, tg_msg_id FROM songs s WHERE status='stored' AND tg_msg_id IS NOT NULL
+    const from = this.#backupFrom.get(ch) ?? 0;
+    const songs = this.#sql(`SELECT 'song' kind, video_id, tg_msg_id, stored_at FROM songs s INDEXED BY songs_stored_at
+      WHERE stored_at >= ? AND status='stored' AND tg_msg_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='song' AND b.video_id=s.video_id AND b.channel=?)
-      ORDER BY stored_at, rowid LIMIT ?`).all(ch, limit);
+      ORDER BY stored_at, rowid LIMIT ?`).all(from, ch, limit);
+    // Nothing waiting: later checks only look at songs stored from now on.
+    this.#backupFrom.set(ch, songs.length ? songs[0].stored_at : now - 60_000);
     const vids = this.#sql(`SELECT 'video' kind, video_id, tg_msg_id FROM videos v WHERE status='stored' AND tg_msg_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='video' AND b.video_id=v.video_id AND b.channel=?)
       ORDER BY stored_at, rowid LIMIT ?`).all(ch, limit);
@@ -1619,6 +1630,8 @@ export class Catalog {
    * Hand [n] stored songs to analyzer [server]: expired leases first, then
    * never-offered songs, most played first. Skips songs over 15 minutes.
    */
+  #analysisDry = false;
+
   leaseAnalysis(server, n, now = Date.now()) {
     n = Math.max(1, Math.min(Math.floor(Number(n)) || 1, 10));
     const until = now + ANALYSIS_LEASE_MS;
@@ -1627,11 +1640,15 @@ export class Catalog {
         WHERE a.analyzed_at IS NULL AND a.lease_until < ? AND s.status = 'stored'
           AND (s.duration_s IS NULL OR s.duration_s <= ?)
         ORDER BY a.lease_until LIMIT ?`).all(now, ANALYSIS_MAX_S, n);
-      if (out.length < n) {
-        out.push(...this.#sql(`SELECT s.video_id, s.duration_s FROM songs s
+      // The never-offered scan walks every stored song; once it finds none,
+      // it waits until a new song is stored (see stored()).
+      if (out.length < n && !this.#analysisDry) {
+        const fresh = this.#sql(`SELECT s.video_id, s.duration_s FROM songs s
           WHERE s.status = 'stored' AND (s.duration_s IS NULL OR s.duration_s <= ?)
             AND NOT EXISTS (SELECT 1 FROM song_analysis x WHERE x.video_id = s.video_id)
-          ORDER BY s.plays DESC LIMIT ?`).all(ANALYSIS_MAX_S, n - out.length));
+          ORDER BY s.plays DESC LIMIT ?`).all(ANALYSIS_MAX_S, n - out.length);
+        if (!fresh.length) this.#analysisDry = true;
+        out.push(...fresh);
       }
       const up = this.#sql(`INSERT INTO song_analysis(video_id, server, lease_until) VALUES(?,?,?)
         ON CONFLICT(video_id) DO UPDATE SET server=excluded.server, lease_until=excluded.lease_until`);

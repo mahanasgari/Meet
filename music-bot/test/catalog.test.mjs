@@ -681,3 +681,29 @@ test("storedSince lists stored songs after a time, oldest first", () => {
   assert.deepEqual(c.storedSince(NOW).map((s) => s.id), ["a3", "a2"]);
   assert.deepEqual(c.storedSince(0)[0], { id: "a1", msgId: 10, size: 5, at: NOW });
 });
+
+test("backup check starts after songs already copied, and still sees new ones", () => {
+  const c = open();
+  for (const [id, at] of [["b1", NOW], ["b2", NOW + 1]]) {
+    c.claim(id, "s1", at);
+    c.stored(id, { msgId: 5, size: 1 }, at);
+  }
+  assert.deepEqual(c.needsBackupIn("ch", 5, NOW + 10).map((x) => x.videoId), ["b1", "b2"]);
+  c.markBackupIn("song", "b1", "ch", 1);
+  c.markBackupIn("song", "b2", "ch", 2);
+  assert.deepEqual(c.needsBackupIn("ch", 5, NOW + 20), []);
+  c.claim("b3", "s1", NOW + 30);
+  c.stored("b3", { msgId: 6, size: 1 }, NOW + 30);
+  assert.deepEqual(c.needsBackupIn("ch", 5, NOW + 40).map((x) => x.videoId), ["b3"]);
+});
+
+test("analysis lease stops rescanning when nothing is new, until a song is stored", () => {
+  const c = open();
+  c.claim("n1", "s1", NOW);
+  c.stored("n1", { msgId: 5, size: 1 }, NOW);
+  assert.deepEqual(c.leaseAnalysis("an", 1, NOW).map((x) => x.videoId), ["n1"]);
+  assert.deepEqual(c.leaseAnalysis("an", 1, NOW + 1), []);
+  c.claim("n2", "s1", NOW + 2);
+  c.stored("n2", { msgId: 6, size: 1 }, NOW + 2);
+  assert.deepEqual(c.leaseAnalysis("an", 1, NOW + 3).map((x) => x.videoId), ["n2"]);
+});

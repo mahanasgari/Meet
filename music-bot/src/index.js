@@ -3407,6 +3407,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Token check for edge caches (the Iran relay serves stored songs
+    // itself and asks here, with a short cache, whether a listener may).
+    if (req.method === "GET" && url.pathname === "/auth/check") {
+      if (!requireApiToken(req, res)) return;
+      res.writeHead(204, { "cache-control": "no-store" });
+      res.end();
+      return;
+    }
+
     // --- Listen Together (jam) API ---
     if (req.method === "POST" && url.pathname === "/jam") {
       if (!requireApiToken(req, res)) return;

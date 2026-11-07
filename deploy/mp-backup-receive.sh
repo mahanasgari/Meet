@@ -4,7 +4,7 @@
 set -euo pipefail
 
 MP_BACKUP_DIR="${MP_BACKUP_DIR:-/root/mp-backups}"
-MP_BACKUP_KEEP="${MP_BACKUP_KEEP:-14}"
+MP_BACKUP_KEEP="${MP_BACKUP_KEEP:-5}"
 MAX_BYTES=$((2 * 1024 * 1024 * 1024))
 
 NAME="${SSH_ORIGINAL_COMMAND:-}"

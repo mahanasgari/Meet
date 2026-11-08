@@ -20,6 +20,13 @@ const HOME_ONLY = [
   /^\/recommend(\/|$)/,
   /^\/account\//,
   /^\/reports$/,
+  // Kept on home so every server sees the same ones: shared playlist codes,
+  // feedback, the weekly chart (built from home's listeners), cloud sync.
+  /^\/share$/,
+  /^\/share\/[A-Za-z0-9]{6}$/,
+  /^\/feedback$/,
+  /^\/charts\/weekly$/,
+  /^\/sync\/(events|user)$/,
 ];
 
 export const isHomeOnlyPath = (pathname) => HOME_ONLY.some((re) => re.test(String(pathname || "")));

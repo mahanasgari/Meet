@@ -4507,6 +4507,7 @@ const server = http.createServer(async (req, res) => {
         const known = ["no_tracks", "bad_name", "bad_tag", "not_found", "not_owner", "too_many", "invalid_json", "body_too_large"];
         const code = known.includes(e?.message) ? e.message : "bad_request"; // never echo internal error text
         const status = { not_found: 404, not_owner: 403, too_many: 429 }[code] || 400;
+        console.warn(`[explore] ${req.method} ${url.pathname} -> ${status} ${code}${code === "bad_request" ? ` (${String(e?.message || e).slice(0, 120)})` : ""}`);
         sendJson(res, status, { error: code });
       };
       try {
@@ -4525,6 +4526,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (req.method === "POST" && url.pathname === "/explore/publish") {
           if (!account) {
+            console.warn(`[explore] publish -> 403 account_needed (${uid ? "device without account" : "no user token"})`);
             sendJson(res, 403, { error: "account_needed" });
             return;
           }
@@ -4533,6 +4535,7 @@ const server = http.createServer(async (req, res) => {
             owner: uid, ownerName: account, id: isPublicId(body.id) ? body.id : null,
             name: body.name, description: body.description, tag: body.tag, tracks: body.tracks,
           });
+          console.log(`[explore] publish -> 200 ${id} (${Array.isArray(body.tracks) ? body.tracks.length : 0} songs sent)`);
           sendJson(res, 200, { id });
           return;
         }

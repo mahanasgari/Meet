@@ -4504,7 +4504,8 @@ const server = http.createServer(async (req, res) => {
       const admin = !uid && isMasterToken(req);
       const account = uid && accounts?.usernameOf(uid);
       const fail = (e) => {
-        const code = String(e?.message || "error");
+        const known = ["no_tracks", "bad_name", "bad_tag", "not_found", "not_owner", "too_many", "invalid_json", "body_too_large"];
+        const code = known.includes(e?.message) ? e.message : "bad_request"; // never echo internal error text
         const status = { not_found: 404, not_owner: 403, too_many: 429 }[code] || 400;
         sendJson(res, status, { error: code });
       };
@@ -4527,7 +4528,7 @@ const server = http.createServer(async (req, res) => {
             sendJson(res, 403, { error: "account_needed" });
             return;
           }
-          const body = await readJsonMaybeGzip(req, 400_000);
+          const body = (await readJsonMaybeGzip(req, 400_000)) || {};
           const id = publicPlaylists.publish({
             owner: uid, ownerName: account, id: isPublicId(body.id) ? body.id : null,
             name: body.name, description: body.description, tag: body.tag, tracks: body.tracks,

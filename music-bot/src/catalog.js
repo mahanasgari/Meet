@@ -491,7 +491,8 @@ export class Catalog {
     if (m.size < 50_000) m.set(a, (m.get(a) || 0) + 1);
   }
 
-  #refusedFor(server, videoId) {
+  #refusedFor(server, videoId, now = Date.now()) {
+    if (now - this.#refusedSince > REFUSED_RESET_MS) return false; // forgotten daily even when nothing new is refused
     const m = this.#refused.get(server);
     if (!m?.size) return false;
     const a = this.firstArtistId(videoId);
@@ -599,7 +600,7 @@ export class Catalog {
       const picked = [];
       const take = (job) => {
         if (picked.length >= limit || this.#blocked(job, now).includes(server)) return;
-        if ((job.reason === "crawl" || job.reason === "prefetch") && this.#refusedFor(server, job.video_id)) return;
+        if ((job.reason === "crawl" || job.reason === "prefetch") && this.#refusedFor(server, job.video_id, now)) return;
         this.#sql(`UPDATE jobs SET state='running', server=?, lease_until=?, updated_at=? WHERE video_id=?`)
           .run(server, now + LEASE_MS, now, job.video_id);
         picked.push(job.video_id);

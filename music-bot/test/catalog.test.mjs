@@ -672,6 +672,17 @@ test("artists a server's country refuses stop going to that server after two ref
   assert.deepEqual(c.nextJobs("home", 5, NOW + 2).sort(), ["p3"]);
 });
 
+test("a refused artist is forgotten after a day even with no new refusals", () => {
+  const c = open();
+  c.enqueue(["p1", "p2", "p3"], "prefetch", NOW);
+  const link = c.db.prepare("INSERT INTO song_artists(video_id,artist_id,position) VALUES(?,?,0)");
+  for (const id of ["p1", "p2", "p3"]) link.run(id, "persian");
+  c.failed("p1", "germany", "Video unavailable", { blocked: true, refused: true }, NOW);
+  c.failed("p2", "germany", "Video unavailable", { blocked: true, refused: true }, NOW);
+  assert.deepEqual(c.nextJobs("germany", 5, NOW + 1), []);
+  assert.deepEqual(c.nextJobs("germany", 5, NOW + 25 * 3600_000).sort(), ["p1", "p2", "p3"]);
+});
+
 test("storedSince lists stored songs after a time, oldest first", () => {
   const c = open();
   for (const [id, at] of [["a1", NOW], ["a2", NOW + 2], ["a3", NOW + 1]]) {

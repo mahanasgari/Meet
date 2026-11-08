@@ -46,6 +46,7 @@ import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { AccountStore } from "./accounts.js";
+import { PublicPlaylists, EXPLORE_TAGS, isPublicId } from "./public_playlists.js";
 import { isHomeOnlyPath, proxyToHome } from "./home_routes.js";
 import { DiscogsClient, DiscogsEnricher } from "./discogs.js";
 import { SongLinks as ExtSongLinks, OdesliBusy } from "./odesli.js";
@@ -849,6 +850,8 @@ if (catalog) {
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
 const accounts = catalog ? new AccountStore({ dir: joinPath(SHARES, "accounts") }) : null;
+// Explore: public playlists (home only, own small database).
+const publicPlaylists = catalog ? new PublicPlaylists({ file: joinPath(SHARES, "explore", "playlists.db"), cleanTrack: (t) => cleanShareTrack(t) }) : null;
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
 // New songs of the artists a friend follows or plays (Home "New from your
 // artists"): YouTube newest-first search, confirmed on YouTube Music.
@@ -4488,6 +4491,100 @@ const server = http.createServer(async (req, res) => {
       }
       sendJson(res, 200, { name: hit.name, tracks: hit.tracks });
       return;
+    }
+
+    // --- Explore: public playlists (home only; mirrors forward /explore) ---
+    if (url.pathname === "/explore" || url.pathname.startsWith("/explore/")) {
+      if (!requireApiToken(req, res)) return;
+      if (!publicPlaylists) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      const uid = req.mpUser || null;
+      const admin = !uid && isMasterToken(req);
+      const account = uid && accounts?.usernameOf(uid);
+      const fail = (e) => {
+        const code = String(e?.message || "error");
+        const status = { not_found: 404, not_owner: 403, too_many: 429 }[code] || 400;
+        sendJson(res, status, { error: code });
+      };
+      try {
+        if (req.method === "GET" && url.pathname === "/explore") {
+          const q = url.searchParams;
+          sendJson(res, 200, {
+            items: publicPlaylists.list({ sort: q.get("sort") || "popular", tag: q.get("tag"), q: q.get("q") || "",
+              limit: q.get("limit"), offset: q.get("offset") }),
+            tags: EXPLORE_TAGS,
+          });
+          return;
+        }
+        if (req.method === "GET" && url.pathname === "/explore/mine") {
+          sendJson(res, 200, { items: uid ? publicPlaylists.mine(uid) : [], account: Boolean(account) });
+          return;
+        }
+        if (req.method === "POST" && url.pathname === "/explore/publish") {
+          if (!account) {
+            sendJson(res, 403, { error: "account_needed" });
+            return;
+          }
+          const body = await readJsonMaybeGzip(req, 400_000);
+          const id = publicPlaylists.publish({
+            owner: uid, ownerName: account, id: isPublicId(body.id) ? body.id : null,
+            name: body.name, description: body.description, tag: body.tag, tracks: body.tracks,
+          });
+          sendJson(res, 200, { id });
+          return;
+        }
+        const m = url.pathname.match(/^\/explore\/p\/([A-Z2-9]{8})(?:\/(play|save|report|delete))?$/);
+        if (m && req.method === "GET" && !m[2]) {
+          const pl = publicPlaylists.get(m[1], { viewer: uid, admin });
+          if (!pl) sendJson(res, 404, { error: "not_found" });
+          else sendJson(res, 200, pl);
+          return;
+        }
+        if (m && req.method === "POST" && (m[2] === "play" || m[2] === "save")) {
+          sendJson(res, 200, { counted: publicPlaylists.note(m[1], uid, m[2]) });
+          return;
+        }
+        if (m && req.method === "POST" && m[2] === "report") {
+          const body = await readBody(req, 4_000).catch(() => ({}));
+          sendJson(res, 200, { ok: publicPlaylists.report(m[1], uid, body.reason) });
+          return;
+        }
+        if (m && req.method === "POST" && m[2] === "delete") {
+          if (!uid && !admin) {
+            sendJson(res, 403, { error: "not_owner" });
+            return;
+          }
+          sendJson(res, 200, { ok: publicPlaylists.remove(m[1], uid, { admin }) });
+          return;
+        }
+        sendJson(res, 404, { error: "not_found" });
+      } catch (e) {
+        fail(e);
+      }
+      return;
+    }
+
+    // Admin: Explore moderation (dashboard).
+    if (url.pathname === "/admin/api/explore" || url.pathname === "/admin/api/explore/hide") {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!publicPlaylists) {
+        sendJson(res, 404, { error: "not_here" });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/admin/api/explore") {
+        sendJson(res, 200, { items: publicPlaylists.adminList() });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/api/explore/hide") {
+        const body = await readBody(req, 4_000).catch(() => ({}));
+        sendJson(res, 200, { ok: publicPlaylists.setHidden(String(body.id || ""), Boolean(body.hidden)) });
+        return;
+      }
     }
 
     // --- continue with existing search / playlist / meta / audio / LiveKit rooms ---

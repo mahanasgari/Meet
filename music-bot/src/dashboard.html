@@ -234,7 +234,7 @@ var state = {
 };
 var PAGES = [
   ["overview", "Overview"], ["servers", "Servers"], ["users", "Users"], ["listening", "Listening"],
-  ["archive", "Archive"], ["foryou", "For you"], ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["alerts", "Alerts"]
+  ["archive", "Archive"], ["foryou", "For you"], ["traffic", "Traffic"], ["app", "App"], ["feedback", "Feedback"], ["explore", "Explore"], ["alerts", "Alerts"]
 ];
 var charts = [], tables = {};
 
@@ -1066,6 +1066,31 @@ function pageFeedback() {
   return '<div class="toolbar"><input type="search" id="fbQ" placeholder="Search feedback" value="' + esc(state.fbQ) + '"></div><div id="fbList">' + fbList() + "</div>";
 }
 
+/* Explore moderation: public playlists, reported first. */
+function exploreRow(p) {
+  var cover = arr(p.cover)[0];
+  return '<div class="card" style="margin-bottom:10px;display:flex;gap:12px;align-items:center">' +
+    (cover ? '<img src="' + esc(cover) + '" alt="" width="56" height="56" style="border-radius:8px;object-fit:cover;flex:none">' : "") +
+    '<div style="flex:1;min-width:0"><div><b>' + esc(p.name) + '</b> <span class="muted">by ' + esc(p.owner) + " · " + fmt(p.count) + " songs · " + esc(p.tag) + "</span>" +
+    (p.hidden ? ' <span class="badge bad">hidden</span>' : "") + (p.reports ? ' <span class="badge warn">' + fmt(p.reports) + " reports</span>" : "") + "</div>" +
+    '<div class="muted">' + fmt(p.plays) + " plays · " + fmt(p.saves) + " saves · " + esc(p.id) + " · " + esc(rel(new Date(p.createdAt).toISOString())) + "</div>" +
+    (p.description ? '<div class="txt">' + esc(p.description) + "</div>" : "") +
+    (p.reasons ? '<div class="txt muted">Reports: ' + esc(p.reasons) + "</div>" : "") + "</div>" +
+    '<button class="btn sm" data-act="exhide" data-id="' + esc(p.id) + '" data-h="' + (p.hidden ? "0" : "1") + '">' + (p.hidden ? "Show" : "Hide") + "</button></div>";
+}
+function loadExplore() {
+  api("api/explore").then(function (r) { state.explore = arr(r && r.items); var e = $("exList"); if (e) e.innerHTML = exploreList(); })
+    .catch(function (e) { var x = $("exList"); if (x) x.innerHTML = empty("Failed: " + e.message); });
+}
+function exploreList() {
+  if (!state.explore) return empty("Loading…");
+  return state.explore.length ? state.explore.map(exploreRow).join("") : empty("No public playlists yet");
+}
+function pageExplore() {
+  if (!state.explore) setTimeout(loadExplore, 0);
+  return card("Public playlists", '<div id="exList">' + exploreList() + "</div>", '<a href="#explore" data-act="exreload">Reload</a>');
+}
+
 function alertBadge(l) { var c = l === "down" ? "bad" : l === "up" ? "good" : l === "warn" ? "warn" : "info"; return '<span class="badge ' + c + '">' + esc(l || "info") + "</span>"; }
 function alertsTable(rows, id) {
   return table(id, [
@@ -1248,6 +1273,12 @@ function handleAct(a) {
       load();
     }).catch(function (e) { if (state.token) toast("Failed: " + e.message); });
   } else if (act === "copycode" || act === "copymsg") copyText(a.getAttribute("data-v"));
+  else if (act === "exreload") { state.explore = null; loadExplore(); }
+  else if (act === "exhide") {
+    api("api/explore/hide", { body: { id: a.getAttribute("data-id"), hidden: a.getAttribute("data-h") === "1" } })
+      .then(function () { loadExplore(); toast(a.getAttribute("data-h") === "1" ? "Hidden from Explore" : "Shown on Explore"); })
+      .catch(function (e) { toast("Failed: " + e.message); });
+  }
   else if (act === "close") closeModal();
   else if (act === "block") {
     var b = a.getAttribute("data-blocked") === "1";
@@ -1295,7 +1326,7 @@ document.addEventListener("keydown", function (e) {
 });
 
 /* ========================= router & render ========================= */
-var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, archive: pageArchive, foryou: pageForYou, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, alerts: pageAlerts };
+var RENDER = { overview: pageOverview, servers: pageServers, users: pageUsers, listening: pageListening, archive: pageArchive, foryou: pageForYou, traffic: pageTraffic, app: pageApp, feedback: pageFeedback, explore: pageExplore, alerts: pageAlerts };
 function route() {
   var p = (location.hash || "").replace("#", "");
   state.page = RENDER[p] ? p : "overview";

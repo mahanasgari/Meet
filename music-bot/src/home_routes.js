@@ -32,7 +32,7 @@ const HOME_ONLY = [
 
 export const isHomeOnlyPath = (pathname) => HOME_ONLY.some((re) => re.test(String(pathname || "")));
 
-const COPY_REQ = ["authorization", "content-type", "range", "x-mp-context"];
+const COPY_REQ = ["authorization", "content-type", "content-encoding", "range", "x-mp-context"];
 const COPY_RES = [
   "content-type",
   "content-length",

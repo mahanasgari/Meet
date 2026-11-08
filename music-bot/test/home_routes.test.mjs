@@ -19,6 +19,8 @@ test("X-MP-User only forwarded for the master token", () => {
   assert.equal(h["x-mp-user"], "aaaaaaaaaaaa");
   assert.equal(h["x-forwarded-for"], "1.2.3.4");
   assert.equal(h.cookie, undefined);
+  // A gzip body must stay readable at home (publish, share, feedback).
+  assert.equal(forwardHeaders({ headers: { "content-encoding": "gzip" } }, { isMaster: false })["content-encoding"], "gzip");
 });
 
 const fakeRes = () => {

@@ -4547,7 +4547,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         if (m && req.method === "POST" && m[2] === "report") {
-          const body = await readBody(req, 4_000).catch(() => ({}));
+          const body = (await readJsonMaybeGzip(req, 8_000).catch(() => null)) || {};
           sendJson(res, 200, { ok: publicPlaylists.report(m[1], uid, body.reason) });
           return;
         }

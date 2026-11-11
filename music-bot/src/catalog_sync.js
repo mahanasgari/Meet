@@ -223,7 +223,7 @@ export function decodeRows(buf) {
  * its changes after the position held here and applies them. One round per
  * call; quiet about peers that don't answer (they're caught up later).
  */
-export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutMs = 20_000, maxRounds = 20 } = {}) {
+export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutMs = 20_000, maxRounds = 20, name = "catalog", onApplied } = {}) {
   const result = {};
   for (const p of peers) {
     if (p.origin === feed.origin) continue;
@@ -231,7 +231,7 @@ export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutM
     try {
       for (let round = 0; round < maxRounds; round++) {
         const since = syncPosition(feed.db, p.origin);
-        const r = await fetchImpl(`${p.url}/sync/catalog/changes?since=${since}`, {
+        const r = await fetchImpl(`${p.url}/sync/${name}/changes?since=${since}`, {
           headers: { authorization: `Bearer ${token}` },
           signal: AbortSignal.timeout(timeoutMs),
         });
@@ -245,6 +245,7 @@ export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutM
         if (!rows.length) break;
         feed.apply(p.origin, rows);
         applied += rows.length;
+        onApplied?.(p.origin, rows);
         if (r.headers.get("x-sync-more") !== "1") break;
       }
       result[p.origin] ??= { applied, at: syncPosition(feed.db, p.origin) };

@@ -39,6 +39,7 @@ import { ReportStore } from "./error_reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
 import { ChangeFeed, encodeRows, pullOnce, syncPositions } from "./catalog_sync.js";
+import { SharedDocs, docsBackend } from "./shared_docs.js";
 import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
@@ -562,9 +563,12 @@ function snapshotCatalog() {
      const { renameSync } = process.getBuiltinModule("node:fs");
      const tmp = d.out + ".tmp";
      rmSync(tmp, { force: true });
+     rmSync(tmp + "-journal", { force: true });
      const db = new DatabaseSync(d.src, { readOnly: true });
      db.exec("VACUUM INTO '" + tmp.replace(/'/g, "''") + "'");
      db.close();
+     // A journal left by an interrupted run would be taken for this file's.
+     rmSync(d.out + "-journal", { force: true });
      renameSync(tmp, d.out); // a peer downloading the old one keeps reading it`,
     { eval: true, workerData: { src, out } },
   );
@@ -576,6 +580,23 @@ function snapshotCatalog() {
   });
 }
 
+// Small shared records (invites, accounts, shared playlist codes, song links)
+// and Explore's public playlists: on every server, synced like the catalog.
+// Their outboxes are kept for good (they're small), so a server that joins
+// later still gets everything.
+const sharedDocs = ARCHIVE_ON ? new SharedDocs(joinPath(SHARES, "shared", "shared.db")) : null;
+const smallFeeds = new Map(); // name -> { feed, db, after }
+function addSmallFeed(name, db, after) {
+  db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)");
+  const feed = new ChangeFeed({ db, outFile: joinPath(SHARES, "shared", `${name}-out.db`), origin: SYNC_ORIGIN, keepMs: Infinity });
+  smallFeeds.set(name, { feed, db, after });
+  return feed;
+}
+if (sharedDocs) {
+  addSmallFeed("shared", sharedDocs.db, () => sharedDocs.changed());
+  // Home moves its JSON files in once (recorded, so the mirrors get them).
+  invites.useBackend(docsBackend(sharedDocs, "invites", { legacyLoad: HOME_URL ? null : () => invites.data.invites }));
+}
 const syncState = { last: null, at: 0 };
 if (catalogFeed) {
   setInterval(() => {
@@ -586,6 +607,33 @@ if (catalogFeed) {
     }
   }, 5000).unref();
   setInterval(() => catalogFeed.prune(), 3600_000).unref();
+}
+setInterval(() => {
+  for (const [name, { feed }] of smallFeeds) {
+    try {
+      feed.flush();
+    } catch (e) {
+      console.error(`[sync] ${name} flush:`, e.message);
+    }
+  }
+}, 5000).unref();
+if (HOME_URL && smallFeeds.size) {
+  let pullingSmall = false;
+  const pullSmall = async () => {
+    if (pullingSmall) return;
+    pullingSmall = true;
+    try {
+      for (const [name, { feed, after }] of smallFeeds) {
+        const r = await pullOnce(feed, [{ origin: "home", url: HOME_URL }], { token: MUSIC_API_TOKEN, name, onApplied: () => after?.() });
+        syncState[name] = r;
+        if (r.home?.error) console.error(`[sync] ${name} from home:`, r.home.error);
+      }
+    } finally {
+      pullingSmall = false;
+    }
+  };
+  setTimeout(pullSmall, 8000).unref();
+  setInterval(pullSmall, 15_000).unref();
 }
 if (replica) {
   // Phase 1: home is the one origin (Phase 2: every server).
@@ -912,9 +960,24 @@ if (catalog) {
 
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
-const accounts = catalog ? new AccountStore({ dir: joinPath(SHARES, "accounts") }) : null;
+const accounts = catalog
+  ? new AccountStore({
+      dir: joinPath(SHARES, "accounts"),
+      backend: docsBackend(sharedDocs, "accounts", {
+        legacyLoad: () => {
+          try {
+            return JSON.parse(readFileSync(joinPath(SHARES, "accounts", "accounts.json"), "utf8")).users || {};
+          } catch {
+            return {};
+          }
+        },
+      }),
+    })
+  : null;
 // Explore: public playlists (home only, own small database).
-const publicPlaylists = catalog ? new PublicPlaylists({ file: joinPath(SHARES, "explore", "playlists.db"), cleanTrack: (t) => cleanShareTrack(t) }) : null;
+// On every server (synced from home); only home answers /explore for now.
+const publicPlaylists = sharedDocs ? new PublicPlaylists({ file: joinPath(SHARES, "explore", "playlists.db"), cleanTrack: (t) => cleanShareTrack(t) }) : null;
+if (publicPlaylists) addSmallFeed("explore", publicPlaylists.db);
 const recommender = catalog ? new Recommender({ catalog, usersDir: joinPath(SHARES, "users") }) : null;
 // New songs of the artists a friend follows or plays (Home "New from your
 // artists"): YouTube newest-first search, confirmed on YouTube Music.
@@ -969,7 +1032,20 @@ const releases = new Releases({
 });
 
 // Public song links live on home, the server behind the public domain.
-const songLinks = catalog ? new SongLinks({ file: joinPath(SHARES, "song-links.json") }) : null;
+const songLinks = catalog
+  ? new SongLinks({
+      file: joinPath(SHARES, "song-links.json"),
+      backend: docsBackend(sharedDocs, "song_links", {
+        legacyLoad: () => {
+          try {
+            return JSON.parse(readFileSync(joinPath(SHARES, "song-links.json"), "utf8"));
+          } catch {
+            return {};
+          }
+        },
+      }),
+    })
+  : null;
 const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
 // Per-IP budget for the public song pages' audio (a play is a few ranged
 // requests): 120 requests per 10 minutes.
@@ -2817,17 +2893,32 @@ try {
 } catch {
   // first run / no volume
 }
+// Shared on every server through the synced store (see sharedDocs below).
+let sharesBackend = null;
+function useSharesBackend(backend) {
+  sharesBackend = backend;
+  const load = () => {
+    shares.clear();
+    for (const [k, v] of Object.entries(backend.load())) shares.set(k, v);
+  };
+  load();
+  backend.onChange(load);
+}
 let sharesSaveTimer = null;
 function saveSharesSoon() {
   clearTimeout(sharesSaveTimer);
   sharesSaveTimer = setTimeout(() => {
     try {
+      sharesBackend?.save(Object.fromEntries(shares));
       mkdirSync(SHARES_DIR, { recursive: true });
       writeFileSync(SHARES_FILE, JSON.stringify(Object.fromEntries(shares)));
     } catch (e) {
       console.error("[shares] save failed", e?.message);
     }
   }, 1000);
+}
+if (sharedDocs) {
+  useSharesBackend(docsBackend(sharedDocs, "shares", { legacyLoad: HOME_URL ? null : () => Object.fromEntries(shares) }));
 }
 function shareCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -3951,6 +4042,28 @@ const server = http.createServer(async (req, res) => {
     }
     // --- Catalog sync between servers (master token only): this server's
     // own changes after ?since=, and where it stands.
+    const smallSync = /^\/sync\/([a-z]+)\/(changes|status)$/.exec(url.pathname);
+    if (req.method === "GET" && smallSync && smallFeeds.has(smallSync[1])) {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const { feed, db } = smallFeeds.get(smallSync[1]);
+      if (smallSync[2] === "status") {
+        sendJson(res, 200, { origin: SYNC_ORIGIN, lastSeq: feed.lastSeq(), positions: syncPositions(db), lastPull: syncState[smallSync[1]] || null });
+        return;
+      }
+      const rows = feed.read(Math.max(0, Number(url.searchParams.get("since")) || 0));
+      const last = feed.lastSeq();
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "X-Sync-Origin": SYNC_ORIGIN,
+        "X-Sync-Last": String(last),
+        "X-Sync-More": rows.length && rows[rows.length - 1].seq < last ? "1" : "0",
+      });
+      res.end(encodeRows(rows));
+      return;
+    }
     if (req.method === "GET" && /^\/sync\/catalog\/(changes|status|snapshot)$/.test(url.pathname)) {
       if (!isMasterToken(req)) {
         sendJson(res, 401, { error: "unauthorized" });

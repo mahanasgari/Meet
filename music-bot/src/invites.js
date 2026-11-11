@@ -40,7 +40,8 @@ export function normalizeCode(c) {
 }
 
 export class InviteStore {
-  constructor(dir) {
+  /** [backend] (shared_docs): invites kept in the synced store, shared by every server. */
+  constructor(dir, { backend = null } = {}) {
     this.dir = dir;
     this.file = join(dir, "invites.json");
     this.data = { invites: {} };
@@ -50,9 +51,19 @@ export class InviteStore {
     } catch {
       // first run
     }
+    this.useBackend(backend);
+  }
+
+  /** Switches to the synced store (its records win over the old file's). */
+  useBackend(backend) {
+    this.backend = backend;
+    if (!backend) return;
+    this.data.invites = backend.load();
+    backend.onChange(() => (this.data.invites = backend.load()));
   }
 
   save() {
+    this.backend?.save(this.data.invites);
     mkdirSync(this.dir, { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.data, null, 1));

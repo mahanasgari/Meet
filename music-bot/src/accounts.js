@@ -31,7 +31,8 @@ const normalizeRecovery = (c) => {
 const cleanName = (u) => String(u || "").trim().toLowerCase();
 
 export class AccountStore {
-  constructor({ dir }) {
+  /** [backend] (shared_docs): accounts kept in the synced store, shared by every server. */
+  constructor({ dir, backend = null }) {
     this.dir = dir;
     this.file = join(dir, "accounts.json");
     this.data = { users: {} };
@@ -41,9 +42,15 @@ export class AccountStore {
     } catch {
       // first run
     }
+    this.backend = backend;
+    if (backend) {
+      this.data.users = backend.load();
+      backend.onChange(() => (this.data.users = backend.load()));
+    }
   }
 
   #save() {
+    this.backend?.save(this.data.users);
     mkdirSync(this.dir, { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.data, null, 1));

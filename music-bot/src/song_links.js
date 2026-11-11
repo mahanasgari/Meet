@@ -17,7 +17,7 @@ const esc = (s) =>
 
 export class SongLinks {
   /** @param {{ file: string, now?: () => number }} o */
-  constructor({ file, now = () => Date.now() }) {
+  constructor({ file, now = () => Date.now(), backend = null }) {
     this.file = file;
     this.now = now;
     /** @type {Map<string, {id: string, title: string, artist: string, by: string|null, at: number}>} */
@@ -28,6 +28,13 @@ export class SongLinks {
       // first run
     }
     this.timer = null;
+    // The synced store (shared_docs): links made on any server open on all.
+    this.backend = backend;
+    if (backend) {
+      const load = () => (this.links = new Map(Object.entries(backend.load())));
+      load();
+      backend.onChange(load);
+    }
   }
 
   /**
@@ -67,6 +74,7 @@ export class SongLinks {
     clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       try {
+        this.backend?.save(Object.fromEntries(this.links));
         mkdirSync(dirname(this.file), { recursive: true });
         writeFileSync(this.file, JSON.stringify(Object.fromEntries(this.links)));
       } catch (e) {

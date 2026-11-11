@@ -63,3 +63,11 @@ test("a video chosen by enough listeners becomes the song's default", () => {
   assert.equal(c.videoMapGet("song0000001").srcId, "official001");
   assert.equal(c.videoVotes("song0000001").counts.official001, VIDEO_VOTES_TO_DEFAULT);
 });
+
+test("video download progress: video stream then audio, colour codes ignored, never goes back", async () => {
+  const { progressTracker } = await import("../src/video.js");
+  const got = [];
+  const t = progressTracker((p) => got.push(p));
+  for (const l of ["MPPROG \x1b[0;94m  10.0%\x1b[0m", "noise", "MPPROG  50.0%", "MPPROG 100.0%", "MPPROG   5.0%", "MPPROG  4.0%", "MPPROG 100%"]) t(l);
+  assert.deepEqual(got, [0.08, 0.4, 0.8, 0.81, 0.9]);
+});

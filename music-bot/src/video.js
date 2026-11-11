@@ -38,7 +38,7 @@ const fail = (stderr, fallback) => {
   return Object.assign(new Error(msg.slice(0, 300)), { kind: classifyYtdlpError(stderr) });
 };
 
-function run(bin, args, { timeoutMs = 15 * 60_000 } = {}) {
+function run(bin, args, { timeoutMs = 15 * 60_000, onLine } = {}) {
   return new Promise((resolve) => {
     let out = "";
     let err = "";
@@ -49,7 +49,14 @@ function run(bin, args, { timeoutMs = 15 * 60_000 } = {}) {
       return resolve({ code: -1, out, err: String(e?.message || e) });
     }
     const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    child.stdout.on("data", (d) => (out += d));
+    let partial = "";
+    child.stdout.on("data", (d) => {
+      out += d;
+      if (!onLine) return;
+      const lines = (partial + d).split(/\r|\n/);
+      partial = lines.pop();
+      for (const l of lines) if (l) onLine(l);
+    });
     child.stderr.on("data", (d) => (err = (err + d).slice(-4000)));
     child.on("error", (e) => { err += String(e?.message || e); resolve({ code: -1, out, err }); });
     child.on("close", (code) => { clearTimeout(timer); resolve({ code, out, err }); });
@@ -60,7 +67,32 @@ function run(bin, args, { timeoutMs = 15 * 60_000 } = {}) {
  * Downloads a video to a temp mp4 (H.264 + AAC, moov first) plus a thumbnail.
  * The caller uploads it and then deletes `path` and `thumbPath`.
  */
-export async function downloadVideo(id, { ytdlpBin, ffmpegBin, ffprobeBin = "ffprobe", ytdlpArgs = [], tmpDir }) {
+/**
+ * yt-dlp progress lines ("MPPROG 41.5%") → overall 0..0.9: the video and
+ * the audio stream download one after the other (a drop in percent = the
+ * next stream); the rest is for joining and the thumbnail.
+ */
+export function progressTracker(report) {
+  let part = 0;
+  let last = 0;
+  let best = 0;
+  return (line) => {
+    // eslint-disable-next-line no-control-regex
+    const m = /MPPROG\s*([\d.]+)%/.exec(String(line).replace(/\x1b\[[0-9;]*m/g, "")); // colour codes off
+    if (!m) return;
+    const pct = Math.min(100, Number(m[1])) / 100;
+    if (pct + 0.2 < last) part = Math.min(part + 1, 1);
+    last = pct;
+    // Most of the size is the video stream (first): 80 %, audio 10 %.
+    const overall = part === 0 ? pct * 0.8 : 0.8 + pct * 0.1;
+    if (overall > best) {
+      best = overall;
+      report?.(Math.round(best * 100) / 100);
+    }
+  };
+}
+
+export async function downloadVideo(id, { ytdlpBin, ffmpegBin, ffprobeBin = "ffprobe", ytdlpArgs = [], tmpDir, onProgress }) {
   const base = join(tmpDir, `.v-${id}-${process.pid}-${randomBytes(3).toString("hex")}`);
   const raw = `${base}.raw.mp4`;
   const out = `${base}.mp4`;
@@ -72,7 +104,10 @@ export async function downloadVideo(id, { ytdlpBin, ffmpegBin, ffprobeBin = "ffp
   cleanup();
   try {
     const y = await run(ytdlpBin, ["-f", VIDEO_FORMAT, "--merge-output-format", "mp4", "--no-playlist", "--no-warnings",
-      "--print-to-file", "%()j", meta, ...ytdlpArgs, "-o", raw, `https://www.youtube.com/watch?v=${id}`]);
+      "--newline", "--progress-template", "download:MPPROG %(progress._percent_str)s",
+      "--print-to-file", "%()j", meta, ...ytdlpArgs, "-o", raw, `https://www.youtube.com/watch?v=${id}`],
+      { onLine: progressTracker(onProgress) });
+    onProgress?.(0.92);
     if (y.code !== 0 || !existsSync(raw)) throw fail(y.err, `yt-dlp exited ${y.code}`);
 
     let info = {};

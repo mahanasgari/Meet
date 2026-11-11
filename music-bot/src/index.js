@@ -1142,14 +1142,126 @@ let videoJobs = 0;
 // Videos downloaded here and still uploading: id → { path, users }. Later
 // listeners play the same file instead of downloading it again.
 const videoTemp = new Map();
+// Videos being downloaded here: id → { progress, done: Promise<entry|null> }.
+// A download runs on its own (not tied to one listener's connection), so a
+// listener who waits on /video/prepare, or reconnects, doesn't start it over.
+const videoDownloads = new Map();
+// Failed downloads, kept a minute so /video/prepare can say so: id → message.
+const videoFailures = new Map();
+
+/** Starts (or joins) downloading video [id] here; resolves to its temp entry, or null on failure. */
+function startVideoDownload(id) {
+  const running = videoDownloads.get(id);
+  if (running) return running;
+  const home = archive.home;
+  const sid = archive.serverId;
+  const job = { progress: 0, done: null };
+  videoJobs++;
+  videoFailures.delete(id);
+  job.done = (async () => {
+    let v;
+    try {
+      v = await downloadVideo(id, {
+        ytdlpBin: YTDLP_BIN,
+        ffmpegBin: FFMPEG_BIN,
+        ytdlpArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+        tmpDir: tmpdir(),
+        onProgress: (p) => (job.progress = p),
+      });
+    } catch (e) {
+      videoJobs--;
+      videoDownloads.delete(id);
+      console.error(`[video] ${id} download failed (${e.kind}):`, e.message);
+      videoFailures.set(id, { at: Date.now(), none: e.kind === "none" });
+      await Promise.resolve(home.videoFailed(id, sid, String(e.message).slice(0, 200), { none: e.kind === "none" })).catch(() => undefined);
+      return null;
+    }
+    job.progress = 1;
+    // Listeners play the temp file while it uploads; it's deleted once the
+    // upload and every listener are done.
+    const entry = {
+      path: v.path,
+      users: 1, // the upload
+      release: () => {
+        if (--entry.users > 0) return;
+        if (videoTemp.get(id) === entry) videoTemp.delete(id);
+        rmSync(v.path, { force: true });
+        if (v.thumbPath) rmSync(v.thumbPath, { force: true });
+      },
+    };
+    videoTemp.set(id, entry);
+    videoDownloads.delete(id);
+    (async () => {
+      try {
+        if (!archive.tg.ready) await archive.tg.connect();
+        const r = await archive.tg.uploadVideo(v.path, {
+          title: v.title,
+          artist: v.artist,
+          durationS: v.durationS,
+          width: v.width,
+          height: v.height,
+          thumbPath: v.thumbPath,
+          caption: videoCaption(id, v),
+        });
+        await home.videoStored(id, { msgId: r.msgId, size: r.size, width: v.width, height: v.height, vcodec: v.vcodec, acodec: v.acodec, durationS: v.durationS, formatId: v.formatId, server: sid });
+        console.log(`[video] ${id} archived (${Math.round(r.size / 1048576)} MB)`);
+      } catch (e) {
+        console.error(`[video] ${id} upload failed:`, e.message);
+        await Promise.resolve(home.videoFailed(id, sid, `upload: ${e.message}`.slice(0, 200), {})).catch(() => undefined);
+      } finally {
+        videoJobs--;
+        // New listeners go to the channel (or a fresh try) from now on; ones
+        // still playing the file keep it until they finish.
+        if (videoTemp.get(id) === entry) videoTemp.delete(id);
+        entry.release();
+      }
+    })();
+    return entry;
+  })();
+  videoDownloads.set(id, job);
+  return job;
+}
+
+function serveVideoTemp(req, res, entry, sid) {
+  entry.users++;
+  res.once("close", entry.release);
+  serveFileRange(req, res, entry.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
+}
+
+/**
+ * Is video [id] ready to play here? Starts its download when nobody has
+ * it. {state: ready | downloading | none | busy | failed, progress?}.
+ */
+async function prepareVideo(id) {
+  if (videoTemp.has(id)) return { state: "ready" };
+  const job = videoDownloads.get(id);
+  if (job) return { state: "downloading", progress: job.progress };
+  const failed = videoFailures.get(id);
+  if (failed && Date.now() - failed.at < 60_000) return { state: failed.none ? "none" : "failed" };
+  const c = await archive.home.videoClaim(id, archive.serverId).catch(() => null);
+  if (c?.action === "stored") return { state: "ready" };
+  if (c?.action === "none") return { state: "none" };
+  if (c?.action === "wait") return { state: "downloading", progress: null, elsewhere: true }; // another server
+  if (c?.action !== "download") return { state: "busy" };
+  if (videoJobs >= 2) {
+    await Promise.resolve(archive.home.videoFailed(id, archive.serverId, "busy", {})).catch(() => undefined);
+    return { state: "busy" };
+  }
+  startVideoDownload(id);
+  return { state: "downloading", progress: 0 };
+}
+
 async function handleVideo(req, res, id) {
   const home = archive.home;
   const sid = archive.serverId;
   const tmp = videoTemp.get(id);
-  if (tmp) {
-    tmp.users++;
-    res.once("close", tmp.release);
-    serveFileRange(req, res, tmp.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
+  if (tmp) return serveVideoTemp(req, res, tmp, sid);
+  const running = videoDownloads.get(id);
+  if (running) {
+    const entry = await running.done;
+    if (req.destroyed) return;
+    if (entry) return serveVideoTemp(req, res, entry, sid);
+    sendJson(res, 502, { error: "video_failed" });
     return;
   }
   // Someone else is downloading it: wait (up to ~90 s) until it's stored.
@@ -1178,63 +1290,10 @@ async function handleVideo(req, res, id) {
     sendJson(res, 503, { error: "video_busy" });
     return;
   }
-  videoJobs++;
-  let v;
-  try {
-    v = await downloadVideo(id, {
-      ytdlpBin: YTDLP_BIN,
-      ffmpegBin: FFMPEG_BIN,
-      ytdlpArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
-      tmpDir: tmpdir(),
-    });
-  } catch (e) {
-    videoJobs--;
-    console.error(`[video] ${id} download failed (${e.kind}):`, e.message);
-    await Promise.resolve(home.videoFailed(id, sid, String(e.message).slice(0, 200), { none: e.kind === "none" })).catch(() => undefined);
-    sendJson(res, e.kind === "none" ? 404 : 502, { error: e.kind === "none" ? "no_video" : "video_failed" });
-    return;
-  }
-  // Play it to this listener from the temp file while it uploads; the file
-  // is deleted once both are done.
-  const entry = {
-    path: v.path,
-    users: 2, // this listener + the upload
-    release: () => {
-      if (--entry.users > 0) return;
-      if (videoTemp.get(id) === entry) videoTemp.delete(id);
-      rmSync(v.path, { force: true });
-      if (v.thumbPath) rmSync(v.thumbPath, { force: true });
-    },
-  };
-  const done = entry.release;
-  videoTemp.set(id, entry);
-  res.once("close", done);
-  serveFileRange(req, res, v.path, { mime: "video/mp4", source: `youtube:${sid}:archiving` });
-  (async () => {
-    try {
-      if (!archive.tg.ready) await archive.tg.connect();
-      const r = await archive.tg.uploadVideo(v.path, {
-        title: v.title,
-        artist: v.artist,
-        durationS: v.durationS,
-        width: v.width,
-        height: v.height,
-        thumbPath: v.thumbPath,
-        caption: videoCaption(id, v),
-      });
-      await home.videoStored(id, { msgId: r.msgId, size: r.size, width: v.width, height: v.height, vcodec: v.vcodec, acodec: v.acodec, durationS: v.durationS, formatId: v.formatId, server: sid });
-      console.log(`[video] ${id} archived (${Math.round(r.size / 1048576)} MB)`);
-    } catch (e) {
-      console.error(`[video] ${id} upload failed:`, e.message);
-      await Promise.resolve(home.videoFailed(id, sid, `upload: ${e.message}`.slice(0, 200), {})).catch(() => undefined);
-    } finally {
-      videoJobs--;
-      // New listeners go to the channel (or a fresh try) from now on; ones
-      // still playing the file keep it until they finish.
-      if (videoTemp.get(id) === entry) videoTemp.delete(id);
-      done();
-    }
-  })();
+  const entry = await startVideoDownload(id).done;
+  if (req.destroyed) return;
+  if (entry) return serveVideoTemp(req, res, entry, sid);
+  sendJson(res, 502, { error: "video_failed" });
 }
 
 // --- Backups: copy every archived song and video into each backup channel
@@ -5122,7 +5181,7 @@ const server = http.createServer(async (req, res) => {
 
     // --- Music videos (archived in the Telegram channel; servers keep only a
     // temporary file while a video is being downloaded and uploaded).
-    if (req.method === "GET" && (url.pathname === "/video/info" || url.pathname === "/video")) {
+    if (req.method === "GET" && (url.pathname === "/video/info" || url.pathname === "/video" || url.pathname === "/video/prepare")) {
       if (!requireApiToken(req, res)) return;
       const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
       if (!archive || !/^[A-Za-z0-9_-]{11}$/.test(id)) {
@@ -5151,6 +5210,10 @@ const server = http.createServer(async (req, res) => {
       }
       if (!src) {
         sendJson(res, 404, { error: "no_video" });
+        return;
+      }
+      if (url.pathname === "/video/prepare") {
+        sendJson(res, 200, await prepareVideo(src).catch(() => ({ state: "busy" })));
         return;
       }
       await handleVideo(req, res, src);

@@ -32,7 +32,8 @@ const cleanName = (u) => String(u || "").trim().toLowerCase();
 
 export class AccountStore {
   /** [backend] (shared_docs): accounts kept in the synced store, shared by every server. */
-  constructor({ dir, backend = null }) {
+  /** [dataDocs] (a SharedDocs): each account's library copy, synced too. */
+  constructor({ dir, backend = null, dataDocs = null, importData = false }) {
     this.dir = dir;
     this.file = join(dir, "accounts.json");
     this.data = { users: {} };
@@ -46,6 +47,23 @@ export class AccountStore {
     if (backend) {
       this.data.users = backend.load();
       backend.onChange(() => (this.data.users = backend.load()));
+    }
+    this.dataDocs = dataDocs;
+    // Home moves its existing library files in once.
+    if (dataDocs && importData && dataDocs.count("account_data") === 0) {
+      for (const u of Object.values(this.data.users)) {
+        const f = this.#fileData(u.uid);
+        if (f.data != null) dataDocs.put("account_data", u.uid, f, f.updatedAt || Date.now());
+      }
+    }
+  }
+
+  #fileData(uid) {
+    try {
+      const r = JSON.parse(readFileSync(join(this.dir, "data", `${uid}.json`), "utf8"));
+      return { data: r.data ?? null, updatedAt: r.updatedAt || 0 };
+    } catch {
+      return { data: null, updatedAt: 0 };
     }
   }
 
@@ -108,17 +126,17 @@ export class AccountStore {
   }
 
   getData(uid) {
-    try {
-      const r = JSON.parse(readFileSync(join(this.dir, "data", `${uid}.json`), "utf8"));
-      return { data: r.data ?? null, updatedAt: r.updatedAt || 0 };
-    } catch {
-      return { data: null, updatedAt: 0 };
+    if (this.dataDocs) {
+      const r = this.dataDocs.get("account_data", uid);
+      if (r) return { data: r.data ?? null, updatedAt: r.updatedAt || 0 };
     }
+    return this.#fileData(uid);
   }
 
   putData(uid, data, now = Date.now()) {
     const text = JSON.stringify({ data, updatedAt: now });
     if (text.length > MAX_DATA) throw new Error("too_big");
+    this.dataDocs?.put("account_data", uid, { data, updatedAt: now }, now);
     const d = join(this.dir, "data");
     mkdirSync(d, { recursive: true });
     const file = join(d, `${uid}.json`);

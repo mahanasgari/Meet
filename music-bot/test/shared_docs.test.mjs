@@ -59,3 +59,22 @@ test("invites: a block at home reaches the mirror", () => {
   assert.deepEqual(di.disabledUids(), hi.disabledUids());
   assert.equal(di.disabledUids().length, 1);
 });
+
+test("an account's library copy is synced too (home's files moved in once)", () => {
+  const d = mkdtempSync(join(tmpdir(), "sd-"));
+  const home = server(d, "home");
+  const de = server(d, "germany");
+  mkdirSync(join(d, "acc", "data"), { recursive: true });
+  writeFileSync(join(d, "acc", "data", "aaaaaaaaaaaa.json"), JSON.stringify({ data: { likes: [1] }, updatedAt: 5 }));
+  const users = () => ({ sara: { uid: "aaaaaaaaaaaa", hash: "h", salt: "s" } });
+  const ha = new AccountStore({ dir: join(d, "acc"), backend: docsBackend(home.docs, "accounts", { legacyLoad: users }), dataDocs: home.docs, importData: true });
+  assert.deepEqual(ha.getData("aaaaaaaaaaaa"), { data: { likes: [1] }, updatedAt: 5 });
+  const da = new AccountStore({ dir: join(d, "acc-de"), backend: docsBackend(de.docs, "accounts"), dataDocs: de.docs });
+  assert.equal(da.getData("aaaaaaaaaaaa").data, null);
+  ship(home, de);
+  assert.deepEqual(da.getData("aaaaaaaaaaaa"), { data: { likes: [1] }, updatedAt: 5 });
+  // Saved on the mirror (home down) → back home.
+  da.putData("aaaaaaaaaaaa", { likes: [1, 2] }, 9);
+  ship(de, home);
+  assert.deepEqual(ha.getData("aaaaaaaaaaaa"), { data: { likes: [1, 2] }, updatedAt: 9 });
+});

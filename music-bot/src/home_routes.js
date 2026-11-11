@@ -56,8 +56,16 @@ export function forwardHeaders(req, { isMaster, ip }) {
  * Proxy [req] to homeUrl + path + query. Always answers [res]; resolves true.
  * 502 {error:"home_unreachable"} when home doesn't answer or the body is too big.
  */
-export async function proxyToHome({ fetchImpl = fetch, homeUrl, req, res, url, isMaster, ip, bodyLimit = 3_000_000, timeoutMs = 30_000 }) {
+export async function proxyToHome({ fetchImpl = fetch, homeUrl, req, res, url, isMaster, ip, bodyLimit = 3_000_000, timeoutMs = 30_000, fallback = false }) {
+  // [fallback]: this server can answer itself. When home doesn't answer (or
+  // answers 5xx), nothing is sent: resolves false, with the request body kept
+  // in req.mpBody for the local handler.
+  let body = null;
   const fail = () => {
+    if (fallback && !res.headersSent) {
+      req.mpBody = body || Buffer.alloc(0);
+      return false;
+    }
     if (res.headersSent) {
       res.destroy();
       return;
@@ -76,12 +84,20 @@ export async function proxyToHome({ fetchImpl = fetch, homeUrl, req, res, url, i
       let size = 0;
       for await (const c of req) {
         size += c.length;
-        if (size > bodyLimit) return fail(), true;
+        if (size > bodyLimit) {
+          fallback = false; // too big for either
+          fail();
+          return true;
+        }
         chunks.push(c);
       }
-      init.body = Buffer.concat(chunks);
+      body = init.body = Buffer.concat(chunks);
     }
     const r = await fetchImpl(homeUrl + url.pathname + url.search, init);
+    if (fallback && r.status >= 500) {
+      r.body?.cancel().catch(() => {});
+      return fail();
+    }
     const out = {};
     for (const k of COPY_RES) {
       const v = r.headers.get(k);
@@ -95,7 +111,7 @@ export async function proxyToHome({ fetchImpl = fetch, homeUrl, req, res, url, i
     // Stream so big files start at once; a mid-stream failure cuts the socket.
     Readable.fromWeb(r.body).on("error", () => res.destroy()).pipe(res);
   } catch {
-    fail();
+    if (fail() === false) return false;
   }
   return true;
 }

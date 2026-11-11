@@ -65,6 +65,22 @@ export class SharedDocs {
     return n;
   }
 
+  get(coll, id) {
+    const r = this.db.prepare("SELECT body FROM docs WHERE coll=? AND id=?").get(coll, id);
+    if (!r) return null;
+    try {
+      return JSON.parse(r.body);
+    } catch {
+      return null;
+    }
+  }
+
+  put(coll, id, value, now = Date.now()) {
+    this.db.prepare(`INSERT INTO docs(coll, id, body, updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(coll, id) DO UPDATE SET body=excluded.body, updated_at=excluded.updated_at`)
+      .run(coll, id, JSON.stringify(value), now);
+  }
+
   /** [fn]() runs when other servers' changes to [coll] arrive. */
   onChange(coll, fn) {
     if (!this.listeners.has(coll)) this.listeners.set(coll, new Set());

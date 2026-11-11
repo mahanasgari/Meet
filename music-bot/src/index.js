@@ -981,11 +981,14 @@ if (catalog) {
 
 // In-house recommender (home only): friends' plays + co-listening + the
 // YouTube Music song graph + similar artists. No YouTube requests.
-const accounts = catalog
+// On every server (synced); mirrors use theirs when home is down.
+const accounts = sharedDocs
   ? new AccountStore({
       dir: joinPath(SHARES, "accounts"),
+      dataDocs: sharedDocs,
+      importData: !HOME_URL,
       backend: docsBackend(sharedDocs, "accounts", {
-        legacyLoad: () => {
+        legacyLoad: HOME_URL ? null : () => {
           try {
             return JSON.parse(readFileSync(joinPath(SHARES, "accounts", "accounts.json"), "utf8")).users || {};
           } catch {
@@ -1053,11 +1056,11 @@ const releases = new Releases({
 });
 
 // Public song links live on home, the server behind the public domain.
-const songLinks = catalog
+const songLinks = sharedDocs
   ? new SongLinks({
       file: joinPath(SHARES, "song-links.json"),
       backend: docsBackend(sharedDocs, "song_links", {
-        legacyLoad: () => {
+        legacyLoad: HOME_URL ? null : () => {
           try {
             return JSON.parse(readFileSync(joinPath(SHARES, "song-links.json"), "utf8"));
           } catch {
@@ -2968,6 +2971,7 @@ function cleanShareTrack(t) {
 
 /** Body as JSON; accepts `Content-Encoding: gzip` (small over lossy links). */
 function readJsonMaybeGzip(req, limit) {
+  if (req.mpBody) return Promise.resolve().then(() => parseBodyBuffer(req, req.mpBody, limit, { gzip: true }));
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -2995,7 +2999,19 @@ function readJsonMaybeGzip(req, limit) {
   });
 }
 
+/** A request body home didn't take (see proxyToHome's fallback), read here. */
+function parseBodyBuffer(req, buf, limit, { gzip = false } = {}) {
+  if (buf.length > limit) throw Object.assign(new Error("body_too_large"), { status: 400 });
+  try {
+    if (gzip && (req.headers["content-encoding"] || "").includes("gzip")) buf = gunzipSync(buf, { maxOutputLength: 1_000_000 });
+    return buf.length ? JSON.parse(buf.toString("utf8")) : {};
+  } catch {
+    throw Object.assign(new Error("invalid_json"), { status: 400 });
+  }
+}
+
 function readBody(req, limit = 8_192) {
+  if (req.mpBody) return Promise.resolve().then(() => parseBodyBuffer(req, req.mpBody, limit));
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -3649,24 +3665,38 @@ function queueInterest(endpoint, body, text) {
   }
 }
 
+// Home-only requests a mirror with a catalog copy answers itself when home
+// doesn't (its copy and the synced accounts, invites, shares and Explore).
+const LOCAL_WHEN_HOME_DOWN =
+  /^\/(song\/(info|related|links)|artists\/search|search\/smart|mood\/(songs|vote)|share(\/song|\/[A-Za-z0-9]{6})?|s\/[A-Za-z2-9]{8}|invite\/redeem|account\/[a-z-]+|explore(\/[A-Za-z0-9/-]*)?|video\/(candidates|choose)|charts\/weekly)$/;
+const homeCatalog = catalog;
+
 const server = http.createServer(async (req, res) => {
   try {
+    // Home's catalog on home; on a mirror, its copy for a request home
+    // couldn't answer (below), otherwise none.
+    let catalog = homeCatalog;
     const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
     trackRequest(req, res, url);
     if (corsAndPackedHeaders(req, res, url)) return;
 
-    // Mirrors have no catalog/accounts: hand home-only requests to home so
-    // phones that can't reach its domain still work.
-    if (!catalog && HOME_URL && isHomeOnlyPath(url.pathname)) {
-      await proxyToHome({
+    // Mirrors hand home-only requests to home, so phones that can't reach its
+    // domain still work; with home down, a mirror with a copy answers itself.
+    if (!homeCatalog && HOME_URL && isHomeOnlyPath(url.pathname)) {
+      const local = Boolean(replica) && LOCAL_WHEN_HOME_DOWN.test(url.pathname);
+      const sent = await proxyToHome({
         homeUrl: HOME_URL,
         req,
         res,
         url,
         isMaster: isMasterToken(req),
         ip: clientIp(req),
+        fallback: local,
+        timeoutMs: local ? 12_000 : 30_000,
       });
-      return;
+      if (sent) return;
+      catalog = replica;
+      res.setHeader("X-MP-Answered-By", SYNC_ORIGIN);
     }
 
     if (req.method === "GET" && url.pathname === "/health") {

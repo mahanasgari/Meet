@@ -239,6 +239,11 @@ export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutM
           result[p.origin] = { error: "too_far_behind" };
           break;
         }
+        if (r.status === 404) {
+          // That server has no such data (a mirror without a catalog copy).
+          result[p.origin] = { none: true };
+          break;
+        }
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         if (r.headers.get("x-sync-origin") && r.headers.get("x-sync-origin") !== p.origin) throw new Error("origin mismatch");
         const rows = decodeRows(Buffer.from(await r.arrayBuffer()));
@@ -254,4 +259,14 @@ export async function pullOnce(feed, peers, { fetchImpl = fetch, token, timeoutM
     }
   }
   return result;
+}
+
+/** The servers to sync with: "origin=url,origin=url" (SYNC_PEERS) or [fallback]. */
+export function parsePeers(text, fallback = []) {
+  const out = [];
+  for (const part of String(text || "").split(",")) {
+    const m = /^\s*([a-z0-9-]{1,40})\s*=\s*(https?:\/\/\S+?)\/*\s*$/.exec(part);
+    if (m) out.push({ origin: m[1], url: m[2] });
+  }
+  return out.length ? out : fallback;
 }

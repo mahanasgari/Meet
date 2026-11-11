@@ -218,10 +218,25 @@ export class HomeLink {
     }
   }
   async stored(id, info) {
-    return this.catalog ? this.catalog.stored(id, info) : this.post("/archive/stored", { id, info }, 15000);
+    if (this.catalog) return this.catalog.stored(id, info);
+    return this.#write("/archive/stored", { id, info }, 15000, (r) => r.stored(id, info));
   }
   async failed(id, server, error, flags) {
-    return this.catalog ? this.catalog.failed(id, server, error, flags) : this.post("/archive/failed", { id, server, error, flags });
+    if (this.catalog) return this.catalog.failed(id, server, error, flags);
+    return this.#write("/archive/failed", { id, server, error, flags }, 5000, (r) => r.failed(id, server, error, flags));
+  }
+
+  /**
+   * A change for home's catalog. Home down: it goes into this server's own
+   * copy instead, and reaches home (and everyone) through the sync.
+   */
+  async #write(path, body, timeoutMs, local) {
+    try {
+      return await this.post(path, body, timeoutMs);
+    } catch (e) {
+      if (!this.replica) throw e;
+      return local(this.replica);
+    }
   }
   async nextJobs(server, limit, { urgentOnly = false } = {}) {
     if (this.catalog) return this.catalog.nextJobs(server, limit, Date.now(), { urgentOnly });
@@ -234,7 +249,8 @@ export class HomeLink {
     return this.post("/archive/enqueue", { ids, reason }).then((r) => r.queued || 0);
   }
   async plays(events) {
-    return this.catalog ? this.catalog.recordPlays(events) : this.post("/archive/plays", { events }, 10000);
+    if (this.catalog) return this.catalog.recordPlays(events);
+    return this.#write("/archive/plays", { events }, 10000, (r) => r.recordPlays(events));
   }
   async archivedIds(ids) {
     if (this.catalog) return this.catalog.archivedIds(ids);
@@ -279,10 +295,12 @@ export class HomeLink {
     }
   }
   async videoStored(id, info) {
-    return this.catalog ? this.catalog.videoStored(id, info) : this.post("/archive/video-stored", { id, info }, 15000);
+    if (this.catalog) return this.catalog.videoStored(id, info);
+    return this.#write("/archive/video-stored", { id, info }, 15000, (r) => r.videoStored(id, info));
   }
   async videoFailed(id, server, error, flags) {
-    return this.catalog ? this.catalog.videoFailed(id, server, error, flags) : this.post("/archive/video-failed", { id, server, error, flags });
+    if (this.catalog) return this.catalog.videoFailed(id, server, error, flags);
+    return this.#write("/archive/video-failed", { id, server, error, flags }, 5000, (r) => r.videoFailed(id, server, error, flags));
   }
   // Shared lyrics, kept in the home catalog.
   async lyricsGet(id) {
@@ -298,11 +316,12 @@ export class HomeLink {
   }
   async lyricsPut(id, lyrics, picked) {
     if (this.catalog) return this.catalog.lyricsPut(id, lyrics, { picked });
-    return (await this.post("/archive/lyrics-put", { id, lyrics, picked }, 8000)).stored === true;
+    const r = await this.#write("/archive/lyrics-put", { id, lyrics, picked }, 8000, (c) => ({ stored: c.lyricsPut(id, lyrics, { picked }) }));
+    return r.stored === true;
   }
   async lyricsReject(id, lyrics = null) {
     if (this.catalog) return this.catalog.lyricsReject(id, lyrics);
-    await this.post("/archive/lyrics-reject", { id, lyrics }, 8000);
+    await this.#write("/archive/lyrics-reject", { id, lyrics }, 8000, (c) => c.lyricsReject(id, lyrics));
   }
   async peers() {
     if (this.catalog) return this.localPeers();

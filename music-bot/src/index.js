@@ -38,7 +38,7 @@ import { dailyReport, weeklyReport } from "./reports.js";
 import { ReportStore } from "./error_reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
-import { ChangeFeed, encodeRows, pullOnce, syncPositions } from "./catalog_sync.js";
+import { ChangeFeed, encodeRows, parsePeers, pullOnce, syncPositions } from "./catalog_sync.js";
 import { SharedDocs, docsBackend } from "./shared_docs.js";
 import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
@@ -529,6 +529,13 @@ const replicaFile = joinPath(SHARES, "catalog", "catalog.db");
 const replica = ARCHIVE_ON && HOME_URL && process.env.CATALOG_REPLICA !== "0" && existsSync(replicaFile) ? new Catalog(replicaFile) : null;
 const SYNC_ORIGIN = (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase().replace(/[^a-z0-9-]/g, "-");
 const syncDb = catalog || replica;
+// Every server syncs with every other one (each pulls the others' changes).
+const SYNC_PEERS = parsePeers(process.env.SYNC_PEERS, [
+  { origin: "home", url: "https://music.cloudproducts.ir/extractor" },
+  { origin: "germany", url: "https://hetzshib.buymepizza.ir/extractor" },
+  { origin: "united-states", url: "https://usnishback.buymepizza.ir/extractor" },
+  { origin: "turkey", url: "https://shabash.buymepizza.ir/extractor" },
+]).filter((p) => p.origin !== (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase());
 const catalogFeed = syncDb
   ? new ChangeFeed({ db: syncDb.db, outFile: joinPath(SHARES, "catalog", "sync-out.db"), origin: SYNC_ORIGIN })
   : null;
@@ -598,6 +605,17 @@ if (sharedDocs) {
   invites.useBackend(docsBackend(sharedDocs, "invites", { legacyLoad: HOME_URL ? null : () => invites.data.invites }));
 }
 const syncState = { last: null, at: 0 };
+// A server that's down shows up once when it goes, and when it's back.
+const syncErrSeen = new Map();
+function logSyncErrors(name, result) {
+  for (const [o, x] of Object.entries(result || {})) {
+    const key = `${name}:${o}`;
+    const was = syncErrSeen.get(key);
+    if (x.error && was !== x.error) console.error(`[sync] ${name} from ${o}:`, x.error);
+    if (!x.error && was) console.log(`[sync] ${name} from ${o}: back`);
+    syncErrSeen.set(key, x.error || null);
+  }
+}
 if (catalogFeed) {
   setInterval(() => {
     try {
@@ -617,16 +635,16 @@ setInterval(() => {
     }
   }
 }, 5000).unref();
-if (HOME_URL && smallFeeds.size) {
+if (smallFeeds.size && SYNC_PEERS.length) {
   let pullingSmall = false;
   const pullSmall = async () => {
     if (pullingSmall) return;
     pullingSmall = true;
     try {
       for (const [name, { feed, after }] of smallFeeds) {
-        const r = await pullOnce(feed, [{ origin: "home", url: HOME_URL }], { token: MUSIC_API_TOKEN, name, onApplied: () => after?.() });
+        const r = await pullOnce(feed, SYNC_PEERS, { token: MUSIC_API_TOKEN, name, onApplied: () => after?.() });
         syncState[name] = r;
-        if (r.home?.error) console.error(`[sync] ${name} from home:`, r.home.error);
+        logSyncErrors(name, r);
       }
     } finally {
       pullingSmall = false;
@@ -635,26 +653,29 @@ if (HOME_URL && smallFeeds.size) {
   setTimeout(pullSmall, 8000).unref();
   setInterval(pullSmall, 15_000).unref();
 }
-if (replica) {
-  // Phase 1: home is the one origin (Phase 2: every server).
+if (catalogFeed && SYNC_PEERS.length) {
+  // Every server with a catalog pulls the others' changes (home too: what
+  // a mirror wrote while home was down comes home this way).
   let pulling = false;
   const pull = async () => {
     if (pulling) return;
     pulling = true;
     try {
-      syncState.last = await pullOnce(catalogFeed, [{ origin: "home", url: HOME_URL }], { token: MUSIC_API_TOKEN });
+      syncState.last = await pullOnce(catalogFeed, SYNC_PEERS, { token: MUSIC_API_TOKEN });
       syncState.at = Date.now();
-      for (const [o, r] of Object.entries(syncState.last)) if (r.error) console.error(`[sync] from ${o}:`, r.error);
+      logSyncErrors("catalog", syncState.last);
     } finally {
       pulling = false;
     }
   };
   setTimeout(pull, 5000).unref();
   setInterval(pull, 15_000).unref();
+}
+if (replica) {
   // Its own snapshots: another new server can start from this copy.
   setTimeout(snapshotCatalog, 20 * 60_000).unref();
   setInterval(snapshotCatalog, 6 * 3600_000).unref();
-  console.log(`[sync] catalog copy on, from home at ${JSON.stringify(syncPositions(replica.db))}`);
+  console.log(`[sync] catalog copy on, at ${JSON.stringify(syncPositions(replica.db))}`);
 }
 const extLinks = catalog ? new ExtSongLinks({ catalog }) : null;
 const errorReports = catalog ? new ReportStore({ file: joinPath(SHARES, "reports.jsonl") }) : null;

@@ -123,3 +123,28 @@ test("old outbox rows are pruned", () => {
   assert.ok(home.feed.prune(NOW) >= 1);
   assert.ok(home.feed.firstSeq() > 1);
 });
+
+test("peer list from SYNC_PEERS, or the built-in one", async () => {
+  const { parsePeers } = await import("../src/catalog_sync.js");
+  assert.deepEqual(parsePeers("home=https://h/x/, germany = https://g/x ,bad,UPPER=https://u"), [
+    { origin: "home", url: "https://h/x" },
+    { origin: "germany", url: "https://g/x" },
+  ]);
+  assert.deepEqual(parsePeers("", [{ origin: "a", url: "https://a" }]), [{ origin: "a", url: "https://a" }]);
+});
+
+test("home down: a mirror writes into its own copy, and that reaches home later", async () => {
+  const { HomeLink } = await import("../src/archive.js");
+  const d = dir();
+  const home = node(d, "home");
+  const de = node(d, "germany");
+  const link = new HomeLink({ replica: de.c, homeUrl: "http://127.0.0.1:9", token: "t" }); // nothing listens there
+  await link.stored("song0000009", { msgId: 9, title: "Made while home was down" });
+  await link.videoStored("song0000009", { msgId: 99, size: 5, width: 640, height: 360 });
+  assert.equal((await link.lookup("song0000009")).msgId, 9, "served from the copy");
+  assert.equal((await link.claim("song0000009", "germany")).action, "stored");
+  de.feed.flush();
+  ship(de, home);
+  assert.equal(home.c.lookup("song0000009").msgId, 9);
+  assert.equal(home.c.videoLookup("song0000009").msgId, 99);
+});

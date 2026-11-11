@@ -148,8 +148,14 @@ export function songInfoFromYtdlp(j) {
 
 /** Talks to the catalog: directly on the home server, over HTTP elsewhere. */
 export class HomeLink {
-  constructor({ catalog = null, homeUrl = "", token = "", peers = () => [] }) {
+  /**
+   * [catalog]: this is home. [replica]: this server's own copy of home's
+   * catalog (kept in step by catalog_sync): reads come from it first and
+   * still work when home is down; writes go to home.
+   */
+  constructor({ catalog = null, replica = null, homeUrl = "", token = "", peers = () => [] }) {
     this.catalog = catalog;
+    this.replica = catalog ? null : replica;
     this.homeUrl = homeUrl.replace(/\/+$/, "");
     this.token = token;
     this.localPeers = peers;
@@ -174,16 +180,41 @@ export class HomeLink {
 
   async lookup(id) {
     if (this.catalog) return this.catalog.lookup(id);
-    return (await this.post("/archive/lookup", { id }, 4000)).song || null;
+    const local = this.#replicaRead((r) => r.lookup(id));
+    if (local?.status === "stored") return local;
+    try {
+      return (await this.post("/archive/lookup", { id }, 4000)).song || null;
+    } catch (e) {
+      if (this.replica) return local; // home down: what this copy knows
+      throw e;
+    }
   }
   async claim(id, server) {
     if (this.catalog) return this.catalog.claim(id, server);
+    const local = this.#replicaRead((r) => r.lookup(id));
+    if (local?.status === "stored" && local.msgId) return { action: "stored", song: local };
     try {
       return await this.post("/archive/claim", { id, server }, 4000);
     } catch {
       // Home's disk can hang ~30 s. Waiting beats falling through to YouTube,
       // which often fails here for a song the channel already has.
-      return this.post("/archive/claim", { id, server }, 15000);
+      try {
+        return await this.post("/archive/claim", { id, server }, this.replica ? 8000 : 15000);
+      } catch (e) {
+        // Home is down: this server gets the song itself.
+        if (this.replica) return { action: "download" };
+        throw e;
+      }
+    }
+  }
+
+  /** [fn](replica) or null when there's no copy (or it fails). */
+  #replicaRead(fn) {
+    if (!this.replica) return null;
+    try {
+      return fn(this.replica);
+    } catch {
+      return null;
     }
   }
   async stored(id, info) {
@@ -207,20 +238,45 @@ export class HomeLink {
   }
   async archivedIds(ids) {
     if (this.catalog) return this.catalog.archivedIds(ids);
+    const local = this.#replicaRead((r) => r.archivedIds(ids));
+    if (local) return local;
     return (await this.post("/archive/archived", { ids }, 5000)).ids || [];
   }
   // Music videos: same pattern as songs, kept in the catalog's videos table.
   async videoLookup(id) {
     if (this.catalog) return this.catalog.videoLookup(id);
-    return (await this.post("/archive/video-lookup", { id }, 4000)).video || null;
+    const local = this.#replicaRead((r) => r.videoLookup(id));
+    if (local?.status === "stored") return local;
+    try {
+      return (await this.post("/archive/video-lookup", { id }, 4000)).video || null;
+    } catch (e) {
+      if (this.replica) return local;
+      throw e;
+    }
   }
   /** {srcId} — the video to play for [id] (an audio track's official video, or itself); srcId null = none. */
   async videoMap(id) {
     if (this.resolveVideo) return this.resolveVideo(id);
-    return this.post("/archive/video-map", { id }, 15000);
+    try {
+      return await this.post("/archive/video-map", { id }, 15000);
+    } catch (e) {
+      if (!this.replica) throw e;
+      // Home down: the match this copy knows (a new match waits for home).
+      const song = this.#replicaRead((r) => r.lookup(id));
+      if (!song || song.sourceKind !== "ytm_track") return { srcId: id };
+      return { srcId: this.#replicaRead((r) => r.videoMapGet(id))?.srcId || null };
+    }
   }
   async videoClaim(id, server) {
-    return this.catalog ? this.catalog.videoClaim(id, server) : this.post("/archive/video-claim", { id, server }, 4000);
+    if (this.catalog) return this.catalog.videoClaim(id, server);
+    const local = this.#replicaRead((r) => r.videoLookup(id));
+    if (local?.status === "stored" && local.msgId) return { action: "stored", video: local };
+    try {
+      return await this.post("/archive/video-claim", { id, server }, 4000);
+    } catch (e) {
+      if (this.replica) return { action: "download" };
+      throw e;
+    }
   }
   async videoStored(id, info) {
     return this.catalog ? this.catalog.videoStored(id, info) : this.post("/archive/video-stored", { id, info }, 15000);
@@ -231,7 +287,14 @@ export class HomeLink {
   // Shared lyrics, kept in the home catalog.
   async lyricsGet(id) {
     if (this.catalog) return this.catalog.lyricsGet(id);
-    return (await this.post("/archive/lyrics-get", { id }, 4000)).entry || null;
+    const local = this.#replicaRead((r) => r.lyricsGet(id));
+    if (local) return local;
+    try {
+      return (await this.post("/archive/lyrics-get", { id }, 4000)).entry || null;
+    } catch (e) {
+      if (this.replica) return null;
+      throw e;
+    }
   }
   async lyricsPut(id, lyrics, picked) {
     if (this.catalog) return this.catalog.lyricsPut(id, lyrics, { picked });

@@ -19,10 +19,11 @@ import {
   createReadStream,
   readdirSync,
   statfsSync,
+  existsSync,
 } from "node:fs";
 import { cpus, freemem, loadavg, tmpdir, totalmem, uptime as osUptime } from "node:os";
 import { join as joinPath } from "node:path";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { createGzip, gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
 import { audioFormat } from "./quality.js";
@@ -37,6 +38,7 @@ import { dailyReport, weeklyReport } from "./reports.js";
 import { ReportStore } from "./error_reports.js";
 import { Archive, HomeLink, handleHomeRoute, songCaption, songInfoFromYtdlp } from "./archive.js";
 import { Catalog } from "./catalog.js";
+import { ChangeFeed, encodeRows, pullOnce, syncPositions } from "./catalog_sync.js";
 import { SongGraph } from "./song_graph.js";
 import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./interest.js";
 import { Recommender } from "./recommend.js";
@@ -519,6 +521,93 @@ const ARCHIVE_ON =
   process.env.ARCHIVE !== "0" &&
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_STORE_BOT_TOKEN && process.env.TG_STORE_CHANNEL);
 const catalog = ARCHIVE_ON && !HOME_URL ? new Catalog(joinPath(SHARES, "catalog", "catalog.db")) : null;
+// A mirror's own copy of the catalog (placed by deploy/catalog-copy.sh, then
+// kept in step with home every few seconds): it serves reads by itself, so
+// songs, videos and lyrics still play when home is down.
+const replicaFile = joinPath(SHARES, "catalog", "catalog.db");
+const replica = ARCHIVE_ON && HOME_URL && process.env.CATALOG_REPLICA !== "0" && existsSync(replicaFile) ? new Catalog(replicaFile) : null;
+const SYNC_ORIGIN = (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase().replace(/[^a-z0-9-]/g, "-");
+const syncDb = catalog || replica;
+const catalogFeed = syncDb
+  ? new ChangeFeed({ db: syncDb.db, outFile: joinPath(SHARES, "catalog", "sync-out.db"), origin: SYNC_ORIGIN })
+  : null;
+// A consistent copy for the nightly backup (the live file is in WAL mode).
+// VACUUM INTO takes minutes on home's disk: on a worker thread with its own
+// connection, so the server keeps answering meanwhile.
+let snapshotting = false;
+function snapshotCatalog() {
+  if (snapshotting) return;
+  const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
+  const src = joinPath(SHARES, "catalog", "catalog.db");
+  // A copy (mirror) makes one only with room to spare: the snapshot is as
+  // big as the catalog, and mirror disks are small.
+  if (!catalog) {
+    try {
+      const fs = statfsSync(SHARES);
+      const free = fs.bavail * fs.bsize;
+      if (free < statSync(src).size * 2 + 2 * 1024 ** 3) {
+        console.log("[archive] no catalog snapshot here: not enough free disk");
+        rmSync(out, { force: true });
+        return;
+      }
+    } catch {
+      return;
+    }
+  }
+  snapshotting = true;
+  const w = new Worker(
+    `const { workerData: d } = process.getBuiltinModule("node:worker_threads");
+     const { rmSync } = process.getBuiltinModule("node:fs");
+     const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+     const { renameSync } = process.getBuiltinModule("node:fs");
+     const tmp = d.out + ".tmp";
+     rmSync(tmp, { force: true });
+     const db = new DatabaseSync(d.src, { readOnly: true });
+     db.exec("VACUUM INTO '" + tmp.replace(/'/g, "''") + "'");
+     db.close();
+     renameSync(tmp, d.out); // a peer downloading the old one keeps reading it`,
+    { eval: true, workerData: { src, out } },
+  );
+  const t = Date.now();
+  w.on("error", (e) => console.error("[archive] snapshot:", e.message));
+  w.on("exit", () => {
+    snapshotting = false;
+    console.log(`[archive] catalog snapshot in ${Math.round((Date.now() - t) / 1000)} s`);
+  });
+}
+
+const syncState = { last: null, at: 0 };
+if (catalogFeed) {
+  setInterval(() => {
+    try {
+      catalogFeed.flush();
+    } catch (e) {
+      console.error("[sync] flush:", e.message);
+    }
+  }, 5000).unref();
+  setInterval(() => catalogFeed.prune(), 3600_000).unref();
+}
+if (replica) {
+  // Phase 1: home is the one origin (Phase 2: every server).
+  let pulling = false;
+  const pull = async () => {
+    if (pulling) return;
+    pulling = true;
+    try {
+      syncState.last = await pullOnce(catalogFeed, [{ origin: "home", url: HOME_URL }], { token: MUSIC_API_TOKEN });
+      syncState.at = Date.now();
+      for (const [o, r] of Object.entries(syncState.last)) if (r.error) console.error(`[sync] from ${o}:`, r.error);
+    } finally {
+      pulling = false;
+    }
+  };
+  setTimeout(pull, 5000).unref();
+  setInterval(pull, 15_000).unref();
+  // Its own snapshots: another new server can start from this copy.
+  setTimeout(snapshotCatalog, 20 * 60_000).unref();
+  setInterval(snapshotCatalog, 6 * 3600_000).unref();
+  console.log(`[sync] catalog copy on, from home at ${JSON.stringify(syncPositions(replica.db))}`);
+}
 const extLinks = catalog ? new ExtSongLinks({ catalog }) : null;
 const errorReports = catalog ? new ReportStore({ file: joinPath(SHARES, "reports.jsonl") }) : null;
 /** Healthy music servers for peer hand-offs, best first (home only). */
@@ -533,7 +622,7 @@ function healthyPeers() {
 const archive = ARCHIVE_ON
   ? new Archive({
       serverId: process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home"),
-      home: new HomeLink({ catalog, homeUrl: HOME_URL, token: MUSIC_API_TOKEN, peers: healthyPeers }),
+      home: new HomeLink({ catalog, replica, homeUrl: HOME_URL, token: MUSIC_API_TOKEN, peers: healthyPeers }),
       tg: new TgStore({
         apiId: Number(process.env.TG_API_ID),
         apiHash: process.env.TG_API_HASH,
@@ -568,34 +657,8 @@ if (catalog) {
   };
   setTimeout(seed, 10 * 60_000).unref();
   setInterval(seed, 6 * 3600_000).unref();
-  // A consistent copy for the nightly backup (the live file is in WAL mode).
-  // VACUUM INTO takes minutes on home's disk: on a worker thread with its own
-  // connection, so the server keeps answering meanwhile.
-  let snapshotting = false;
-  const snapshot = () => {
-    if (snapshotting) return;
-    snapshotting = true;
-    const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
-    const src = joinPath(SHARES, "catalog", "catalog.db");
-    const w = new Worker(
-      `const { workerData: d } = process.getBuiltinModule("node:worker_threads");
-       const { rmSync } = process.getBuiltinModule("node:fs");
-       const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
-       rmSync(d.out, { force: true });
-       const db = new DatabaseSync(d.src, { readOnly: true });
-       db.exec("VACUUM INTO '" + d.out.replace(/'/g, "''") + "'");
-       db.close();`,
-      { eval: true, workerData: { src, out } },
-    );
-    const t = Date.now();
-    w.on("error", (e) => console.error("[archive] snapshot:", e.message));
-    w.on("exit", () => {
-      snapshotting = false;
-      console.log(`[archive] catalog snapshot in ${Math.round((Date.now() - t) / 1000)} s`);
-    });
-  };
-  setTimeout(snapshot, 15 * 60_000).unref();
-  setInterval(snapshot, 6 * 3600_000).unref();
+  setTimeout(snapshotCatalog, 15 * 60_000).unref();
+  setInterval(snapshotCatalog, 6 * 3600_000).unref();
 
   // Songs archived before type/quality were recorded: read their metadata
   // again (no download) and refresh the catalog and the channel caption.
@@ -3886,6 +3949,66 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, out ? 200 : 404, out || { error: "not_found" });
       return;
     }
+    // --- Catalog sync between servers (master token only): this server's
+    // own changes after ?since=, and where it stands.
+    if (req.method === "GET" && /^\/sync\/catalog\/(changes|status|snapshot)$/.test(url.pathname)) {
+      if (!isMasterToken(req)) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!catalogFeed) {
+        sendJson(res, 404, { error: "no_catalog" });
+        return;
+      }
+      if (url.pathname === "/sync/catalog/snapshot") {
+        // A whole copy for a new server (made every 6 h; it carries its sync
+        // positions in its meta table). gzip on the wire.
+        const file = joinPath(SHARES, "catalog", "catalog-snapshot.db");
+        let st;
+        try {
+          st = statSync(file);
+        } catch {
+          sendJson(res, 404, { error: "no_snapshot" });
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Encoding": "gzip",
+          "X-Snapshot-Bytes": String(st.size),
+          "X-Snapshot-At": String(Math.round(st.mtimeMs)),
+          "X-Sync-Origin": SYNC_ORIGIN,
+        });
+        const gz = createGzip({ level: 1 });
+        createReadStream(file).on("error", () => res.destroy()).pipe(gz).pipe(res);
+        res.on("close", () => gz.destroy());
+        return;
+      }
+      if (url.pathname === "/sync/catalog/status") {
+        sendJson(res, 200, {
+          origin: SYNC_ORIGIN, role: catalog ? "home" : "copy", lastSeq: catalogFeed.lastSeq(), firstSeq: catalogFeed.firstSeq(),
+          positions: syncPositions(syncDb.db), lastPull: syncState.last, lastPullAt: syncState.at || null,
+        });
+        return;
+      }
+      const since = Math.max(0, Number(url.searchParams.get("since")) || 0);
+      const first = catalogFeed.firstSeq();
+      // Further behind than the outbox keeps: the peer needs a fresh copy.
+      if (first > 1 && since < first - 1) {
+        sendJson(res, 410, { error: "too_far_behind", firstSeq: first });
+        return;
+      }
+      const rows = catalogFeed.read(since);
+      const last = catalogFeed.lastSeq();
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "X-Sync-Origin": SYNC_ORIGIN,
+        "X-Sync-Last": String(last),
+        "X-Sync-More": rows.length && rows[rows.length - 1].seq < last ? "1" : "0",
+      });
+      res.end(encodeRows(rows));
+      return;
+    }
+
     // --- The app's next song: get it onto this server's disk before it plays.
     if (req.method === "POST" && url.pathname === "/warm") {
       if (!requireApiToken(req, res)) return;

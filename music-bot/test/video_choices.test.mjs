@@ -33,6 +33,17 @@ test("videos list: this song's versions, official first, other songs left out", 
   assert.deepEqual(videoCandidates(rows, { title: "" }), []);
 });
 
+test("a song stored under its upload title only lists that song", () => {
+  const rows2 = [
+    { videoId: "official001", title: "Sami Beigi - In Eshghe I Official Video ( سامی بیگی - این عشقه )", subtitle: "Sami Beigi", durationS: 232 },
+    { videoId: "lyrics00001", title: "Sami Beigi - In Eshghe I Lyric Video ( سامی بیگی - این عشقه )", subtitle: "Sami Beigi", durationS: 225 },
+    { videoId: "cheshmat001", title: "Sami Beigi - Cheshmat I Official Audio ( سامی بیگی - چشمات )", subtitle: "Sami Beigi", durationS: 178 },
+    { videoId: "sultan00001", title: "Sami Beigi - Sultan Feat Dynatonic OFFICIAL TRACK - KING ALBUM", subtitle: "Sami Beigi", durationS: 204 },
+  ];
+  const list = videoCandidates(rows2, { title: "Sami Beigi - In Eshghe I Official Video ( سامی بیگی - این عشقه )", artist: "Sami Beigi", durationS: 232 });
+  assert.deepEqual(list.map((x) => x.videoId), ["official001", "lyrics00001"]);
+});
+
 test("video kinds", () => {
   assert.equal(videoKind({ title: "X - Y (Official Audio)" }), "audio");
   assert.equal(videoKind({ title: "X - Y", videoType: "ATV" }), "audio");

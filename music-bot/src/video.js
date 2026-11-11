@@ -269,7 +269,11 @@ export function videoKind(r) {
  * durationS, kind, score}. Rows for other songs are left out.
  */
 export function videoCandidates(rows, { title, artist, artists, durationS }, { exclude = [], limit = 8 } = {}) {
-  const want = String(title || "").trim();
+  // A song stored under its upload title ("Artist - Song I Official Video")
+  // is matched by the song part only, or the artist's other songs match too.
+  const full = String(title || "").trim();
+  const songPart = splitUploadTitle(full, String(artist || "")).title || full;
+  const want = normalize(songPart) ? songPart : full;
   if (!normalize(want)) return [];
   const wantArtists = (artists && artists.length ? artists : String(artist || "").split(/,|&| and | feat\.? | ft\.? /i))
     .map((a) => String(a).trim())

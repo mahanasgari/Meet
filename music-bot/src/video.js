@@ -247,3 +247,64 @@ export function pickOfficialVideo(rows, { title, artist, artists, durationS }, {
   }
   return best;
 }
+
+/**
+ * What kind of video a search row is, for the app's label: official, live,
+ * lyrics, cover, audio (a still image / visualizer) or fan (other uploads).
+ */
+export function videoKind(r) {
+  const t = String(r?.title || "");
+  if (r?.videoType === "ATV" || /official\s*(audio|track|visuali[sz]er)|\bvisuali[sz]er\b|\baudio\b/i.test(t)) return "audio";
+  if (/\blyrics?\b|\bmetin\b|متن/i.test(t)) return "lyrics";
+  if (/\blive\b|\bconcert\b|کنسرت|اجرای زنده/i.test(t)) return "live";
+  if (/\bcover\b|\bkaraoke\b|\bremix\b|\binstrumental\b/i.test(t)) return "cover";
+  if (r?.videoType === "OMV" || /official\s*(music\s*)?video|music\s*video|\bm\/?v\b|video\s*clip|موزیک ویدیو|موزیک ویدئو/i.test(t)) return "official";
+  return "fan";
+}
+
+/**
+ * The videos a listener can choose from for a song: rows that are about
+ * this song (title close, artist in the title or channel, length not far
+ * off), best first, at most [limit]. Each: {videoId, title, channel,
+ * durationS, kind, score}. Rows for other songs are left out.
+ */
+export function videoCandidates(rows, { title, artist, artists, durationS }, { exclude = [], limit = 8 } = {}) {
+  const want = String(title || "").trim();
+  if (!normalize(want)) return [];
+  const wantArtists = (artists && artists.length ? artists : String(artist || "").split(/,|&| and | feat\.? | ft\.? /i))
+    .map((a) => String(a).trim())
+    .filter((a) => normalize(a).length >= 2);
+  const out = [];
+  const seen = new Set();
+  for (const r of rows || []) {
+    const id = r?.videoId || "";
+    if (!/^[A-Za-z0-9_-]{11}$/.test(id) || seen.has(id) || exclude.includes(id)) continue;
+    if (r.videoType === "PODCAST_EPISODE") continue;
+    const rawTitle = String(r.title || "");
+    const channel = String(r.subtitle || "").split("•")[0].trim();
+    const split = splitUploadTitle(rawTitle, channel);
+    const titleSim = Math.max(similarity(want, split.title), similarity(want, rawTitle) * 0.95);
+    const titleNorm = normalize(rawTitle);
+    // A longer upload title ("Song (Live at ...)") still names the song.
+    const named = titleNorm.includes(normalize(want));
+    if (titleSim < 0.55 && !named) continue;
+    const artistSim = wantArtists.length
+      ? Math.max(
+          0,
+          ...wantArtists.map((a) =>
+            Math.max(similarity(a, split.artist || ""), similarity(a, channel), titleNorm.includes(normalize(a)) ? 0.95 : 0),
+          ),
+        )
+      : 0.6;
+    if (artistSim < 0.4) continue;
+    if (durationS && r.durationS && (r.durationS < durationS * 0.5 || r.durationS > durationS * 3)) continue;
+    const kind = videoKind(r);
+    let score = 0.5 * Math.max(titleSim, named ? 0.8 : 0) + 0.3 * artistSim;
+    if (durationS && r.durationS) score += 0.1 * Math.max(0, 1 - Math.abs(r.durationS - durationS) / (durationS * 0.6));
+    score += { official: 0.25, fan: 0, live: -0.05, lyrics: -0.08, cover: -0.15, audio: -0.2 }[kind];
+    if (r.videoType === "OMV") score += 0.1;
+    seen.add(id);
+    out.push({ videoId: id, title: rawTitle, channel, durationS: r.durationS || null, kind, score: Math.round(score * 100) / 100 });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, limit);
+}

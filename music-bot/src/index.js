@@ -59,7 +59,7 @@ import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
 import { DeezerClient, ItunesClient, SongInfoEnricher } from "./song_info.js";
 import { songMeta } from "./song_meta.js";
-import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCaption } from "./video.js";
+import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCandidates, videoCaption, videoKind } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
 import {
@@ -1058,6 +1058,41 @@ if (archive && catalog) {
   }
 }
 /** "Wrong video" from a listener: never pick that video for this song again. */
+// The "Videos" list: music videos a listener can choose from for a song.
+// Searches are kept a week (they're only a quick YouTube Music search).
+const videoSearchCache = new Map();
+async function videoChoices(id, hint, uid) {
+  const song = catalog?.lookup(id) || null;
+  const info = {
+    title: song?.title || hint.title || "",
+    artist: (song?.artists?.length ? song.artists.join(", ") : song?.artist) || hint.artist || "",
+    artists: song?.artists || null,
+    durationS: song?.durationS || hint.durationS || null,
+  };
+  if (!info.title) return { items: [], current: null, mine: null };
+  const query = `${info.title} ${info.artist}`.trim();
+  let hit = videoSearchCache.get(query);
+  if (!hit || Date.now() - hit.at > 7 * 864e5) {
+    hit = { at: Date.now(), rows: await searchYtmVideos(query) };
+    videoSearchCache.set(query, hit);
+    while (videoSearchCache.size > 2000) videoSearchCache.delete(videoSearchCache.keys().next().value);
+  }
+  const map = catalog?.videoMapGet(id);
+  let items = videoCandidates(hit.rows, info, { exclude: map?.rejected || [] });
+  // A song that is itself a video upload is one of the choices.
+  if (song && needsVideo(song) && !items.some((x) => x.videoId === id)) {
+    items.unshift({ videoId: id, title: song.title, channel: song.artist || "", durationS: song.durationS || null, kind: videoKind({ title: song.title }), score: 1 });
+  }
+  const current = song ? (await resolveVideo(id).catch(() => ({ srcId: null }))).srcId : null;
+  const { counts, mine } = catalog ? catalog.videoVotes(id, uid) : { counts: {}, mine: null };
+  // The song's default first, then the most chosen, then the best match.
+  items = items
+    .map((x) => ({ ...x, votes: counts[x.videoId] || 0, isDefault: x.videoId === current }))
+    .sort((a, b) => b.isDefault - a.isDefault || b.votes - a.votes || b.score - a.score);
+  if (items[0]) items[0].best = true;
+  return { items, current, mine };
+}
+
 async function reportVideo(id) {
   if (!catalog) return { ok: false };
   catalog.videoMapReject(id);
@@ -5036,6 +5071,37 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, meta ? 200 : 404, meta || { error: "not_found" });
       return;
     }
+    // The Videos list for a song, and the listener's choice from it.
+    if (req.method === "GET" && url.pathname === "/video/candidates") {
+      if (!requireApiToken(req, res)) return;
+      const id = String(url.searchParams.get("id") || "").replace(/^yt_/, "");
+      if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      const q = url.searchParams;
+      try {
+        const hint = { title: (q.get("title") || "").slice(0, 200), artist: (q.get("artist") || "").slice(0, 200), durationS: Number(q.get("d")) || null };
+        sendJson(res, 200, await videoChoices(id, hint, req.mpUser || "owner"));
+      } catch (e) {
+        console.error("[video] candidates:", e.message);
+        sendJson(res, 502, { error: "search_failed" });
+      }
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/video/choose") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 2_000).catch(() => ({}));
+      const id = String(body.id || "").replace(/^yt_/, "");
+      const src = String(body.videoId || "");
+      if (!catalog || !/^[A-Za-z0-9_-]{11}$/.test(id) || !/^[A-Za-z0-9_-]{11}$/.test(src)) {
+        sendJson(res, 400, { error: "invalid_id" });
+        return;
+      }
+      sendJson(res, 200, catalog.videoVote(id, req.mpUser || "owner", src, String(body.title || "").slice(0, 200) || null));
+      return;
+    }
+
     // "Wrong video?" from the app.
     if (req.method === "POST" && url.pathname === "/video/report") {
       if (!requireApiToken(req, res)) return;
@@ -5063,8 +5129,12 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, archive ? 400 : 404, { error: archive ? "invalid_id" : "no_archive" });
         return;
       }
-      // Official audio tracks play their matched music video instead.
-      const map = await archive.home.videoMap(id).catch(() => ({ srcId: id }));
+      // A video the listener chose from the Videos list (v=), otherwise:
+      // official audio tracks play their matched music video instead.
+      const chosen = url.searchParams.get("v") || "";
+      const map = /^[A-Za-z0-9_-]{11}$/.test(chosen)
+        ? { srcId: chosen }
+        : await archive.home.videoMap(id).catch(() => ({ srcId: id }));
       const src = map?.srcId || null;
       if (url.pathname === "/video/info") {
         if (!src) {
@@ -5075,7 +5145,7 @@ const server = http.createServer(async (req, res) => {
           src === id ? archive.home.lookup(id).catch(() => null) : null,
           archive.home.videoLookup(src).catch(() => null),
         ]);
-        const hasVideo = video ? video.status !== "none" : src !== id || needsVideo(song);
+        const hasVideo = video ? video.status !== "none" : src !== id || Boolean(chosen) || needsVideo(song);
         sendJson(res, 200, { hasVideo, stored: video?.status === "stored", width: video?.width || null, height: video?.height || null });
         return;
       }

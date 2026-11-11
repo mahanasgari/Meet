@@ -23,6 +23,9 @@ const KINDS = ["ytm_track", "ytm_video", "youtube"];
 const ANALYSIS_LEASE_MS = 30 * 60_000;
 const ANALYSIS_MAX_S = 15 * 60;
 
+/** Listeners who must choose the same video before it becomes the song's default. */
+export const VIDEO_VOTES_TO_DEFAULT = 2;
+
 const MIGRATIONS = [
   `CREATE TABLE songs (
     video_id TEXT PRIMARY KEY,
@@ -207,7 +210,11 @@ const MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS song_analysis_${c} ON song_analysis(${c}) WHERE analyzed_at IS NOT NULL AND error IS NULL;`).join("\n  "),
   // v22: listeners' own answer to "how does this song feel" (one per user and song).
   `CREATE TABLE mood_votes (video_id TEXT NOT NULL, uid TEXT NOT NULL, mood TEXT NOT NULL, at INTEGER, PRIMARY KEY (video_id, uid));
-  CREATE INDEX mood_votes_video ON mood_votes(video_id);`
+  CREATE INDEX mood_votes_video ON mood_votes(video_id);`,
+  // v23: the music video each listener chose for a song (Videos list).
+  `CREATE TABLE IF NOT EXISTS video_votes (video_id TEXT NOT NULL, uid TEXT NOT NULL, src_id TEXT NOT NULL,
+    title TEXT, at INTEGER, PRIMARY KEY (video_id, uid));
+  CREATE INDEX IF NOT EXISTS video_votes_video ON video_votes(video_id);`
 ];
 export const MOOD_COLUMNS = { happy: "happy", sad: "sad", relaxed: "relaxed", aggressive: "aggressive", party: "party", dance: "danceability", energy: "energy" };
 const VIDEO_LEASE_MS = 10 * MIN;
@@ -827,6 +834,35 @@ export class Catalog {
   videoMapResetMatches() {
     this.#sql("DELETE FROM video_map WHERE rejected_json IS NULL OR rejected_json='[]'").run();
     this.#sql("UPDATE video_map SET src_id=NULL, title=NULL, checked_at=0").run();
+  }
+
+  /**
+   * [uid] chose [srcId] as the video for song [videoId]. Once
+   * [VIDEO_VOTES_TO_DEFAULT] listeners chose the same video it becomes the
+   * song's video for everyone. Returns {votes, isDefault}.
+   */
+  videoVote(videoId, uid, srcId, title = null, now = Date.now()) {
+    this.#sql(`INSERT INTO video_votes(video_id, uid, src_id, title, at) VALUES(?,?,?,?,?)
+      ON CONFLICT(video_id, uid) DO UPDATE SET src_id=excluded.src_id, title=excluded.title, at=excluded.at`)
+      .run(videoId, uid, srcId, title, now);
+    const votes = this.#sql("SELECT COUNT(*) n FROM video_votes WHERE video_id=? AND src_id=?").get(videoId, srcId).n;
+    let isDefault = this.videoMapGet(videoId)?.srcId === srcId;
+    if (!isDefault && votes >= VIDEO_VOTES_TO_DEFAULT) {
+      // A song that is itself the video maps to itself only through a vote.
+      this.videoMapSet(videoId, srcId, title, now);
+      isDefault = true;
+    }
+    return { votes, isDefault };
+  }
+
+  /** Votes per chosen video for song [videoId], and [uid]'s own choice. */
+  videoVotes(videoId, uid = null) {
+    const counts = {};
+    for (const r of this.#sql("SELECT src_id, COUNT(*) n FROM video_votes WHERE video_id=? GROUP BY src_id").all(videoId)) {
+      counts[r.src_id] = r.n;
+    }
+    const mine = uid ? this.#sql("SELECT src_id FROM video_votes WHERE video_id=? AND uid=?").get(videoId, uid)?.src_id || null : null;
+    return { counts, mine };
   }
 
   videoMapSet(videoId, srcId, title = null, now = Date.now()) {

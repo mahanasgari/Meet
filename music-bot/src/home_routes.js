@@ -28,6 +28,7 @@ const HOME_ONLY = [
   /^\/charts\/weekly$/,
   /^\/sync\/(events|user)$/,
   /^\/explore(\/|$)/, // public playlists
+  /^\/video\/(candidates|choose)$/, // the Videos list and listeners' choices
 ];
 
 export const isHomeOnlyPath = (pathname) => HOME_ONLY.some((re) => re.test(String(pathname || "")));

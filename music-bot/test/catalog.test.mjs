@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "22");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "23");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "22");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "23");
   c.close();
 });
 

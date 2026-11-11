@@ -1,0 +1,17 @@
+# Iran edge -> Germany's music bot through SSH (Iran's filtering cuts large
+# downloads over HTTPS; SSH gets through, like the VPN tunnels).
+# Germany side: user mpedge, key restricted to permitopen="127.0.0.1:4100".
+# Install: /etc/systemd/system/mpedge-tunnel.service, systemctl enable --now mpedge-tunnel
+[Unit]
+Description=MiniPlayer edge tunnel Iran -> United States music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -L 127.0.0.1:14101:127.0.0.1:4100 -i /etc/mpedge/id_ed25519 -o UserKnownHostsFile=/etc/mpedge/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o Compression=no -o ConnectTimeout=10 mpedge@104.37.191.251
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -66,7 +66,12 @@ class Models:
     """Loads every model once."""
 
     def __init__(self):
+        import essentia
         import essentia.standard as es
+
+        # Essentia warns "No network created..." on every prediction: tens
+        # of thousands of lines a minute filled a 38 GB disk in two days.
+        essentia.log.warningActive = False
 
         self.es = es
         self.effnet = es.TensorflowPredictEffnetDiscogs(

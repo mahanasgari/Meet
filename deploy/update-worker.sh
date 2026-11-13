@@ -23,6 +23,7 @@ mv /root/music-bot.next.env /root/music-bot.current.env
 sed -i '/^HOME_URL=/d' /root/music-bot.current.env; echo 'HOME_URL=https://music.cloudproducts.ir/extractor' >> /root/music-bot.current.env
 docker rm -f music-bot >/dev/null
 docker run -d --name music-bot --restart unless-stopped --memory "$MEM" \
+  --log-opt max-size=20m --log-opt max-file=3 \
   --add-host host.docker.internal:host-gateway -p 127.0.0.1:4100:4100 \
   --env-file /root/music-bot.current.env -v music_shares:/shares "$IMG" >/dev/null
 sleep 8

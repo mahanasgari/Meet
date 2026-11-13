@@ -7,6 +7,12 @@ services:
     image: ghcr.io/mahanasgari/music-analyzer:latest
     container_name: music-analyzer
     restart: unless-stopped
+    # A chatty library once filled the disk with its log: 60 MB at most.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     mem_limit: 900m
     cpus: 0.8
     env_file:

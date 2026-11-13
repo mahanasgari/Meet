@@ -547,20 +547,22 @@ function snapshotCatalog() {
   if (snapshotting) return;
   const out = joinPath(SHARES, "catalog", "catalog-snapshot.db");
   const src = joinPath(SHARES, "catalog", "catalog.db");
-  // A copy (mirror) makes one only with room to spare: the snapshot is as
-  // big as the catalog, and mirror disks are small.
-  if (!catalog) {
-    try {
+  // The snapshot is as big as the catalog and is written beside the old one.
+  // Short of room: the old one goes first; still short (under 2 GB left
+  // after writing): no snapshot. A full disk stops the music bot itself.
+  try {
+    const free = () => {
       const fs = statfsSync(SHARES);
-      const free = fs.bavail * fs.bsize;
-      if (free < statSync(src).size * 2 + 2 * 1024 ** 3) {
-        console.log("[archive] no catalog snapshot here: not enough free disk");
-        rmSync(out, { force: true });
-        return;
-      }
-    } catch {
+      return fs.bavail * fs.bsize;
+    };
+    const need = statSync(src).size * 1.1 + 2 * 1024 ** 3;
+    if (free() < need + (existsSync(out) ? statSync(out).size : 0)) rmSync(out, { force: true });
+    if (free() < need) {
+      console.log(`[archive] no catalog snapshot: ${Math.round(free() / 1024 ** 2)} MB free`);
       return;
     }
+  } catch {
+    return;
   }
   snapshotting = true;
   const w = new Worker(

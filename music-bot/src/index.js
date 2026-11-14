@@ -45,7 +45,7 @@ import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./
 import { Recommender } from "./recommend.js";
 import { LastfmClient, LastfmEnricher } from "./lastfm.js";
 import { MusicBrainzClient, ListenBrainzClient, MusicBrainzEnricher } from "./musicbrainz.js";
-import { SongLinks, renderSongPage, expiredPage } from "./song_links.js";
+import { SongLinks, renderSongPage, expiredPage, assetLinks, fingerprint } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
 import { AccountStore } from "./accounts.js";
@@ -1073,6 +1073,11 @@ const songLinks = sharedDocs
     })
   : null;
 const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
+// The app's signing certificate(s) (public), for Android App Links.
+const APP_CERTS = (process.env.ANDROID_CERT_SHA256 || "bdfecdbc85796c068a5481f86f167923948023bc4f6f5041846d7571e23573cc")
+  .split(",")
+  .map(fingerprint)
+  .filter(Boolean);
 // Per-IP budget for the public song pages' audio (a play is a few ranged
 // requests): 120 requests per 10 minutes.
 const songLinkHits = new Map();
@@ -3670,7 +3675,7 @@ function queueInterest(endpoint, body, text) {
 // Home-only requests a mirror with a catalog copy answers itself when home
 // doesn't (its copy and the synced accounts, invites, shares and Explore).
 const LOCAL_WHEN_HOME_DOWN =
-  /^\/(song\/(info|related|links)|artists\/search|search\/smart|mood\/(songs|vote)|share(\/song|\/[A-Za-z0-9]{6})?|s\/[A-Za-z2-9]{8}|invite\/redeem|account\/[a-z-]+|explore(\/[A-Za-z0-9/-]*)?|video\/(candidates|choose)|charts\/weekly)$/;
+  /^\/(song\/(info|related|links)|artists\/search|search\/smart|mood\/(songs|vote)|share(\/song|\/[A-Za-z0-9]{6})?|s\/[A-Za-z2-9]{8}(\/info)?|invite\/redeem|account\/[a-z-]+|explore(\/[A-Za-z0-9/-]*)?|video\/(candidates|choose)|charts\/weekly)$/;
 const homeCatalog = catalog;
 
 const server = http.createServer(async (req, res) => {
@@ -4458,7 +4463,11 @@ const server = http.createServer(async (req, res) => {
 
     // --- A friend's song link: the page, its audio and cover, public. nginx
     // sends the domain root to /web/, so /web/s/<code> is /s/<code> outside.
-    const songLink = url.pathname.match(/^(?:\/web)?\/s\/([A-Za-z2-9]{8})(?:\/(audio|cover))?\/?$/);
+    if ((req.method === "GET" || req.method === "HEAD") && /^(?:\/web)?\/\.well-known\/assetlinks\.json$/.test(url.pathname)) {
+      sendJson(res, 200, assetLinks(APP_CERTS));
+      return;
+    }
+    const songLink = url.pathname.match(/^(?:\/web)?\/s\/([A-Za-z2-9]{8})(?:\/(audio|cover|info))?\/?$/);
     if ((req.method === "GET" || req.method === "HEAD") && songLink && songLinks) {
       const link = songLinks.get(songLink[1]);
       const part = songLink[2];
@@ -4473,6 +4482,11 @@ const server = http.createServer(async (req, res) => {
       if (!part) {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
         res.end(renderSongPage(link, { base: SONG_LINK_BASE, code: songLink[1].toUpperCase() }));
+        return;
+      }
+      if (part === "info") {
+        // The app opening a link: which song it is.
+        sendJson(res, 200, { code: songLink[1].toUpperCase(), id: link.id, title: link.title, artist: link.artist });
         return;
       }
       if (part === "cover") {

@@ -110,6 +110,13 @@ export function renderSongPage(link, { base, code }) {
 <meta name="theme-color" content="#000000">
 <meta name="robots" content="noindex">
 <link rel="icon" href="/favicon.png">
+<script>
+  // This browser already has the web app set up: open the song there, in
+  // the friend's own account (?guest=1 keeps this page).
+  try {
+    if (localStorage.getItem('mp_web_ready') === '1' && !/[?&]guest=1/.test(location.search)) location.replace('/?s=${code}');
+  } catch (e) {}
+</script>
 <style>
   :root { --bg: #0b0b0d; --fg: #f4f4f6; --muted: #a0a0a8; --accent: #ff2d55; --card: #17171b; }
   * { box-sizing: border-box; }
@@ -129,7 +136,9 @@ export function renderSongPage(link, { base, code }) {
     font-size: 12px; font-variant-numeric: tabular-nums; }
   .bar input { flex: 1; accent-color: var(--accent); }
   .status { min-height: 20px; margin-top: 12px; color: var(--muted); font-size: 13px; }
-  footer { margin-top: 36px; color: var(--muted); font-size: 13px; }
+  .open { display: none; margin-top: 26px; padding: 11px 22px; border-radius: 999px; border: 1px solid #3a3a42;
+    color: var(--fg); text-decoration: none; font-size: 14px; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
   footer a { color: var(--fg); }
 </style>
 </head>
@@ -147,10 +156,22 @@ export function renderSongPage(link, { base, code }) {
     <span id="dur">0:00</span>
   </div>
   <div class="status" id="status"></div>
+  <a class="open" id="openapp" href="#">Open in the MiniPlayer app</a>
   <audio id="audio" preload="none" src="${esc(page)}/audio"></audio>
   <footer>Shared with MiniPlayer · <a href="/">Get the app</a> (needs an invite from a friend)</footer>
 </main>
 <script>
+  (function () {
+    // Have the app? Android: the app's own link (falls back to this page);
+    // PC: miniplayer://. iPhone has no app.
+    var open = document.getElementById('openapp'), ua = navigator.userAgent, code = '${code}';
+    if (/iPhone|iPad|iPod/.test(ua) || /[?&]noapp=1/.test(location.search)) return;
+    if (/Android/i.test(ua)) {
+      var back = location.origin + location.pathname + '?noapp=1';
+      open.href = 'intent://' + location.host + '/s/' + code + '#Intent;scheme=https;package=com.miniplayer.mini_player;S.browser_fallback_url=' + encodeURIComponent(back) + ';end';
+    } else open.href = 'miniplayer://s/' + code;
+    open.style.display = 'inline-block';
+  })();
   var a = document.getElementById('audio'), btn = document.getElementById('play'), icon = document.getElementById('icon');
   var seek = document.getElementById('seek'), cur = document.getElementById('cur'), dur = document.getElementById('dur');
   var status = document.getElementById('status'), dragging = false;
@@ -188,4 +209,20 @@ export function expiredPage() {
 <title>Link expired</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0b0d;color:#f4f4f6;
 font:16px -apple-system,system-ui,sans-serif;text-align:center;padding:20px}p{color:#a0a0a8}</style></head>
 <body><div><h1>This song link has expired</h1><p>Ask your friend to share it again.</p></div></body></html>`;
+}
+
+/** Android App Links: lets the app open music.cloudproducts.ir/s/... links. */
+export function assetLinks(fingerprints, pkg = "com.miniplayer.mini_player") {
+  return [
+    {
+      relation: ["delegate_permission/common.handle_all_urls"],
+      target: { namespace: "android_app", package_name: pkg, sha256_cert_fingerprints: fingerprints },
+    },
+  ];
+}
+
+/** "bdfe…" or "BD:FE:…" → "BD:FE:…" (null when it isn't a SHA-256). */
+export function fingerprint(hex) {
+  const h = String(hex || "").replace(/[^0-9a-f]/gi, "").toUpperCase();
+  return h.length === 64 ? h.match(/../g).join(":") : null;
 }

@@ -58,3 +58,20 @@ test("the page escapes titles and points at the link's own audio and cover", () 
   assert.ok(html.includes("یاس"));
   assert.ok(!/title: "[^"]*<\/script>/.test(html), "no </script> inside the inline script");
 });
+
+test("the page offers the app and hands a set-up web app the song", () => {
+  const html = renderSongPage({ id: ID, title: "T", artist: "A" }, { base: "https://m.example", code: "ABCD2345" });
+  assert.ok(html.includes("location.replace('/?s=ABCD2345')"), "web app users open it in their account");
+  assert.ok(html.includes("package=com.miniplayer.mini_player"), "Android: the app");
+  assert.ok(html.includes("'miniplayer://s/' + code"), "PC: the app's own link");
+});
+
+test("App Links file names the app and its certificate", async () => {
+  const { assetLinks, fingerprint } = await import("../src/song_links.js");
+  const fp = fingerprint("bdfecdbc85796c068a5481f86f167923948023bc4f6f5041846d7571e23573cc");
+  assert.match(fp, /^BD:FE:CD:BC:(?:[0-9A-F]{2}:){27}CC$/);
+  assert.equal(fingerprint("nope"), null);
+  const [e] = assetLinks([fp]);
+  assert.equal(e.target.package_name, "com.miniplayer.mini_player");
+  assert.deepEqual(e.target.sha256_cert_fingerprints, [fp]);
+});

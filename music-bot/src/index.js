@@ -46,6 +46,7 @@ import { Recommender } from "./recommend.js";
 import { LastfmClient, LastfmEnricher } from "./lastfm.js";
 import { MusicBrainzClient, ListenBrainzClient, MusicBrainzEnricher } from "./musicbrainz.js";
 import { PlayHistory } from "./play_history.js";
+import { Connect } from "./connect.js";
 import { SongLinks, renderSongPage, expiredPage, assetLinks, fingerprint } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
@@ -1073,6 +1074,9 @@ const songLinks = sharedDocs
       }),
     })
   : null;
+// "Play on my other device": an account's open apps, in memory on home.
+const connect = new Connect();
+
 // Every song each account played (History), on all servers.
 const playHistory = sharedDocs ? new PlayHistory(sharedDocs) : null;
 const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
@@ -3733,6 +3737,36 @@ const server = http.createServer(async (req, res) => {
     }
 
     // --- Listen Together (jam) API ---
+    // --- Play on my other device (see connect.js): poll = "I'm here, this is
+    // what I play, anything for me?"; send = a command for another device.
+    if (req.method === "POST" && (url.pathname === "/connect/poll" || url.pathname === "/connect/send")) {
+      if (!requireApiToken(req, res)) return;
+      if (!req.mpUser || !accounts?.usernameOf(req.mpUser)) {
+        sendJson(res, 403, { error: "no_account" });
+        return;
+      }
+      const body = await readJsonMaybeGzip(req, 600_000).catch(() => null);
+      if (!body || typeof body.device !== "string") {
+        sendJson(res, 400, { error: "bad_body" });
+        return;
+      }
+      if (url.pathname === "/connect/send") {
+        const ok = connect.send(req.mpUser, body.device, String(body.target || ""), String(body.cmd || ""), body.args);
+        sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: "device_gone" });
+        return;
+      }
+      connect.hello(req.mpUser, { id: body.device, name: body.name, platform: body.platform, state: body.state });
+      let gone = false;
+      req.on("close", () => (gone = true));
+      const r = await connect.poll(req.mpUser, body.device, {
+        since: Number(body.since) || 0,
+        waitMs: Math.min(Number(body.wait) || 0, 20_000),
+        known: typeof body.known === "string" ? body.known : null,
+      });
+      if (!gone) sendJson(res, 200, r);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/jam") {
       if (!requireApiToken(req, res)) return;
       const session = createJamSession();

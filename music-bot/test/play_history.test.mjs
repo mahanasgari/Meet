@@ -46,4 +46,5 @@ test("bad plays are dropped", () => {
   assert.equal(cleanPlay({ id: "x", at: Date.UTC(2019, 0, 1) }, NOW), null);
   assert.equal(cleanPlay({ id: "x", at: NOW, s: 1e9 }, NOW).s, 86_400);
   assert.equal(cleanPlay({ id: "x", at: NOW, t: "a".repeat(500) }, NOW).t.length, 200);
+  assert.equal(cleanPlay({ id: "x", at: NOW, imp: 1 }, NOW).imp, 1, "the old-list mark is kept");
 });

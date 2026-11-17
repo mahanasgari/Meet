@@ -5,7 +5,8 @@
 // ~2000 plays, ~250 KB).
 //
 // A play: { id, t (title), a (artist), at (start, ms), s (seconds heard),
-//   d (song length, s), f (played to the end) } — or a removal
+//   d (song length, s), f (played to the end), imp (from the app's old
+//   History list, no real time) } — or a removal
 //   { id, at, del: 1 } (the user deleted it; kept so other devices delete
 //   it too).
 export const HISTORY_COLL = "play_history";
@@ -35,6 +36,7 @@ export function cleanPlay(e, now = Date.now()) {
     s: num(e.s, 0, 86_400),
     d: num(e.d, 0, 86_400),
     ...(e.f ? { f: 1 } : {}),
+    ...(e.imp ? { imp: 1 } : {}),
   };
 }
 
@@ -49,6 +51,7 @@ function mergeOne(a, b) {
     s: Math.max(a.s || 0, b.s || 0),
     d: Math.max(a.d || 0, b.d || 0),
     ...(a.f || b.f ? { f: 1 } : {}),
+    ...(a.imp || b.imp ? { imp: 1 } : {}),
   };
 }
 

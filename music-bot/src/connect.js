@@ -12,7 +12,7 @@
 const ONLINE_MS = 45_000; // a device that hasn't polled for this long is gone
 const MAX_WAIT_MS = 20_000;
 const MAX_QUEUED = 50;
-export const CONNECT_COMMANDS = new Set(["transfer", "play", "pause", "next", "prev", "seek", "volume", "stop"]);
+export const CONNECT_COMMANDS = new Set(["transfer", "handback", "play", "pause", "next", "prev", "seek", "volume", "stop"]);
 
 const str = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
 

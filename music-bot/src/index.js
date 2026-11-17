@@ -3689,7 +3689,11 @@ const server = http.createServer(async (req, res) => {
 
     // Mirrors hand home-only requests to home, so phones that can't reach its
     // domain still work; with home down, a mirror with a copy answers itself.
-    if (!homeCatalog && HOME_URL && isHomeOnlyPath(url.pathname)) {
+    // A song link this server already has (they sync to every server) is
+    // answered here: no trip to home, which is slow when it's busy.
+    const linkHere = /^\/s\/([A-Za-z2-9]{8})(?:\/(?:audio|cover|info))?\/?$/.exec(url.pathname);
+    const ownLink = Boolean(linkHere && songLinks?.get(linkHere[1]));
+    if (!homeCatalog && HOME_URL && !ownLink && isHomeOnlyPath(url.pathname)) {
       const local = Boolean(replica) && LOCAL_WHEN_HOME_DOWN.test(url.pathname);
       const sent = await proxyToHome({
         homeUrl: HOME_URL,

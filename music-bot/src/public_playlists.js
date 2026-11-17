@@ -149,7 +149,7 @@ export class PublicPlaylists {
           LEFT JOIN (SELECT playlist, SUM(CASE kind WHEN 'save' THEN 3 ELSE 1 END) score
                      FROM events WHERE at > ? GROUP BY playlist) w ON w.playlist = p.id
           WHERE ${where.join(" AND ")}
-          ORDER BY score DESC, (p.plays + 3 * p.saves) DESC, p.created_at DESC LIMIT ? OFFSET ?`;
+          ORDER BY score DESC, (p.plays + 3 * p.saves) DESC, MIN(p.count, 50) DESC, p.created_at DESC LIMIT ? OFFSET ?`;
     const params = sort === "new" ? [...args, limit, offset] : [now - WEEK, ...args, limit, offset];
     return this.db.prepare(sql).all(...params).map((r) => this.#row(r));
   }

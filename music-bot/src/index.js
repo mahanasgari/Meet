@@ -45,6 +45,7 @@ import { artistSongsPlaylist, interestFor, listedSongIds, playlistIds } from "./
 import { Recommender } from "./recommend.js";
 import { LastfmClient, LastfmEnricher } from "./lastfm.js";
 import { MusicBrainzClient, ListenBrainzClient, MusicBrainzEnricher } from "./musicbrainz.js";
+import { PlayHistory } from "./play_history.js";
 import { SongLinks, renderSongPage, expiredPage, assetLinks, fingerprint } from "./song_links.js";
 import { Releases, YT_NEWEST_PARAMS } from "./releases.js";
 import { ChordStore } from "./chords.js";
@@ -1072,6 +1073,8 @@ const songLinks = sharedDocs
       }),
     })
   : null;
+// Every song each account played (History), on all servers.
+const playHistory = sharedDocs ? new PlayHistory(sharedDocs) : null;
 const SONG_LINK_BASE = (process.env.SONG_LINK_BASE || "https://music.cloudproducts.ir").replace(/\/+$/, "");
 // The app's signing certificate(s) (public), for Android App Links.
 const APP_CERTS = (process.env.ANDROID_CERT_SHA256 || "bdfecdbc85796c068a5481f86f167923948023bc4f6f5041846d7571e23573cc")
@@ -3991,6 +3994,24 @@ const server = http.createServer(async (req, res) => {
         } catch {
           sendJson(res, 413, { error: "too_big" });
         }
+        return;
+      }
+      if (sub === "history" && (req.method === "GET" || req.method === "POST")) {
+        if (!requireApiToken(req, res)) return;
+        if (!playHistory || !req.mpUser || !accounts.usernameOf(req.mpUser)) {
+          sendJson(res, 403, { error: "no_account" });
+          return;
+        }
+        if (req.method === "GET") {
+          sendJson(res, 200, playHistory.since(req.mpUser, Number(url.searchParams.get("since")) || 0));
+          return;
+        }
+        const body = await readJsonMaybeGzip(req, 3_000_000).catch(() => null);
+        if (!Array.isArray(body?.plays) || body.plays.length > 5000) {
+          sendJson(res, 400, { error: "bad_body" });
+          return;
+        }
+        sendJson(res, 200, { changed: playHistory.add(req.mpUser, body.plays), now: Date.now() });
         return;
       }
       sendJson(res, 404, { error: "not_found" });

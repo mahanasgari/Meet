@@ -529,7 +529,9 @@ export class Catalog {
 
   stored(videoId, info = {}, now = Date.now()) {
     const q = info.quality ?? {};
-    this.#analysisDry = false; // a new song for the analyzer
+    // New for the analyzer: offered next without a scan of every song.
+    this.#analysisNew.add(videoId);
+    if (this.#analysisNew.size > 5000) this.#analysisNew.delete(this.#analysisNew.values().next().value);
     return this.#tx(() => {
       this.#ensureSong(videoId, now);
       // COALESCE keeps existing values where info has none.
@@ -1668,24 +1670,48 @@ export class Catalog {
    * never-offered songs, most played first. Skips songs over 15 minutes.
    */
   #analysisDry = false;
+  #analysisNew = new Set();
 
   leaseAnalysis(server, n, now = Date.now()) {
     n = Math.max(1, Math.min(Math.floor(Number(n)) || 1, 10));
     const until = now + ANALYSIS_LEASE_MS;
     return this.#tx(() => {
-      const out = this.#sql(`SELECT a.video_id, s.duration_s FROM song_analysis a JOIN songs s ON s.video_id = a.video_id
+      // CROSS JOIN keeps SQLite on the few waiting rows (partial index): a
+      // plain JOIN walked all ~80k stored songs first (108 s, froze home).
+      const out = this.#sql(`SELECT a.video_id, s.duration_s FROM song_analysis a CROSS JOIN songs s ON s.video_id = a.video_id
         WHERE a.analyzed_at IS NULL AND a.lease_until < ? AND s.status = 'stored'
           AND (s.duration_s IS NULL OR s.duration_s <= ?)
         ORDER BY a.lease_until LIMIT ?`).all(now, ANALYSIS_MAX_S, n);
-      // The never-offered scan walks every stored song; once it finds none,
-      // it waits until a new song is stored (see stored()).
+      // Songs stored since start, by id (cheap): most played first.
+      if (out.length < n && this.#analysisNew.size) {
+        const ids = [...this.#analysisNew];
+        this.#analysisNew.clear();
+        const seen = new Set(out.map((r) => r.video_id));
+        const rows = [];
+        for (let i = 0; i < ids.length; i += 500) {
+          const part = ids.slice(i, i + 500);
+          rows.push(...this.#sql(`SELECT s.video_id, s.duration_s, s.plays FROM songs s
+            WHERE s.video_id IN (${part.map(() => "?").join(",")}) AND s.status = 'stored'
+              AND (s.duration_s IS NULL OR s.duration_s <= ?)
+              AND NOT EXISTS (SELECT 1 FROM song_analysis x WHERE x.video_id = s.video_id)`).all(...part, ANALYSIS_MAX_S));
+        }
+        rows.sort((x, y) => (y.plays || 0) - (x.plays || 0));
+        for (const r of rows) {
+          if (seen.has(r.video_id)) continue;
+          if (out.length < n) out.push(r);
+          else this.#analysisNew.add(r.video_id); // next time
+        }
+      }
+      // The never-offered scan walks every stored song (~45 s on home), so
+      // it runs only until it finds none; later songs come via stored().
       if (out.length < n && !this.#analysisDry) {
         const fresh = this.#sql(`SELECT s.video_id, s.duration_s FROM songs s
           WHERE s.status = 'stored' AND (s.duration_s IS NULL OR s.duration_s <= ?)
             AND NOT EXISTS (SELECT 1 FROM song_analysis x WHERE x.video_id = s.video_id)
           ORDER BY s.plays DESC LIMIT ?`).all(ANALYSIS_MAX_S, n - out.length);
         if (!fresh.length) this.#analysisDry = true;
-        out.push(...fresh);
+        const have = new Set(out.map((r) => r.video_id));
+        out.push(...fresh.filter((r) => !have.has(r.video_id)));
       }
       const up = this.#sql(`INSERT INTO song_analysis(video_id, server, lease_until) VALUES(?,?,?)
         ON CONFLICT(video_id) DO UPDATE SET server=excluded.server, lease_until=excluded.lease_until`);

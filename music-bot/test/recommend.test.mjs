@@ -171,6 +171,50 @@ test("forUser cold start returns friends' popular songs (untitled ones are skipp
   cleanup();
 });
 
+test("forUser cold start with seedArtists expands catalog songs", () => {
+  const { catalog, rec, cleanup } = setup();
+  catalog.stored(A, { title: "Seed Hit", artist: "ColdStartBand" });
+  catalog.stored(B, { title: "Like Seed", artist: "Other" });
+  catalog.stored(C, { title: "Friend Hit", artist: "Pop" });
+  catalog.setRelated(A, [{ id: B, kind: "related", rank: 0 }]);
+  catalog.recordPlays([
+    { videoId: C, uid: "f1", at: NOW - DAY, source: "disk" },
+  ]);
+  const res = rec.forUser("newbie", { seedArtists: ["ColdStartBand"] });
+  assert.ok(res.seeds.some((s) => s.videoId === A));
+  assert.ok(res.items.some((i) => i.videoId === B));
+  assert.match(res.items.find((i) => i.videoId === B).reasons[0], /Because you like/);
+  cleanup();
+});
+
+test("forUser session binge boosts recent seeds without dropping long-term", () => {
+  const { catalog, rec, cleanup } = setup();
+  const old = id("O");
+  const binge = id("N");
+  const likeOld = id("Lo");
+  const likeNew = id("Ln");
+  catalog.stored(old, { title: "Long Term", artist: "Old" });
+  catalog.stored(binge, { title: "Binge", artist: "New" });
+  catalog.stored(likeOld, { title: "Like Old", artist: "X" });
+  catalog.stored(likeNew, { title: "Like New", artist: "Y" });
+  // Many old plays so long-term weight stays high even after confidence.
+  catalog.recordPlays([
+    ...[10, 20, 30, 40, 50].map((d) => ({ videoId: old, uid: "me", at: NOW - d * DAY, source: "disk" })),
+    { videoId: binge, uid: "me", at: NOW - 10 * 60_000, source: "disk" },
+  ]);
+  catalog.setRelated(old, [{ id: likeOld, kind: "related", rank: 0 }]);
+  catalog.setRelated(binge, [{ id: likeNew, kind: "related", rank: 0 }]);
+  rec.build({ force: true });
+  const res = rec.forUser("me", { limit: 10 });
+  const seedIds = res.seeds.map((s) => s.videoId);
+  assert.ok(seedIds.includes(old), "long-term seed kept");
+  assert.ok(seedIds.includes(binge), "session seed present");
+  const bingeW = res.seeds.find((s) => s.videoId === binge).weight;
+  const oldW = res.seeds.find((s) => s.videoId === old).weight;
+  assert.ok(bingeW > 0 && oldW > 0);
+  cleanup();
+});
+
 test("model is cached for 30 minutes", () => {
   const { catalog, rec, cleanup } = setup();
   catalog.recordPlays(seq("x", [A, B]));
@@ -247,7 +291,13 @@ test("stats: how songs started from each place fare", () => {
     ev("play", A, NOW - DAY, { ctx: "picks" }), ev("skip", B, NOW - DAY + MIN, { ctx: "picks" }), ev("play", C, NOW - DAY + 2 * MIN, { ctx: "autoplay" }),
   ]);
   rec.build({ force: true });
-  assert.deepEqual(rec.stats().origins, { picks: { plays: 1, skips: 1 }, autoplay: { plays: 1, skips: 0 } });
+  assert.deepEqual(rec.stats().origins, {
+    picks: { plays: 1, skips: 1, completes: 0, seconds: 0 },
+    autoplay: { plays: 1, skips: 0, completes: 0, seconds: 0 },
+  });
+  const surfaces = rec.stats().surfaces;
+  assert.equal(surfaces.length, 2);
+  assert.equal(surfaces.find((s) => s.ctx === "picks").skipRate, 0.5);
   cleanup();
 });
 

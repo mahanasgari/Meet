@@ -18,7 +18,7 @@ const LB_WEIGHT = 0.5; // ListenBrainz similar recordings (score normalised to 0
 const LASTFM_WEIGHT = 0.6; // Last.fm similarity (0..1) scale next to related 1.0 and co-listening 1.5*sim
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
 const SAME_LISTEN_MS = 15 * MIN;
-const FEEDBACK = new Set(["play", "skip", "like", "dislike", "fav", "unfav"]);
+const FEEDBACK = new Set(["play", "skip", "complete", "like", "dislike", "fav", "unfav"]);
 
 const parse = (s, fallback = null) => {
   if (s == null) return fallback;
@@ -91,7 +91,11 @@ export class Recommender {
         if (!(ts >= from && ts <= now)) continue;
         const id = typeof e.id === "string" ? e.id.replace(/^yt_/, "") : "";
         if (!YT_ID.test(id)) continue;
-        push(events, who, { t: e.t, id, at: ts, ctx: e.ctx });
+        const secs = Number(e.s);
+        push(events, who, {
+          t: e.t, id, at: ts, ctx: e.ctx,
+          s: Number.isFinite(secs) ? secs : undefined,
+        });
         if (e.ti && !titles.has(id)) titles.set(id, { title: e.ti, artist: e.a ?? null });
       }
     }
@@ -100,14 +104,15 @@ export class Recommender {
     const feedback = new Map(); // who -> { skips, full: Map(id -> n), liked: Map(id -> true|false) }
     const songFb = new Map(); // id -> { plays, skips } over everyone's sync
     const badNext = new Map(); // a -> Map(b -> times b was skipped right after a)
-    const origins = {}; // ctx -> { plays, skips }: how suggestions fare
+    // ctx -> plays/skips/completes: which home surfaces keep people listening.
+    const origins = {};
     const inc = (map, k) => map.set(k, (map.get(k) ?? 0) + 1);
     for (const who of new Set([...plays.keys(), ...events.keys()])) {
       const ev = (events.get(who) ?? []).sort((a, b) => a.at - b.at);
       // The app reports a song when it ends (or is skipped), the server when
       // it starts: the same listen is a server play up to 15 min before.
       const reported = new Map(); // id -> [at]
-      for (const e of ev) if (e.t === "play" || e.t === "skip") (reported.get(e.id) ?? reported.set(e.id, []).get(e.id)).push(e.at);
+      for (const e of ev) if (e.t === "play" || e.t === "skip" || e.t === "complete") (reported.get(e.id) ?? reported.set(e.id, []).get(e.id)).push(e.at);
       const sameListen = (p) => (reported.get(p.id) ?? []).some((at) => p.at >= at - SAME_LISTEN_MS && p.at <= at + 2 * MIN);
       const list = (plays.get(who) ?? []).filter((p) => !sameListen(p));
       const fb = { skips: new Map(), full: new Map(), liked: new Map() };
@@ -117,17 +122,24 @@ export class Recommender {
         if (e.at - lastAt > SESSION_GAP_MS) prev = null;
         lastAt = e.at;
         const sf = songFb.get(e.id) ?? songFb.set(e.id, { plays: 0, skips: 0 }).get(e.id);
-        const o = e.ctx ? (origins[e.ctx] ??= { plays: 0, skips: 0 }) : null;
-        if (e.t === "play") {
+        const o = e.ctx ? (origins[e.ctx] ??= { plays: 0, skips: 0, completes: 0, seconds: 0 }) : null;
+        if (e.t === "play" || e.t === "complete") {
           list.push({ id: e.id, at: e.at });
           inc(fb.full, e.id);
           sf.plays++;
-          if (o) o.plays++;
+          if (o) {
+            o.plays++;
+            if (e.t === "complete") o.completes++;
+            if (Number.isFinite(e.s)) o.seconds += e.s;
+          }
           prev = e.id;
         } else if (e.t === "skip") {
           inc(fb.skips, e.id);
           sf.skips++;
-          if (o) o.skips++;
+          if (o) {
+            o.skips++;
+            if (Number.isFinite(e.s)) o.seconds += e.s;
+          }
           if (prev && prev !== e.id) {
             const m = badNext.get(prev) ?? badNext.set(prev, new Map()).get(prev);
             inc(m, e.id);
@@ -249,19 +261,37 @@ export class Recommender {
 
   stats() {
     const m = this.#m;
-    if (!m) return { listeners: 0, sessions: 0, songsWithNeighbors: 0, pairs: 0, builtAt: null };
+    if (!m) return { listeners: 0, sessions: 0, songsWithNeighbors: 0, pairs: 0, builtAt: null, surfaces: [] };
     let skips = 0;
     let likes = 0;
     for (const fb of m.feedback.values()) {
       for (const n of fb.skips.values()) skips += n;
       for (const v of fb.liked.values()) if (v) likes++;
     }
+    // Per-surface rates so we can answer "which shelf skips more?"
+    const surfaces = Object.entries(m.origins || {})
+      .map(([ctx, o]) => {
+        const plays = o.plays || 0;
+        const sk = o.skips || 0;
+        const completes = o.completes || 0;
+        const starts = plays + sk;
+        return {
+          ctx,
+          plays,
+          skips: sk,
+          completes,
+          seconds: o.seconds || 0,
+          skipRate: starts > 0 ? sk / starts : null,
+          completeRate: starts > 0 ? completes / starts : null,
+        };
+      })
+      .sort((a, b) => (b.plays + b.skips) - (a.plays + a.skips) || a.ctx.localeCompare(b.ctx));
     return {
       listeners: m.listeners, sessions: m.sessions, songsWithNeighbors: m.neighbors.size,
       pairs: m.pairs, builtAt: m.builtAt,
       feedback: { listeners: m.feedback.size, skips, likes },
-      // Plays vs skips of songs started from each place (picks, morelike, autoplay, …).
       origins: m.origins,
+      surfaces,
     };
   }
 
@@ -288,6 +318,7 @@ export class Recommender {
       artist: songArtist ?? (trackArtist || null) ?? sync?.artist ?? null,
       archived: s?.status === "stored",
       unavailable: s?.status === "unavailable",
+      failed: s?.status === "failed",
     };
   }
 
@@ -483,22 +514,108 @@ export class Recommender {
 
   // -------------------------------------------------------------- forUser
 
-  /** Per-friend suggestions with reasons. */
-  forUser(uid, { limit = 30 } = {}) {
+  /**
+   * Catalog songs for cold-start artist names (exact NOCASE match).
+   * Prefer song_artists links; fall back to songs.artist text.
+   * Returns [{ videoId, title, weight }] usable as forUser seeds.
+   */
+  #seedsFromArtists(names, { perArtist = 5 } = {}) {
+    const out = [];
+    const seen = new Set();
+    const push = (id, label) => {
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push({ videoId: id, title: this.#meta(id).title || label, weight: 1 });
+    };
+    for (const raw of names) {
+      const name = String(raw || "").trim();
+      if (!name) continue;
+      let n = 0;
+      const aids = this.#q("SELECT id, name FROM artists WHERE name = ? COLLATE NOCASE LIMIT 3").all(name);
+      for (const a of aids) {
+        const rows = this.#q(
+          `SELECT sa.video_id id FROM song_artists sa
+           LEFT JOIN songs s ON s.video_id = sa.video_id
+           WHERE sa.artist_id = ?
+           ORDER BY CASE WHEN s.status = 'stored' THEN 0 ELSE 1 END, COALESCE(s.plays, 0) DESC
+           LIMIT ?`,
+        ).all(a.id, perArtist);
+        for (const r of rows) {
+          push(r.id, a.name);
+          n++;
+        }
+      }
+      if (n > 0) continue;
+      // Fallback: songs.artist string (no artist graph row yet).
+      for (const r of this.#q(
+        `SELECT video_id id FROM songs
+         WHERE artist = ? COLLATE NOCASE AND status = 'stored'
+         ORDER BY COALESCE(plays, 0) DESC LIMIT ?`,
+      ).all(name, perArtist)) {
+        push(r.id, name);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Blend long-term affinity with a short session window.
+   * Confidence damps one-off plays: weight *= min(1, count/3).
+   */
+  #blendSeeds(mine, now) {
+    const blended = new Map(); // id -> { weight, title, count, last }
+    const touch = (id, w, s) => {
+      const cur = blended.get(id) ?? {
+        weight: 0,
+        title: this.#meta(id).title,
+        count: s?.count ?? 0,
+        last: s?.last ?? 0,
+      };
+      cur.weight += w;
+      cur.count = Math.max(cur.count, s?.count ?? 0);
+      cur.last = Math.max(cur.last, s?.last ?? 0);
+      blended.set(id, cur);
+    };
+    // Long-term: top by weight, damped by evidence.
+    const long = [...mine].sort((a, b) => b[1].weight - a[1].weight || (a[0] < b[0] ? -1 : 1)).slice(0, 15);
+    for (const [id, s] of long) {
+      const conf = Math.min(1, (s.count || 1) / 3);
+      touch(id, 0.65 * s.weight * conf, s);
+    }
+    // Short-term: last ~12 plays by recency (a binge can steer without wiping taste).
+    const recent = [...mine]
+      .filter(([, s]) => now - s.last < 6 * 3600_000) // within 6h
+      .sort((a, b) => b[1].last - a[1].last || (a[0] < b[0] ? -1 : 1))
+      .slice(0, 12);
+    for (const [i, [id, s]] of recent.entries()) {
+      touch(id, 0.35 * (1 / (1 + i)) * Math.max(s.weight, 0.4), s);
+    }
+    return [...blended]
+      .map(([id, s]) => ({ videoId: id, title: s.title, weight: s.weight, count: s.count, last: s.last }))
+      .sort((a, b) => b.weight - a.weight || (a.videoId < b.videoId ? -1 : 1))
+      .slice(0, 15);
+  }
+
+  /** Per-friend suggestions with reasons. Optional seedArtists for cold start. */
+  forUser(uid, { limit = 30, seedArtists = [] } = {}) {
     const m = this.#model();
     const now = this.#now();
     const mine = m.perUser.get(uid);
     const popMax = Math.max(1, ...m.recent.values());
     const pop = (id) => (m.recent.get(id) ?? 0) / popMax;
+    const artistSeeds = Array.isArray(seedArtists)
+      ? seedArtists.map((s) => String(s || "").trim()).filter(Boolean).slice(0, 12)
+      : [];
 
-    // Final pass shared by both paths: drop unavailable and untitled songs, cap two per artist.
+    // Final pass shared by both paths: drop unplayable / untitled / failed rows, cap two per artist.
     const finish = (list) => {
       const perArtist = new Map();
       const items = [];
       for (const c of list) {
         const meta = this.#meta(c.videoId);
         // No title anywhere yet: nothing to show in the app.
-        if (meta.unavailable || !meta.title) continue;
+        if (meta.unavailable || meta.failed || !meta.title) continue;
+        if (/^(unknown|untitled|n\/?a)$/i.test(meta.title.trim())) continue;
         const key = (meta.artist ?? "").split(",")[0].trim().toLowerCase();
         if (key) {
           const k = perArtist.get(key) ?? 0;
@@ -519,11 +636,43 @@ export class Recommender {
       .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
       .map(([id, c]) => ({ videoId: id, score: c, reasons: ["Popular with friends"] }));
 
-    // Cold start: nothing known about this listener.
-    if (!mine || !mine.size) return { uid, seeds: [], items: finish(popular()) };
+    // Cold start: optional seed artists first, else friends' popular.
+    if (!mine || !mine.size) {
+      const cold = artistSeeds.length ? this.#seedsFromArtists(artistSeeds) : [];
+      if (!cold.length) return { uid, seeds: [], items: finish(popular()) };
+      const cands = new Map();
+      const touch = (id) => cands.get(id) ?? cands.set(id, { score: 0, seeds: new Map(), signals: new Map() }).get(id);
+      const inc = (map, k, w) => map.set(k, (map.get(k) ?? 0) + w);
+      for (const seed of cold) {
+        const seedTitle = seed.title ?? "a seed artist";
+        for (const s of this.similarTo(seed.videoId, { limit: 40 })) {
+          const w = s.score * seed.weight;
+          const c = touch(s.videoId);
+          c.score += w;
+          inc(c.seeds, seedTitle, w);
+          if (s.reasons[0]) inc(c.signals, s.reasons[0], w);
+        }
+      }
+      for (const [id] of m.recent) {
+        const c = touch(id);
+        const w = 0.08 * pop(id);
+        c.score += w;
+        inc(c.signals, "Popular with friends", w);
+      }
+      const knownCold = new Set(cold.map((s) => s.videoId));
+      const list = [...cands]
+        .filter(([id]) => !knownCold.has(id))
+        .map(([id, c]) => {
+          const top = (map) => [...map].sort((a, b) => b[1] - a[1]).map(([t]) => t);
+          const seedReasons = top(c.seeds).map((t) => `Because you like ${t}`);
+          const reasons = seedReasons.slice(0, 1).concat(top(c.signals).slice(0, 1));
+          return { videoId: id, score: c.score, reasons };
+        })
+        .sort((a, b) => b.score - a.score || (a.videoId < b.videoId ? -1 : 1));
+      return { uid, seeds: cold.slice(0, 10), items: finish(list) };
+    }
 
-    const seeds = [...mine].sort((a, b) => b[1].weight - a[1].weight || (a[0] < b[0] ? -1 : 1))
-      .slice(0, 15).map(([id, s]) => ({ videoId: id, title: this.#meta(id).title, weight: s.weight }));
+    const seeds = this.#blendSeeds(mine, now);
 
     // Candidates: similarTo of each seed weighted by seed weight, plus a popularity prior.
     // id -> { score, seeds: Map(seed title -> weight), signals: Map(reason -> weight) }

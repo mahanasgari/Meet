@@ -26,6 +26,7 @@ const HOME_ONLY = [
   /^\/share\/[A-Za-z0-9]{6}$/,
   /^\/feedback$/,
   /^\/charts\/weekly$/,
+  /^\/discover\/(new|trending)$/,
   /^\/sync\/(events|user)$/,
   /^\/explore(\/|$)/, // public playlists
   /^\/video\/(candidates|choose)$/, // the Videos list and listeners' choices

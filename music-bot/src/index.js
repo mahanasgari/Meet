@@ -26,6 +26,7 @@ import { join as joinPath } from "node:path";
 import { createGzip, gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
+import { discoverNew, discoverTrending } from "./discover.js";
 import { audioFormat } from "./quality.js";
 import { clipParams, makeClip } from "./clip.js";
 import { renderDownloadPage } from "./download_page.js";
@@ -115,17 +116,29 @@ const YTDLP_PROXY = process.env.YTDLP_PROXY || "";
 /** Optional: relay YouTube Music API calls (/search, /ytm/*) to this server. */
 const YTM_RELAY = (process.env.YTM_RELAY || "").replace(/\/+$/, "");
 function ytdlpNetArgs() {
-  // Node (already in the image) as yt-dlp's JavaScript runtime: without one
-  // YouTube serves fewer formats and flags the server as a bot more often.
+  // Deno (if present) + Node: without a JS runtime YouTube serves fewer
+  // formats and flags the server as a bot more often.
+  const runtimes = [];
+  try {
+    if (existsSync("/usr/local/bin/deno") || existsSync("/usr/bin/deno")) runtimes.push("deno");
+  } catch {}
+  runtimes.push("node");
   return [
     "--js-runtimes",
-    "node",
+    runtimes.join(","),
     ...(YTDLP_PROXY ? ["--proxy", YTDLP_PROXY] : []),
   ];
 }
 
 function ytdlpCookieArgs() {
-  if (YTDLP_COOKIES) return ["--cookies", YTDLP_COOKIES];
+  // Skip a missing/empty path: an empty placeholder makes yt-dlp refuse every extract.
+  if (YTDLP_COOKIES) {
+    try {
+      if (statSync(YTDLP_COOKIES).size > 64) return ["--cookies", YTDLP_COOKIES];
+    } catch {
+      /* not mounted yet */
+    }
+  }
   if (YTDLP_BROWSER) return ["--cookies-from-browser", YTDLP_BROWSER];
   return [];
 }
@@ -702,6 +715,9 @@ const archive = ARCHIVE_ON
         botToken: process.env.TG_STORE_BOT_TOKEN,
         channelId: Number(process.env.TG_STORE_CHANNEL),
         sessionFile: joinPath(SHARES, "archive", "tg.session"),
+        // Default 8s (was 12s): main channel only for now, so archive can
+        // push faster. Override with TG_UPLOAD_INTERVAL_MS.
+        minUploadIntervalMs: Number(process.env.TG_UPLOAD_INTERVAL_MS) || 8000,
       }),
       cache: new DiskCache(joinPath(SHARES, "archive", "cache"), {
         maxBytes: (Number(process.env.ARCHIVE_CACHE_GB) || 3) * 1024 ** 3,
@@ -909,9 +925,16 @@ if (catalog) {
       };
       setTimeout(step, everyMs).unref();
     };
-    batch("song-tags-backfill", (n) => catalog.backfillSongTags(n), 1000, 2000);
-    batch("mood-retag", (n) => catalog.retagMoods(n), 500, 2000);
-    batch("search-fts", (n) => catalog.ftsFill(n), 2000, 2000);
+    // Paused on home by default: these scans freeze the 1.9 GB box for tens
+    // of seconds (Telegram bot + archive GramJS drop). Set HOME_BACKFILLS=1
+    // when home has SSD/more RAM, or run them offline.
+    if (process.env.HOME_BACKFILLS === "1") {
+      batch("song-tags-backfill", (n) => catalog.backfillSongTags(n), 1000, 2000);
+      batch("mood-retag", (n) => catalog.retagMoods(n), 500, 2000);
+      batch("search-fts", (n) => catalog.ftsFill(n), 2000, 2000);
+    } else {
+      console.log("[backfills] paused (set HOME_BACKFILLS=1 to run)");
+    }
   }
 
   // Grow the archive around what friends like: every song of the artists
@@ -1026,7 +1049,8 @@ const chordStore = archive
 
 // Ahead of time, one song a minute while nothing else is being worked out:
 // the most-played archived songs, so their chord sheets open at once.
-if (chordStore && catalog) {
+// CHORD_AHEAD=1 turns this on. The old plays⋈songs fill froze home ~35 s.
+if (chordStore && catalog && process.env.CHORD_AHEAD === "1") {
   let todo = [];
   let nextFill = 0;
   setInterval(() => {
@@ -1034,13 +1058,17 @@ if (chordStore && catalog) {
     if (!todo.length) {
       if (Date.now() < nextFill) return;
       nextFill = Date.now() + 6 * 3600_000; // all done: look again in a while
-      todo = catalog.db
-        .prepare(`SELECT p.video_id id FROM plays p JOIN songs s ON s.video_id=p.video_id
-          WHERE s.status='stored' AND COALESCE(s.duration_s, 0) <= 720 AND p.at>?
-          GROUP BY p.video_id ORDER BY COUNT(*) DESC LIMIT 500`)
+      const top = catalog.db
+        .prepare(`SELECT video_id id FROM plays WHERE at>? GROUP BY video_id ORDER BY COUNT(*) DESC LIMIT 500`)
         .all(Date.now() - 30 * 864e5)
-        .map((r) => r.id)
-        .filter((id) => !chordStore.has(id))
+        .map((r) => r.id);
+      const stored = new Set(catalog.archivedIds(top));
+      todo = top
+        .filter((id) => stored.has(id) && !chordStore.has(id))
+        .filter((id) => {
+          const s = catalog.db.prepare("SELECT duration_s FROM songs WHERE video_id=?").get(id);
+          return !s || (s.duration_s ?? 0) <= 720;
+        })
         .reverse();
       if (!todo.length) return;
     }
@@ -1484,7 +1512,9 @@ const backupChannels = () => [
   ]),
 ];
 const BACKUP_CHANNEL = process.env.TG_BACKUP_CHANNEL || "";
-if (catalog && archive) {
+// TG_BACKUP_ENABLE=1 turns this on. Off by default on home: needsBackupIn
+// cold scans froze the bot (~30 s) and dropped Telegram/archive.
+if (catalog && archive && process.env.TG_BACKUP_ENABLE === "1") {
   let backingUp = false;
   const backupTick = async () => {
     const channels = backupChannels();
@@ -4345,7 +4375,13 @@ const server = http.createServer(async (req, res) => {
         // (The owner's PC uses the secret: default to the heaviest listener.)
         let uid = req.mpUser || (isMasterToken(req) ? String(url.searchParams.get("uid") || "") : "");
         if (!uid && isMasterToken(req)) uid = ownerUid() || "";
-        const r = recommender.forUser(uid, { limit });
+        // Optional cold-start seeds from the app's Tune sheet (comma-separated names).
+        const seedArtists = String(url.searchParams.get("seeds") || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 12);
+        const r = recommender.forUser(uid, { limit, seedArtists });
         sendJson(res, 200, { items: r.items.filter((x) => x.title).map(toItem) });
       } catch (e) {
         console.error("[recommend]", e.message);
@@ -4364,7 +4400,18 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === "/admin/api/recommend/stats") {
         recommender.build(); // cached; builds on first use
-        sendJson(res, 200, recommender.stats());
+        const stats = recommender.stats();
+        // Analysis coverage: mood/sound-alike only help when songs are analyzed.
+        if (catalog) {
+          const a = catalog.analysisStats();
+          const stored = catalog.db.prepare("SELECT COUNT(*) n FROM songs WHERE status='stored'").get().n;
+          stats.analysis = {
+            ...a,
+            stored,
+            coverage: stored > 0 ? a.analyzed / stored : null,
+          };
+        }
+        sendJson(res, 200, stats);
         return;
       }
       if (url.pathname === "/admin/api/recommend/users") {
@@ -4649,6 +4696,37 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Catalog-first New & Trending (home only).
+    if (req.method === "GET" && (url.pathname === "/discover/new" || url.pathname === "/discover/trending")) {
+      if (!requireApiToken(req, res)) return;
+      if (!catalog) {
+        sendJson(res, 404, { error: "no_catalog" });
+        return;
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 30, 1), 80);
+      const langRaw = String(url.searchParams.get("lang") || "").toLowerCase();
+      const lang = ["fa", "en", "tr", "ar"].includes(langRaw) ? langRaw : null;
+      try {
+        if (url.pathname === "/discover/new") {
+          const items = discoverNew(catalog, { limit, lang });
+          sendJson(res, 200, { items, source: "catalog", lang });
+          return;
+        }
+        const { items, mode, windowMs } = discoverTrending(catalog, { limit, lang });
+        sendJson(res, 200, {
+          items,
+          source: "miniplayer_plays",
+          mode,
+          windowDays: Math.round((windowMs || 0) / 864e5),
+          lang,
+        });
+      } catch (e) {
+        console.error("[discover]", e.message);
+        sendJson(res, 500, { error: "discover_failed" });
+      }
+      return;
+    }
+
     // --- Opt-in listening sync (MiniPlayer): one JSONL file per anonymous id.
     if (url.pathname === "/sync/events" || url.pathname === "/sync/user") {
       if (!requireApiToken(req, res)) return;
@@ -4660,7 +4738,7 @@ const server = http.createServer(async (req, res) => {
           sendJson(res, 400, { error: "invalid_uid" });
           return;
         }
-        const kinds = new Set(["play", "skip", "like", "dislike", "fav", "unfav", "follow"]);
+        const kinds = new Set(["play", "skip", "complete", "like", "dislike", "fav", "unfav", "follow"]);
         const str = (v, n) => (typeof v === "string" ? v.slice(0, n) : undefined);
         const lines = (Array.isArray(body.events) ? body.events : [])
           .slice(0, 500)
@@ -4672,8 +4750,8 @@ const server = http.createServer(async (req, res) => {
               ti: str(e.ti, 200),
               a: str(e.a, 120),
               s: Number.isFinite(e.s) ? Math.max(0, Math.min(36000, Math.round(e.s))) : undefined,
-              // Where the play started (picks, morelike, autoplay, …) to
-              // measure how good our suggestions are.
+              // Where the play started (picks, morelike, autoplay, foryou, …)
+              // so we can measure which surfaces keep people listening.
               ctx: typeof e.ctx === "string" && /^[a-z_]{1,20}$/.test(e.ctx) ? e.ctx : undefined,
               ts: Number.isFinite(e.ts) ? Math.round(e.ts) : Date.now(),
             }),

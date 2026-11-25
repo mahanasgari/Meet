@@ -27,6 +27,8 @@ const HOME_ONLY = [
   /^\/feedback$/,
   /^\/charts\/weekly$/,
   /^\/discover\/(new|trending)$/,
+  /^\/invite\/status$/,
+  /^\/import\/(fetch|match)$/,
   /^\/sync\/(events|user)$/,
   /^\/explore(\/|$)/, // public playlists
   /^\/video\/(candidates|choose)$/, // the Videos list and listeners' choices

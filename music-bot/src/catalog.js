@@ -214,7 +214,12 @@ const MIGRATIONS = [
   // v23: the music video each listener chose for a song (Videos list).
   `CREATE TABLE IF NOT EXISTS video_votes (video_id TEXT NOT NULL, uid TEXT NOT NULL, src_id TEXT NOT NULL,
     title TEXT, at INTEGER, PRIMARY KEY (video_id, uid));
-  CREATE INDEX IF NOT EXISTS video_votes_video ON video_votes(video_id);`
+  CREATE INDEX IF NOT EXISTS video_votes_video ON video_votes(video_id);`,
+  // v24: missingMeta() used to walk every stored song looking for source_kind
+  // IS NULL (17s+ on home), freezing the bot so Telegram and archive stalled.
+  // (rowid can't appear in a CREATE INDEX expression.)
+  `CREATE INDEX IF NOT EXISTS songs_stored_no_kind ON songs(stored_at)
+    WHERE status='stored' AND source_kind IS NULL;`
 ];
 export const MOOD_COLUMNS = { happy: "happy", sad: "sad", relaxed: "relaxed", aggressive: "aggressive", party: "party", dance: "danceability", energy: "energy" };
 const VIDEO_LEASE_MS = 10 * MIN;
@@ -459,9 +464,11 @@ export class Catalog {
   }
 
   // Stored songs with no source kind yet, oldest first.
+  // Uses songs_stored_no_kind (partial) so home doesn't scan the whole catalog.
   missingMeta(limit = 20) {
-    return this.#sql(`SELECT video_id FROM songs WHERE status='stored' AND source_kind IS NULL
-      ORDER BY stored_at, rowid LIMIT ?`).all(limit).map((r) => r.video_id);
+    return this.#sql(`SELECT video_id FROM songs
+      WHERE status='stored' AND source_kind IS NULL
+      ORDER BY stored_at LIMIT ?`).all(limit).map((r) => r.video_id);
   }
 
   // Jobs whose lease ran out go back to the queue.
@@ -776,7 +783,10 @@ export class Catalog {
 
   needsBackupIn(channel, limit = 5, now = Date.now()) {
     const ch = String(channel);
-    const from = this.#backupFrom.get(ch) ?? 0;
+    // After restart, don't scan from 0 (that walked the catalog and froze
+    // home ~30 s). Only look at the last week until #backupFrom is warm.
+    let from = this.#backupFrom.get(ch);
+    if (from == null) from = now - 7 * 864e5;
     const songs = this.#sql(`SELECT 'song' kind, video_id, tg_msg_id, stored_at FROM songs s INDEXED BY songs_stored_at
       WHERE stored_at >= ? AND status='stored' AND tg_msg_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='song' AND b.video_id=s.video_id AND b.channel=?)
@@ -1476,6 +1486,35 @@ export class Catalog {
       if (!best || rank[1] > best.rank[1] || (rank[1] === best.rank[1] && (rank[0] > best.rank[0] || (rank[0] === best.rank[0] && rank[2] > best.rank[2])))) best = { id: r.video_id, rank };
     }
     return best?.id ?? null;
+  }
+
+  /** Catalog video_id for a known Spotify track id, or null. */
+  videoIdBySpotifyId(spotifyId) {
+    if (!spotifyId) return null;
+    try {
+      return this.#sql(
+        "SELECT video_id FROM spotify_tracks WHERE spotify_id=? AND spotify_id IS NOT NULL LIMIT 1",
+      ).get(String(spotifyId))?.video_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Catalog video_id for an ISRC (spotify_tracks or song_info), or null. */
+  videoIdByIsrc(isrc) {
+    const id = String(isrc || "").replace(/\s/g, "").toUpperCase();
+    if (id.length < 8) return null;
+    try {
+      const a = this.#sql(
+        "SELECT video_id FROM spotify_tracks WHERE isrc=? AND spotify_id IS NOT NULL LIMIT 1",
+      ).get(id);
+      if (a?.video_id) return a.video_id;
+      return this.#sql(
+        "SELECT video_id FROM song_info WHERE isrc=? LIMIT 1",
+      ).get(id)?.video_id ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

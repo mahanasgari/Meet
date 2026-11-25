@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { cpus, freemem, loadavg, tmpdir, totalmem, uptime as osUptime } from "node:os";
 import { join as joinPath } from "node:path";
+import { randomBytes } from "node:crypto";
 import { createGzip, gzipSync, gunzipSync } from "node:zlib";
 import { AccessToken } from "livekit-server-sdk";
 import { buildWeeklyChart } from "./charts.js";
@@ -63,6 +64,17 @@ import { FELT_MOODS, labelName } from "./mood_model.js";
 import { handleAnalysis } from "./analysis_routes.js";
 import { ArtistCrawler, crawlWeight } from "./artist_crawl.js";
 import { SpotifyClient, SpotifyEnricher } from "./spotify.js";
+import {
+  detectSource,
+  parseCsv,
+  parseSpotifyPlaylistId,
+  parseApplePlaylist,
+  flatPlaylistViaYtdlp,
+  fetchSpotifyPlaylist,
+  fetchApplePlaylist,
+  matchTracks,
+  IMPORT_LIMIT,
+} from "./import_match.js";
 import { DeezerClient, ItunesClient, SongInfoEnricher } from "./song_info.js";
 import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCandidates, videoCaption, videoKind } from "./video.js";
@@ -85,6 +97,25 @@ import {
   TrackSource,
   dispose,
 } from "@livekit/rtc-node";
+
+/** Verify a Google ID token via Google's tokeninfo endpoint (no extra deps). */
+async function verifyGoogleIdToken(idToken, clientId) {
+  if (!idToken || !clientId) return null;
+  try {
+    const r = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+      { signal: AbortSignal.timeout(8_000) },
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j.aud !== clientId) return null;
+    if (!(j.email_verified === true || j.email_verified === "true")) return null;
+    if (!j.sub) return null;
+    return { sub: String(j.sub), email: j.email ? String(j.email) : null };
+  } catch {
+    return null;
+  }
+}
 
 const PORT = Number(process.env.PORT || 4100);
 const SAMPLE_RATE = 48_000;
@@ -537,6 +568,15 @@ const ARCHIVE_ON =
   process.env.ARCHIVE !== "0" &&
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_STORE_BOT_TOKEN && process.env.TG_STORE_CHANNEL);
 const catalog = ARCHIVE_ON && !HOME_URL ? new Catalog(joinPath(SHARES, "catalog", "catalog.db")) : null;
+/** Spotify Web API client for public playlist import (client-credentials). */
+const spotifyImportClient =
+  process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET
+    ? new SpotifyClient({
+        clientId: process.env.SPOTIFY_CLIENT_ID,
+        clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+      })
+    : null;
+const appleMusicToken = process.env.APPLE_MUSIC_TOKEN || "";
 // A mirror's own copy of the catalog (placed by deploy/catalog-copy.sh, then
 // kept in step with home every few seconds): it serves reads by itself, so
 // songs, videos and lyrics still play when home is down.
@@ -850,11 +890,8 @@ if (catalog) {
 
   // Spotify metadata (popularity, ISRC, genres) for catalog songs, one lookup
   // per tick; needs an app's client id/secret.
-  if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
-    const spotify = new SpotifyEnricher({
-      catalog,
-      client: new SpotifyClient({ clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET }),
-    });
+  if (spotifyImportClient) {
+    const spotify = new SpotifyEnricher({ catalog, client: spotifyImportClient });
     setInterval(() => {
       spotify.tick().catch((e) => console.error("[spotify]", e.message));
     }, (Number(process.env.SPOTIFY_EVERY_S) || 3) * 1000).unref();
@@ -3962,11 +3999,102 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // --- Playlist import: fetch external playlists + match to YouTube ids.
+    if (req.method === "POST" && url.pathname === "/import/fetch") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 512_000).catch(() => ({}));
+      try {
+        let out;
+        if (body.csv) {
+          out = { source: "csv", ...parseCsv(body.csv) };
+        } else if (body.url) {
+          const source = detectSource(body.url);
+          if (!source) {
+            sendJson(res, 400, { error: "unsupported_url" });
+            return;
+          }
+          if (source === "spotify") {
+            const id = parseSpotifyPlaylistId(body.url);
+            if (!id) {
+              sendJson(res, 400, { error: "bad_spotify_url" });
+              return;
+            }
+            if (!spotifyImportClient) {
+              sendJson(res, 503, { error: "spotify_disabled" });
+              return;
+            }
+            out = { source, ...(await fetchSpotifyPlaylist(spotifyImportClient, id)) };
+          } else if (source === "apple") {
+            const ref = parseApplePlaylist(body.url);
+            if (!ref) {
+              sendJson(res, 400, { error: "bad_apple_url" });
+              return;
+            }
+            out = {
+              source,
+              ...(await fetchApplePlaylist({
+                ...ref,
+                token: appleMusicToken,
+              })),
+            };
+          } else if (source === "youtube" || source === "soundcloud") {
+            if (!isAllowedMediaUrl(body.url)) {
+              sendJson(res, 400, { error: "invalid_url" });
+              return;
+            }
+            out = {
+              source,
+              ...(await flatPlaylistViaYtdlp(body.url, {
+                limit: IMPORT_LIMIT,
+                ytdlpBin: YTDLP_BIN,
+                extraArgs: [...ytdlpNetArgs(), ...ytdlpCookieArgs()],
+              })),
+            };
+          } else {
+            sendJson(res, 400, { error: "unsupported_url" });
+            return;
+          }
+        } else {
+          sendJson(res, 400, { error: "need_url_or_csv" });
+          return;
+        }
+        sendJson(res, 200, out);
+      } catch (e) {
+        const status = e?.status || 502;
+        sendJson(res, status, { error: e?.message || "import_fetch_failed" });
+      }
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/import/match") {
+      if (!requireApiToken(req, res)) return;
+      const body = await readBody(req, 512_000).catch(() => ({}));
+      const tracks = Array.isArray(body.tracks) ? body.tracks.slice(0, IMPORT_LIMIT) : [];
+      try {
+        const result = await matchTracks({
+          tracks,
+          catalog,
+          searchYtm: (q, opts) => searchYouTubeMusicSongs(q, opts),
+        });
+        sendJson(res, 200, result);
+      } catch (e) {
+        sendJson(res, 502, { error: e?.message || "import_match_failed" });
+      }
+      return;
+    }
+
     // --- Invites: redeem a code (public, rate-limited per address).
+    if (req.method === "GET" && url.pathname === "/invite/status") {
+      sendJson(res, 200, invites.status());
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/invite/redeem") {
       const ip = String(req.headers["x-real-ip"] || req.socket.remoteAddress || "");
       if (!redeemLimiter.hit(ip)) {
         sendJson(res, 429, { error: "too_many_attempts" });
+        return;
+      }
+      if (invites.registrationMode() === "disabled") {
+        sendJson(res, 403, { error: "registration_disabled" });
         return;
       }
       const body = await readBody(req, 2_000).catch(() => ({}));
@@ -3992,13 +4120,32 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { error: "not_here" });
         return;
       }
-      if (req.method === "POST" && ["signup", "login", "recover"].includes(sub)) {
+      if (req.method === "POST" && ["signup", "login", "recover", "register", "password", "recovery/rotate", "google", "link/google"].includes(sub)) {
         if (!accountLimiter.hit(clientIp(req))) {
           sendJson(res, 429, { error: "too_many_attempts" });
           return;
         }
-        if (sub === "signup" && !requireApiToken(req, res)) return;
-        const body = await readBody(req, 4_000).catch(() => ({}));
+        if ((sub === "signup" || sub === "password" || sub === "recovery/rotate" || sub === "link/google") && !requireApiToken(req, res)) return;
+        const body = await readBody(req, 8_000).catch(() => ({}));
+        if (sub === "register") {
+          if (invites.registrationMode() !== "open") {
+            sendJson(res, 403, { error: invites.registrationMode() === "disabled" ? "registration_disabled" : "invite_required" });
+            return;
+          }
+          try {
+            const { uid, recoveryCode } = accounts.registerOpen({ username: body.username, password: body.password });
+            sendJson(res, 200, {
+              token: makeUserToken(MUSIC_API_TOKEN, uid),
+              username: accounts.usernameOf(uid),
+              uid,
+              recoveryCode,
+            });
+          } catch (e) {
+            const code = String(e.message);
+            sendJson(res, code === "taken" ? 409 : 400, { error: code });
+          }
+          return;
+        }
         if (sub === "signup") {
           if (!req.mpUser) {
             sendJson(res, 400, { error: "no_user" });
@@ -4014,6 +4161,114 @@ const server = http.createServer(async (req, res) => {
           } catch (e) {
             const code = String(e.message);
             sendJson(res, code === "taken" || code === "has_account" ? 409 : 400, { error: code });
+          }
+          return;
+        }
+        if (sub === "password") {
+          if (!req.mpUser) {
+            sendJson(res, 400, { error: "no_user" });
+            return;
+          }
+          try {
+            accounts.changePassword({
+              uid: req.mpUser,
+              currentPassword: body.currentPassword,
+              newPassword: body.newPassword,
+            });
+            sendJson(res, 200, { ok: true });
+          } catch (e) {
+            const code = String(e.message);
+            sendJson(res, code === "wrong_password" ? 401 : 400, { error: code });
+          }
+          return;
+        }
+        if (sub === "recovery/rotate") {
+          if (!req.mpUser) {
+            sendJson(res, 400, { error: "no_user" });
+            return;
+          }
+          try {
+            const { recoveryCode } = accounts.rotateRecovery({ uid: req.mpUser, password: body.password });
+            sendJson(res, 200, { recoveryCode });
+          } catch (e) {
+            const code = String(e.message);
+            sendJson(res, code === "wrong_password" ? 401 : 400, { error: code });
+          }
+          return;
+        }
+        if (sub === "google" || sub === "link/google") {
+          const clientId = process.env.GOOGLE_CLIENT_ID;
+          if (!clientId) {
+            sendJson(res, 404, { error: "google_disabled" });
+            return;
+          }
+          const verified = await verifyGoogleIdToken(String(body.idToken || ""), clientId);
+          if (!verified) {
+            sendJson(res, 401, { error: "bad_google_token" });
+            return;
+          }
+          if (sub === "link/google") {
+            if (!req.mpUser) {
+              sendJson(res, 400, { error: "no_user" });
+              return;
+            }
+            try {
+              const r = accounts.linkGoogle({
+                uid: req.mpUser,
+                googleSub: verified.sub,
+                googleEmail: verified.email,
+              });
+              sendJson(res, 200, { ...r, googleEmail: verified.email });
+            } catch (e) {
+              const code = String(e.message);
+              sendJson(res, code === "google_taken" ? 409 : 400, { error: code });
+            }
+            return;
+          }
+          // Login or register with Google.
+          let uidForNew = null;
+          const existing = accounts.findByGoogleSub(verified.sub);
+          if (!existing) {
+            const mode = invites.registrationMode();
+            if (mode === "disabled") {
+              sendJson(res, 403, { error: "registration_disabled" });
+              return;
+            }
+            if (mode === "invite_only") {
+              const entry = body.inviteCode ? invites.redeem(body.inviteCode) : null;
+              if (!entry) {
+                sendJson(res, 403, { error: "invite_required" });
+                return;
+              }
+              uidForNew = entry.uid;
+            } else {
+              // open: mint a fresh uid via a throwaway invite entry pattern
+              uidForNew = randomBytes(6).toString("hex");
+            }
+          }
+          try {
+            const r = accounts.loginOrRegisterGoogle({
+              googleSub: verified.sub,
+              googleEmail: verified.email,
+              uid: existing?.uid || uidForNew,
+            });
+            if (!r) {
+              sendJson(res, 403, { error: "invite_required" });
+              return;
+            }
+            if (isBlocked(r.uid)) {
+              sendJson(res, 403, { error: "blocked" });
+              return;
+            }
+            sendJson(res, 200, {
+              token: makeUserToken(MUSIC_API_TOKEN, r.uid),
+              username: r.username,
+              uid: r.uid,
+              created: r.created,
+              recoveryCode: r.recoveryCode,
+            });
+          } catch (e) {
+            sendJson(res, 400, { error: String(e.message) });
           }
           return;
         }
@@ -4033,9 +4288,55 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 200, { token: makeUserToken(MUSIC_API_TOKEN, uid), username, ...(sub === "login" ? { uid } : {}) });
         return;
       }
+      // Per-user invite wallet.
+      if (sub === "invites" && (req.method === "GET" || req.method === "POST" || req.method === "DELETE")) {
+        if (!requireApiToken(req, res)) return;
+        if (!req.mpUser) {
+          sendJson(res, 400, { error: "no_user" });
+          return;
+        }
+        if (req.method === "GET") {
+          sendJson(res, 200, {
+            quota: invites.quotaOf(req.mpUser),
+            remaining: invites.remainingQuota(req.mpUser),
+            invites: invites.listByCreator(req.mpUser),
+          });
+          return;
+        }
+        if (req.method === "POST") {
+          if (!accountLimiter.hit(clientIp(req))) {
+            sendJson(res, 429, { error: "too_many_attempts" });
+            return;
+          }
+          const body = await readBody(req, 2_000).catch(() => ({}));
+          try {
+            sendJson(res, 200, invites.createForUser(req.mpUser, body.name));
+          } catch (e) {
+            const code = String(e.message);
+            sendJson(res, code === "quota_exhausted" ? 403 : 400, { error: code });
+          }
+          return;
+        }
+        // DELETE ?code=
+        const code = String(url.searchParams.get("code") || "");
+        try {
+          const e = invites.revokeByCreator(code, req.mpUser);
+          sendJson(res, e ? 200 : 404, e || { error: "not_found" });
+        } catch (e) {
+          sendJson(res, 409, { error: String(e.message) });
+        }
+        return;
+      }
       if (sub === "me" && req.method === "GET") {
         if (!requireApiToken(req, res)) return;
-        sendJson(res, 200, { username: req.mpUser ? accounts.usernameOf(req.mpUser) : null });
+        const username = req.mpUser ? accounts.usernameOf(req.mpUser) : null;
+        const u = username ? accounts.profile(username) : null;
+        sendJson(res, 200, {
+          username,
+          googleEmail: u?.googleEmail || null,
+          googleLinked: Boolean(u?.googleSub),
+          inviteRemaining: req.mpUser ? invites.remainingQuota(req.mpUser) : 0,
+        });
         return;
       }
       if (sub === "data" && (req.method === "GET" || req.method === "PUT")) {
@@ -4561,6 +4862,25 @@ const server = http.createServer(async (req, res) => {
         dataCache.clear();
         const e = invites.setDisabled(body.id, body.blocked !== false);
         sendJson(res, e ? 200 : 404, e || { error: "not_found" });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/admin/invites/settings") {
+        sendJson(res, 200, {
+          ...invites.status(),
+          quotas: invites.data.quotas || {},
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/invites/settings") {
+        const body = await readBody(req, 4_000).catch(() => ({}));
+        try {
+          if (body.mode != null) invites.setRegistrationMode(body.mode);
+          if (body.defaultInviteQuota != null) invites.setDefaultQuota(body.defaultInviteQuota);
+          if (body.uid && body.quota != null) invites.setQuota(body.uid, body.quota);
+          sendJson(res, 200, { ...invites.status(), quotas: invites.data.quotas || {} });
+        } catch (e) {
+          sendJson(res, 400, { error: String(e.message) });
+        }
         return;
       }
       sendJson(res, 404, { error: "not_found" });

@@ -48,3 +48,29 @@ test("data round trip and size limit", () => {
   assert.throws(() => s.putData(U, "x".repeat(2_000_001)), /too_big/);
   assert.deepEqual(s.getData(U).data, { a: [1, 2] });
 });
+
+test("change password and rotate recovery", () => {
+  const s = store();
+  const { recoveryCode } = s.signup({ username: "dave", password: "password1", uid: U });
+  assert.throws(() => s.changePassword({ uid: U, currentPassword: "nope", newPassword: "password2" }), /wrong_password/);
+  s.changePassword({ uid: U, currentPassword: "password1", newPassword: "password2" });
+  assert.equal(s.login({ username: "dave", password: "password2" }), U);
+  const { recoveryCode: next } = s.rotateRecovery({ uid: U, password: "password2" });
+  assert.notEqual(next, recoveryCode);
+  assert.equal(s.recover({ username: "dave", recoveryCode, newPassword: "password3" }), null);
+  assert.equal(s.recover({ username: "dave", recoveryCode: next, newPassword: "password3" }), U);
+});
+
+test("registerOpen and google link", () => {
+  const s = store();
+  const { uid, recoveryCode } = s.registerOpen({ username: "erin", password: "password1" });
+  assert.match(recoveryCode, /^([A-Z2-9]{4}-){3}[A-Z2-9]{4}$/);
+  assert.equal(s.login({ username: "erin", password: "password1" }), uid);
+  s.linkGoogle({ uid, googleSub: "g-1", googleEmail: "erin@gmail.com" });
+  assert.equal(s.findByGoogleSub("g-1").uid, uid);
+  const other = s.registerOpen({ username: "frank", password: "password1" });
+  assert.throws(
+    () => s.linkGoogle({ uid: other.uid, googleSub: "g-1", googleEmail: "x@gmail.com" }),
+    /google_taken/,
+  );
+});

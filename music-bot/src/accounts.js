@@ -79,6 +79,19 @@ export class AccountStore {
     return Object.keys(this.data.users).find((n) => this.data.users[n].uid === uid) || null;
   }
 
+  /** Public profile fields (no hashes). */
+  profile(username) {
+    const u = this.data.users[cleanName(username)];
+    if (!u) return null;
+    return {
+      uid: u.uid,
+      googleSub: u.googleSub || null,
+      googleEmail: u.googleEmail || null,
+      createdAt: u.createdAt || null,
+      lastLoginAt: u.lastLoginAt || null,
+    };
+  }
+
   signup({ username, password, uid }) {
     const name = cleanName(username);
     if (!/^[a-z0-9_.]{3,24}$/.test(name)) throw new Error("bad_username");
@@ -123,6 +136,113 @@ export class AccountStore {
     u.hash = hashSecret(pw, Buffer.from(salt, "hex"));
     this.#save();
     return u.uid;
+  }
+
+  /** Open registration: brand-new uid + username/password (no invite). */
+  registerOpen({ username, password }) {
+    const uid = randomBytes(6).toString("hex");
+    const { recoveryCode } = this.signup({ username, password, uid });
+    return { uid, recoveryCode };
+  }
+
+  /** Logged-in password change (must know the current password). */
+  changePassword({ uid, currentPassword, newPassword }) {
+    const name = this.usernameOf(uid);
+    if (!name) throw new Error("no_account");
+    const u = this.data.users[name];
+    const ok = matches(String(currentPassword ?? "").slice(0, 200), u.salt, u.hash);
+    if (!ok) throw new Error("wrong_password");
+    const pw = String(newPassword ?? "");
+    if (pw.length < 8 || pw.length > 200) throw new Error("bad_password");
+    const salt = randomBytes(16).toString("hex");
+    u.salt = salt;
+    u.hash = hashSecret(pw, Buffer.from(salt, "hex"));
+    this.#save();
+    return true;
+  }
+
+  /** Issue a new recovery code; old one stops working. Shown once. */
+  rotateRecovery({ uid, password }) {
+    const name = this.usernameOf(uid);
+    if (!name) throw new Error("no_account");
+    const u = this.data.users[name];
+    const ok = matches(String(password ?? "").slice(0, 200), u.salt, u.hash);
+    if (!ok) throw new Error("wrong_password");
+    const recoveryCode = newRecoveryCode();
+    const recoverySalt = randomBytes(16).toString("hex");
+    u.recoverySalt = recoverySalt;
+    u.recoveryHash = hashSecret(recoveryCode, Buffer.from(recoverySalt, "hex"));
+    this.#save();
+    return { recoveryCode };
+  }
+
+  findByGoogleSub(sub) {
+    if (!sub) return null;
+    for (const [username, u] of Object.entries(this.data.users)) {
+      if (u.googleSub === sub) return { username, ...u };
+    }
+    return null;
+  }
+
+  /** Attach Google identity to an existing account uid. */
+  linkGoogle({ uid, googleSub, googleEmail }) {
+    const name = this.usernameOf(uid);
+    if (!name) throw new Error("no_account");
+    const other = this.findByGoogleSub(googleSub);
+    if (other && other.uid !== uid) throw new Error("google_taken");
+    const u = this.data.users[name];
+    u.googleSub = googleSub;
+    u.googleEmail = googleEmail || null;
+    this.#save();
+    return { username: name, uid };
+  }
+
+  /**
+   * Login with a verified Google subject. If unknown and [uid] is provided
+   * (fresh invite), create a passwordless-linked account shell — caller should
+   * have already minted the invite uid. Username is derived from email local-part.
+   */
+  loginOrRegisterGoogle({ googleSub, googleEmail, uid = null }) {
+    const existing = this.findByGoogleSub(googleSub);
+    if (existing) {
+      existing.lastLoginAt = new Date().toISOString();
+      this.#save();
+      return { uid: existing.uid, username: this.usernameOf(existing.uid), created: false };
+    }
+    if (!uid) return null; // need invite/open registration first
+    if (this.usernameOf(uid)) {
+      // Invite device already has username/password — just link.
+      this.linkGoogle({ uid, googleSub, googleEmail });
+      return { uid, username: this.usernameOf(uid), created: false };
+    }
+    // Create a Google-backed account: random unusable password hash + email username.
+    let base = cleanName((googleEmail || "").split("@")[0]).replace(/[^a-z0-9_.]/g, "") || "user";
+    if (base.length < 3) base = `g_${base}`;
+    let name = base.slice(0, 20);
+    let n = 0;
+    while (this.data.users[name] && n < 50) {
+      n++;
+      name = `${base.slice(0, 18)}${n}`;
+    }
+    if (this.data.users[name]) throw new Error("taken");
+    const salt = randomBytes(16).toString("hex");
+    const recoveryCode = newRecoveryCode();
+    const recoverySalt = randomBytes(16).toString("hex");
+    // Password login disabled until they set one via recover/change — store random hash.
+    const randomPw = randomBytes(24).toString("hex");
+    this.data.users[name] = {
+      uid,
+      salt,
+      hash: hashSecret(randomPw, Buffer.from(salt, "hex")),
+      recoverySalt,
+      recoveryHash: hashSecret(recoveryCode, Buffer.from(recoverySalt, "hex")),
+      googleSub,
+      googleEmail: googleEmail || null,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+    };
+    this.#save();
+    return { uid, username: name, created: true, recoveryCode };
   }
 
   getData(uid) {

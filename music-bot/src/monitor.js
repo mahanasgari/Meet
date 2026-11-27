@@ -164,11 +164,43 @@ export class Monitor {
     setInterval(() => this.checkAll(), CHECK_MS).unref();
   }
 
+  /** Ids of the servers watched now (home, servers.json, extra services). */
+  listedIds() {
+    // Empty (nothing loaded yet): hide nothing.
+    try {
+      const ids = new Set(this.targets().map((t) => t.id));
+      return ids.size ? ids : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** False for a server taken off the list (its history and alerts stay on disk, unshown). */
+  isListed(id, ids = this.listedIds()) {
+    return id == null || !ids || ids.has(id);
+  }
+
+  /** The latest [n] alerts about servers still listed (and general ones). */
+  recentAlerts(n = 10) {
+    const ids = this.listedIds();
+    const out = [];
+    for (const a of this.alerts) {
+      if (!this.isListed(a.server, ids)) continue;
+      out.push(a);
+      if (out.length >= n) break;
+    }
+    return out;
+  }
+
   async checkAll() {
     if (this.running) return;
     this.running = true;
     try {
-      await Promise.all(this.targets().map((t) => this.checkOne(t).catch(() => undefined)));
+      const targets = this.targets();
+      await Promise.all(targets.map((t) => this.checkOne(t).catch(() => undefined)));
+      // A server taken off servers.json leaves the panel and the bot.
+      const ids = new Set(targets.map((t) => t.id));
+      for (const id of [...this.state.keys()]) if (!ids.has(id)) this.state.delete(id);
       this.prune();
     } finally {
       this.running = false;
@@ -327,7 +359,9 @@ export class Monitor {
       }
     }
     const out = {};
+    const ids = this.listedIds();
     for (const v of buckets.values()) {
+      if (!this.isListed(v.id, ids)) continue;
       (out[v.id] ||= []).push([v.b, v.up, v.msN ? Math.round(v.msSum / v.msN) : null]);
     }
     for (const a of Object.values(out)) a.sort((x, y) => x[0] - y[0]);
@@ -358,6 +392,11 @@ export class Monitor {
         }
       }
     }
-    return Object.fromEntries(Object.entries(acc).map(([id, [u, n]]) => [id, n ? u / n : null]));
+    const ids = this.listedIds();
+    return Object.fromEntries(
+      Object.entries(acc)
+        .filter(([id]) => this.isListed(id, ids))
+        .map(([id, [u, n]]) => [id, n ? u / n : null]),
+    );
   }
 }

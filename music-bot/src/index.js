@@ -427,7 +427,7 @@ const botCommands = {
     return `<b>Friends</b> (🟢 active today · 🔵 not today · ⚪ never used · ⛔ blocked)\n${rows.join("\n")}`;
   },
   alerts() {
-    const list = monitor ? monitor.alerts.slice(0, 10) : [];
+    const list = monitor ? monitor.recentAlerts(10) : [];
     if (!list.length) return "No alerts yet. All quiet. ✨";
     const icon = { down: "🔴", up: "🟢", warn: "🟠", info: "ℹ️" };
     return `<b>Latest alerts</b>\n${list.map((a) => `${icon[a.level] || ""} ${tehranTime(a.at)} — ${escHtml(a.text)}`).join("\n")}`;
@@ -1785,7 +1785,7 @@ function dashboardData(days) {
     listening: listeningStats(joinPath(SHARES, "users"), days),
     app: { latest, ...appStats(snaps, days) },
     feedback,
-    alerts: monitor ? monitor.alerts.slice(0, 200) : [],
+    alerts: monitor ? monitor.recentAlerts(200) : [],
     backup: backupStatus(),
     archive: catalog
       ? { ...(archiveStats(days) ?? { computing: true }), backupChannel: backupChannels().length > 0 }

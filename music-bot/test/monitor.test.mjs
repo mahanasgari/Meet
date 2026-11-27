@@ -259,3 +259,21 @@ test("Monitor runs probes at most every probeEveryMs and stores results", async 
   assert.equal(calls, 2);
   server.close();
 });
+
+test("a server taken off the list leaves the panel and the bot (history and alerts stay on disk)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mon-"));
+  let list = [{ id: "home", label: "Home", url: "http://127.0.0.1:1", role: "home" }, { id: "iran", label: "Iran", url: "http://127.0.0.1:1", role: "worker" }];
+  const m = new Monitor({ dir, token: "t", targets: () => list, localStats: () => ({}), probes: false });
+  const now = Date.now();
+  writeFileSync(join(dir, `${new Date(now).toISOString().slice(0, 10)}.jsonl`), `${JSON.stringify([now - 1000, "home", 1, 50])}\n${JSON.stringify([now - 1000, "iran", 0, null])}\n`);
+  m.alerts = [{ at: "x", level: "down", server: "iran", text: "Iran is down" }, { at: "x", level: "info", server: null, text: "general" }, { at: "x", level: "up", server: "home", text: "Home back" }];
+  m.state.set("iran", { id: "iran" });
+  assert.deepEqual(Object.keys(m.history(1)).sort(), ["home", "iran"]);
+  list = list.filter((t) => t.id !== "iran");
+  await m.checkAll();
+  assert.equal(m.state.has("iran"), false);
+  assert.deepEqual(Object.keys(m.history(1)), ["home"]);
+  assert.deepEqual(Object.keys(m.uptime(24)), ["home"]);
+  assert.deepEqual(m.recentAlerts(10).map((a) => a.text), ["general", "Home back"]);
+  assert.equal(m.alerts.length, 3, "nothing deleted");
+});

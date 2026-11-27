@@ -586,12 +586,13 @@ const replica = ARCHIVE_ON && HOME_URL && process.env.CATALOG_REPLICA !== "0" &&
 const SYNC_ORIGIN = (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase().replace(/[^a-z0-9-]/g, "-");
 const syncDb = catalog || replica;
 // Every server syncs with every other one (each pulls the others' changes).
-const SYNC_PEERS = parsePeers(process.env.SYNC_PEERS, [
+const ALL_PEERS = parsePeers(process.env.SYNC_PEERS, [
   { origin: "home", url: "https://music.cloudproducts.ir/extractor" },
   { origin: "germany", url: "https://hetzshib.buymepizza.ir/extractor" },
   { origin: "united-states", url: "https://usnishback.buymepizza.ir/extractor" },
   { origin: "turkey", url: "https://shabash.buymepizza.ir/extractor" },
-]).filter((p) => p.origin !== (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase());
+]);
+const SYNC_PEERS = ALL_PEERS.filter((p) => p.origin !== (process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home")).toLowerCase());
 const catalogFeed = syncDb
   ? new ChangeFeed({ db: syncDb.db, outFile: joinPath(SHARES, "catalog", "sync-out.db"), origin: SYNC_ORIGIN })
   : null;
@@ -879,7 +880,10 @@ if (catalog) {
     // comma-separated base URLs, default the sync peers; "0" = only here.
     const crawlPeers = process.env.ARTIST_CRAWL_PEERS === "0" ? [] : (process.env.ARTIST_CRAWL_PEERS
       ? process.env.ARTIST_CRAWL_PEERS.split(",").map((u) => u.trim().replace(/\/+$/, "")).filter(Boolean)
-      : SYNC_PEERS.map((p) => p.url)
+      // Every listed server: labels are stale since home moved (the old main
+      // is still listed as "home"), so this server is skipped by its
+      // /health answer instead (X-MP-Answered-By).
+      : ALL_PEERS.map((p) => p.url)
     ).map((base) => ({
       id: base.replace(/^https?:\/\//, "").split("/")[0],
       base,

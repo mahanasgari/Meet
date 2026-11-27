@@ -335,6 +335,7 @@ export class Archive {
    * @param {string} o.serverId      this server's id (matches the monitor's ids)
    * @param {HomeLink} o.home
    * @param {import("./tg_store.js").TgStore} o.tg
+   * @param {import("./bale_store.js").BaleStore} [o.bale] optional secondary store
    * @param {import("./disk_cache.js").DiskCache} o.cache
    * @param {string} o.dir           upload queue folder
    * @param {string} o.token         master token (for peer hops)
@@ -364,12 +365,13 @@ export class Archive {
     this.storedFile = join(o.dir, "stored-index.json");
     this.jobTimes = [];
     this.peerCache = { at: 0, list: [] };
-    this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0 };
+    this.counters = { disk: 0, telegram: 0, youtube: 0, peer: 0, downloads: 0, uploads: 0, uploadErrors: 0, blocked: 0, bale: 0 };
     this.log = o.log || console;
   }
 
   start() {
     this.tg.connect().catch((e) => this.log.error("[archive] telegram connect:", e.message));
+    this.bale?.connect().catch((e) => this.log.error("[archive] bale connect:", e.message));
     if (!this.home.catalog) {
       this.loadStored();
       void this.syncStored();
@@ -528,15 +530,37 @@ export class Archive {
     return this.serveFromTelegram(req, res, id, song, { noCache: true });
   }
 
-  /** Streams an archived song from the channel (Range-aware), filling the disk cache. */
+  /** Local catalog (home) or replica, if this process has one. */
+  #catalog() {
+    return this.home?.catalog || this.home?.replica || null;
+  }
+
+  /** Bale file_id for [id], when a secondary copy was recorded. */
+  #baleRef(id) {
+    if (!this.bale) return null;
+    const cat = this.#catalog();
+    return cat?.baleCopy?.(id, this.bale.backupChannel) || null;
+  }
+
+  /** Streams an archived song from Telegram (or Bale fallback), Range-aware. */
   async serveFromTelegram(req, res, id, song, { noCache = false } = {}) {
     let f;
+    let source = "telegram";
     try {
       if (!this.tg.ready) await this.tg.connect();
       f = await this.tg.open(song.msgId);
     } catch (e) {
       this.log.error("[archive] telegram open:", e.message);
-      return false;
+      const bale = this.#baleRef(id);
+      if (!bale?.fileId || !this.bale) return false;
+      try {
+        if (!this.bale.ready) await this.bale.connect();
+        f = await this.bale.open(bale.fileId);
+        source = "bale";
+      } catch (e2) {
+        this.log.error("[archive] bale open:", e2.message);
+        return false;
+      }
     }
     const range = parseRange(req.headers.range, f.size);
     if (range === "unsatisfiable") {
@@ -552,7 +576,7 @@ export class Archive {
       "Content-Length": end - start + 1,
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
-      "X-MP-Source": `telegram:${this.serverId}`,
+      "X-MP-Source": `${source}:${this.serverId}`,
       ...(range ? { "Content-Range": `bytes ${start}-${end}/${f.size}` } : {}),
     });
     if (req.method === "HEAD") {
@@ -567,7 +591,8 @@ export class Archive {
     try {
       for await (const chunk of f.read(start, end - start + 1)) {
         if (file) file.write(chunk);
-        this.counters.telegramBytes = (this.counters.telegramBytes || 0) + chunk.length;
+        const key = source === "bale" ? "baleBytes" : "telegramBytes";
+        this.counters[key] = (this.counters[key] || 0) + chunk.length;
         if (!gone && !res.write(chunk)) await Promise.race([once(res, "drain"), once(res, "close")]);
         if (gone && !file) break;
       }
@@ -579,7 +604,7 @@ export class Archive {
       }
       res.end();
     } catch (e) {
-      this.log.error("[archive] telegram read:", e.message);
+      this.log.error(`[archive] ${source} read:`, e.message);
       if (file) {
         file.destroy();
         this.cache.discard(tmp);
@@ -886,9 +911,37 @@ export class Archive {
       });
       await this.home.stored(id, { ...info, msgId: r.msgId, size: r.size, mime: r.mime, server: this.serverId });
       this.stored.set(id, { msgId: r.msgId, size: r.size });
+      // Best-effort secondary mirror (never fails the Telegram archive).
+      void this.mirrorToBale(id, path, info, r.size).catch((e) => this.log.error("[archive] bale mirror:", e.message));
     } finally {
       if (thumb) rmSync(thumb, { force: true });
     }
+  }
+
+  /**
+   * Copy a just-archived (or backfilled) song into the Bale channel when it
+   * fits the Bot API download cap. Records the copy in catalog.backups.
+   */
+  async mirrorToBale(id, path, info = {}, size = 0) {
+    if (!this.bale) return false;
+    const cat = this.#catalog();
+    if (!cat?.markBackupIn) return false;
+    const ch = this.bale.backupChannel;
+    if (cat.baleCopy?.(id, ch)?.fileId) return true;
+    const bytes = size || (existsSync(path) ? statSync(path).size : 0);
+    const { BALE_MAX_DOWNLOAD_BYTES } = await import("./bale_store.js");
+    if (!bytes || bytes > (this.bale.maxDownloadBytes || BALE_MAX_DOWNLOAD_BYTES)) return false;
+    if (!this.bale.ready) await this.bale.connect();
+    const r = await this.bale.uploadAudio(path, {
+      title: info.title || id,
+      artist: info.artist || "",
+      durationS: info.durationS,
+      caption: songCaption(id, info),
+      fileName: `${id}.m4a`,
+    });
+    cat.markBackupIn("song", id, ch, r.msgId, Date.now(), { fileId: r.fileId, size: r.size });
+    this.counters.bale = (this.counters.bale || 0) + 1;
+    return true;
   }
 
   /** Square 320 px JPEG cover for the Telegram message (best effort). */
@@ -1020,6 +1073,7 @@ export class Archive {
     }
     return {
       ready: this.tg.ready,
+      baleReady: this.bale ? this.bale.ready : false,
       cooling: this.cooling() ? new Date(this.coolUntil).toISOString() : null,
       cache: this.cache.stats(),
       uploadQueue: queued,

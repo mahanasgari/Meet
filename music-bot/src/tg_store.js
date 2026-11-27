@@ -30,7 +30,7 @@ async function defaultFactory(session, { apiId, apiHash }) {
 export class TgStore {
   constructor({
     apiId, apiHash, botToken, channelId, sessionFile,
-    minUploadIntervalMs = 12000, log = console, clientFactory, now = Date.now, bigInt, Api, floodPadMs = 1000,
+    minUploadIntervalMs = 8000, log = console, clientFactory, now = Date.now, bigInt, Api, floodPadMs = 1000,
   } = {}) {
     this.apiId = apiId;
     this.apiHash = apiHash;

@@ -226,7 +226,7 @@ test("reopen persists data and migration is idempotent", () => {
   const d = new Catalog(file);
   assert.equal(d.lookup("a").title, "T");
   assert.equal(d.stats(1, NOW).queue.queued, 1);
-  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "23");
+  assert.equal(d.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "26");
   d.close();
 });
 
@@ -287,7 +287,7 @@ test("v1 database upgrades in place to v2 and keeps old rows", () => {
   assert.equal(s.sourceKind, null);
   assert.equal(s.quality.label, null);
   assert.deepEqual(c.missingMeta(), ["old"]);
-  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "23");
+  assert.equal(c.db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value, "26");
   c.close();
 });
 
@@ -444,7 +444,7 @@ test("migration v4: upgrades a v3 DB in place, data survives", async () => {
   const db = new DatabaseSync(file);
   db.exec("DROP TABLE backups; DROP TABLE video_map; DROP TABLE videos; ALTER TABLE plays DROP COLUMN ctx; ALTER TABLE songs DROP COLUMN backup_msg_id; ALTER TABLE songs DROP COLUMN backup_at;");
   // ...and the later v9 artist-page columns, which a v3 DB never had.
-  db.exec("DROP INDEX artists_page; DROP INDEX artists_page_todo; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
+  db.exec("DROP INDEX artists_page; DROP INDEX artists_page_todo; DROP INDEX artists_page_old; ALTER TABLE artists DROP COLUMN page_at; ALTER TABLE artists DROP COLUMN page_ok; ALTER TABLE artists DROP COLUMN page_songs;");
   db.exec("DROP INDEX jobs_crawl; ALTER TABLE jobs DROP COLUMN weight;");
   db.exec("DROP TABLE spotify_tracks; DROP TABLE spotify_artists; DROP TABLE spotify_track_artists; DROP TABLE song_info;"); // v11-12
   db.exec("DROP TABLE lastfm_tracks; DROP TABLE lastfm_similar; DROP TABLE lastfm_similar_names; DROP TABLE lastfm_artists; DROP TABLE lastfm_artist_similar;"); // v14
@@ -706,6 +706,19 @@ test("backup check starts after songs already copied, and still sees new ones", 
   c.claim("b3", "s1", NOW + 30);
   c.stored("b3", { msgId: 6, size: 1 }, NOW + 30);
   assert.deepEqual(c.needsBackupIn("ch", 5, NOW + 40).map((x) => x.videoId), ["b3"]);
+});
+
+test("needsBaleBackup skips oversized songs and stores file_id", () => {
+  const c = open();
+  c.claim("s", "s1", NOW);
+  c.stored("s", { msgId: 1, size: 1000 }, NOW);
+  c.claim("big", "s1", NOW + 1);
+  c.stored("big", { msgId: 2, size: 30 * 1024 * 1024 }, NOW + 1);
+  const ch = "bale:1";
+  assert.deepEqual(c.needsBaleBackup(ch, 5, 20 * 1024 * 1024, NOW + 10).map((x) => x.videoId), ["s"]);
+  c.markBackupIn("song", "s", ch, 9, NOW + 11, { fileId: "fid-s", size: 1000 });
+  assert.equal(c.baleCopy("s", ch).fileId, "fid-s");
+  assert.deepEqual(c.needsBaleBackup(ch, 5, 20 * 1024 * 1024, NOW + 20), []);
 });
 
 test("analysis lease stops rescanning when nothing is new, until a song is stored", () => {

@@ -80,6 +80,7 @@ import { songMeta } from "./song_meta.js";
 import { downloadVideo, needsVideo, pickOfficialVideo, serveFileRange, serveVideoFromTelegram, videoCandidates, videoCaption, videoKind } from "./video.js";
 import { DiskCache } from "./disk_cache.js";
 import { TgStore } from "./tg_store.js";
+import { BaleStore, BALE_MAX_DOWNLOAD_BYTES } from "./bale_store.js";
 import {
   InviteStore,
   RateLimiter,
@@ -745,6 +746,16 @@ function healthyPeers() {
     .sort((a, b) => (a.ms ?? 9e9) - (b.ms ?? 9e9))
     .map((s) => ({ id: s.id, url: s.url }));
 }
+const BALE_ON =
+  Boolean(process.env.BALE_BOT_TOKEN && process.env.BALE_STORE_CHANNEL) && process.env.BALE_BACKUP !== "0";
+const baleStore = BALE_ON
+  ? new BaleStore({
+      botToken: process.env.BALE_BOT_TOKEN,
+      channelId: process.env.BALE_STORE_CHANNEL,
+      minUploadIntervalMs: Number(process.env.BALE_UPLOAD_INTERVAL_MS) || 8000,
+      maxDownloadBytes: Number(process.env.BALE_MAX_DOWNLOAD_BYTES) || BALE_MAX_DOWNLOAD_BYTES,
+    })
+  : null;
 const archive = ARCHIVE_ON
   ? new Archive({
       serverId: process.env.ARCHIVE_SERVER_ID || (HOME_URL ? "worker" : "home"),
@@ -759,6 +770,7 @@ const archive = ARCHIVE_ON
         // push faster. Override with TG_UPLOAD_INTERVAL_MS.
         minUploadIntervalMs: Number(process.env.TG_UPLOAD_INTERVAL_MS) || 8000,
       }),
+      bale: baleStore,
       cache: new DiskCache(joinPath(SHARES, "archive", "cache"), {
         maxBytes: (Number(process.env.ARCHIVE_CACHE_GB) || 3) * 1024 ** 3,
       }),
@@ -771,6 +783,7 @@ const archive = ARCHIVE_ON
     })
   : null;
 archive?.start();
+if (baleStore) console.log(`[archive] bale secondary store on channel ${process.env.BALE_STORE_CHANNEL}`);
 
 if (catalog) {
   // Grow the archive from what friends already listen to (opt-in sync).
@@ -851,15 +864,41 @@ if (catalog) {
     setInterval(() => void graph.tick(), (Number(process.env.GRAPH_EVERY_S) || 90) * 1000).unref();
   }
 
-  // Every artist's YouTube Music page and songs (details only), artists
-  // known when it first started; about 3 days for ~33k artists.
+  // Every artist's YouTube Music page and songs, in rounds that never end
+  // (see artist_crawl.js); about 3 days per ~33k artists.
   if (process.env.ARTIST_CRAWL !== "0") {
     let cutoff = Number(catalog.db.prepare("SELECT value FROM meta WHERE key='artist_crawl_cutoff'").get()?.value);
     if (!cutoff) {
       cutoff = Date.now();
       catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_crawl_cutoff',?)").run(String(cutoff));
     }
-    const artistCrawler = new ArtistCrawler({ catalog, transport: graph.transport, cutoff });
+    const saveCutoff = (t) => catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_crawl_cutoff',?)").run(String(t));
+    // Rounds: each finished round crawls the artists it found (ARTIST_CRAWL_ROUNDS=0: stop after one).
+    // Every other server fetches artists too, through its InnerTube relay
+    // (its own address, X-MP-Hop: no YTM_RELAY bounce). ARTIST_CRAWL_PEERS:
+    // comma-separated base URLs, default the sync peers; "0" = only here.
+    const crawlPeers = process.env.ARTIST_CRAWL_PEERS === "0" ? [] : (process.env.ARTIST_CRAWL_PEERS
+      ? process.env.ARTIST_CRAWL_PEERS.split(",").map((u) => u.trim().replace(/\/+$/, "")).filter(Boolean)
+      : SYNC_PEERS.map((p) => p.url)
+    ).map((base) => ({
+      id: base.replace(/^https?:\/\//, "").split("/")[0],
+      base,
+      transport: async (path, body) => {
+        const r = await fetch(`${base}/ytm/${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${MUSIC_API_TOKEN}`, "X-MP-Hop": "1" },
+          body: JSON.stringify({ context: { client: { clientName: "WEB_REMIX", clientVersion: "1.20250101.01.00", hl: "en" } }, ...body }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!r.ok) throw new Error(`ytmusic ${path} via ${base}: HTTP ${r.status}`);
+        return r.json();
+      },
+    }));
+    const artistCrawler = new ArtistCrawler({
+      catalog, transport: graph.transport, cutoff, peers: [],
+      rounds: process.env.ARTIST_CRAWL_ROUNDS !== "0", onRound: saveCutoff,
+      refreshMs: (Number(process.env.ARTIST_REFRESH_DAYS) || 30) * 86400_000,
+    });
     // Once: queue the songs of artists crawled before crawl songs were queued.
     if (!catalog.db.prepare("SELECT value FROM meta WHERE key='crawl_queue_backfill'").get()) {
       let n = 0;
@@ -876,13 +915,32 @@ if (catalog) {
       catalog.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('artist_videos_pass','1')").run();
       console.log(`[artists] re-fetching ${n} pages for their videos`);
     }
+    // Peers join once we know which URL is this server itself (it answers
+    // with X-MP-Answered-By = its sync origin) and that they answer.
+    if (MUSIC_API_TOKEN) {
+      setTimeout(async () => {
+        const lanes = [];
+        for (const p of crawlPeers) {
+          try {
+            const r = await fetch(`${p.base}/health`, { signal: AbortSignal.timeout(10_000) });
+            if (!r.ok || r.headers.get("x-mp-answered-by") === SYNC_ORIGIN) continue;
+            lanes.push({ id: r.headers.get("x-mp-answered-by") || p.id, transport: p.transport });
+          } catch {}
+        }
+        artistCrawler.addPeers(lanes);
+        console.log(`[artists] crawling through ${lanes.length + 1} servers: here${lanes.map((l) => ", " + l.id).join("")}`);
+      }, 30_000).unref();
+    }
     const every = (Number(process.env.ARTIST_CRAWL_EVERY_S) || 8) * 1000;
+    let idle = false;
     const timer = setInterval(() => {
       artistCrawler.tick().then((more) => {
-        if (more) return;
-        clearInterval(timer);
-        const st = catalog.artistPageStats(cutoff);
-        console.log(`[artists] done: ${st.fetched} pages, ${st.failed} failed, ${st.songs} songs known`);
+        if (more) return void (idle = false);
+        if (!artistCrawler.rounds) clearInterval(timer);
+        if (idle) return; // rounds: waits for new artists or stale pages
+        idle = true;
+        const st = catalog.artistPageStats(artistCrawler.cutoff);
+        console.log(`[artists] done for now: ${st.fetched} pages, ${st.failed} failed, ${st.songs} songs known`);
       }).catch((e) => console.error("[artists]", e.message));
     }, every);
     timer.unref();
@@ -1575,6 +1633,42 @@ if (catalog && archive && process.env.TG_BACKUP_ENABLE === "1") {
   };
   setTimeout(() => void backupTick(), 2 * 60_000).unref();
   setInterval(() => void backupTick(), 60_000).unref();
+}
+
+// --- Bale secondary archive: re-upload recent Telegram songs that fit the
+// Bot API getFile cap (~20 MB). Off when BALE_BOT_TOKEN / channel unset.
+if (catalog && archive?.bale) {
+  let baleBacking = false;
+  const baleTick = async () => {
+    if (baleBacking || !archive.bale) return;
+    if (!archive.bale.ready) {
+      archive.bale.connect().catch(() => undefined);
+      return;
+    }
+    baleBacking = true;
+    const ch = archive.bale.backupChannel;
+    try {
+      for (const item of catalog.needsBaleBackup(ch, 2, archive.bale.maxDownloadBytes || BALE_MAX_DOWNLOAD_BYTES)) {
+        try {
+          const path = await archive.localFile(item.videoId);
+          if (!path) {
+            console.error(`[bale] ${item.videoId}: no local file`);
+            break;
+          }
+          const info = catalog.lookup(item.videoId) || {};
+          const ok = await archive.mirrorToBale(item.videoId, path, info, item.size);
+          if (ok) console.log(`[bale] mirrored ${item.videoId}`);
+        } catch (e) {
+          console.error(`[bale] ${item.videoId}:`, e.message);
+          break;
+        }
+      }
+    } finally {
+      baleBacking = false;
+    }
+  };
+  setTimeout(() => void baleTick(), 90_000).unref();
+  setInterval(() => void baleTick(), 60_000).unref();
 }
 
 let dashboardHtml = null;
@@ -3785,6 +3879,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
+      res.setHeader("X-MP-Answered-By", SYNC_ORIGIN); // which server this is (crawl peers skip themselves)
       sendJson(res, 200, {
         ok: true,
         extractor: "yt-dlp",

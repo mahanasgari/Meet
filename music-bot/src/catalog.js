@@ -219,7 +219,14 @@ const MIGRATIONS = [
   // IS NULL (17s+ on home), freezing the bot so Telegram and archive stalled.
   // (rowid can't appear in a CREATE INDEX expression.)
   `CREATE INDEX IF NOT EXISTS songs_stored_no_kind ON songs(stored_at)
-    WHERE status='stored' AND source_kind IS NULL;`
+    WHERE status='stored' AND source_kind IS NULL;`,
+  // v25: Bale (and other Bot-API) backup copies need a string file_id; size
+  // lets the mirror skip files over the download cap without a getFile call.
+  `ALTER TABLE backups ADD COLUMN file_id TEXT;
+  ALTER TABLE backups ADD COLUMN size INTEGER;`,
+  // v26: the artist crawl never ends: once every known artist is fetched, it
+  // re-fetches the oldest pages for new releases (oldest first, no scan).
+  `CREATE INDEX IF NOT EXISTS artists_page_old ON artists(page_at) WHERE page_ok=1;`,
 ];
 export const MOOD_COLUMNS = { happy: "happy", sad: "sad", relaxed: "relaxed", aggressive: "aggressive", party: "party", dance: "danceability", energy: "energy" };
 const VIDEO_LEASE_MS = 10 * MIN;
@@ -799,9 +806,40 @@ export class Catalog {
     return [...songs, ...vids].slice(0, limit).map((r) => ({ kind: r.kind, videoId: r.video_id, msgId: r.tg_msg_id }));
   }
 
-  markBackupIn(kind, videoId, channel, msgId, now = Date.now()) {
-    this.#sql(`INSERT OR REPLACE INTO backups(kind, video_id, channel, msg_id, at) VALUES(?,?,?,?,?)`)
-      .run(kind, videoId, String(channel), msgId, now);
+  markBackupIn(kind, videoId, channel, msgId, now = Date.now(), { fileId = null, size = null } = {}) {
+    this.#sql(`INSERT OR REPLACE INTO backups(kind, video_id, channel, msg_id, at, file_id, size) VALUES(?,?,?,?,?,?,?)`)
+      .run(kind, videoId, String(channel), msgId, now, fileId ?? null, size ?? null);
+  }
+
+  /**
+   * Stored songs not yet mirrored to a Bale (Bot API) channel, only those
+   * whose Telegram copy fits [maxBytes] (getFile download cap).
+   */
+  needsBaleBackup(channel, limit = 3, maxBytes = 20 * 1024 * 1024, now = Date.now()) {
+    const ch = String(channel);
+    let from = this.#backupFrom.get(ch);
+    if (from == null) from = now - 7 * 864e5;
+    const songs = this.#sql(`SELECT video_id, tg_msg_id, tg_size, stored_at FROM songs s INDEXED BY songs_stored_at
+      WHERE stored_at >= ? AND status='stored' AND tg_msg_id IS NOT NULL
+      AND tg_size IS NOT NULL AND tg_size > 0 AND tg_size <= ?
+      AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.kind='song' AND b.video_id=s.video_id AND b.channel=?)
+      ORDER BY stored_at, rowid LIMIT ?`).all(from, maxBytes, ch, limit);
+    this.#backupFrom.set(ch, songs.length ? songs[0].stored_at : now - 60_000);
+    return songs.map((r) => ({
+      kind: "song",
+      videoId: r.video_id,
+      msgId: r.tg_msg_id,
+      size: r.tg_size,
+    }));
+  }
+
+  /** Bale (or other Bot-API) copy of a song, if one was recorded. */
+  baleCopy(videoId, channel) {
+    const r = this.#sql(
+      `SELECT msg_id, file_id, size, at FROM backups WHERE kind='song' AND video_id=? AND channel=?`,
+    ).get(videoId, String(channel));
+    if (!r?.file_id) return null;
+    return { msgId: r.msg_id, fileId: r.file_id, size: r.size, at: r.at };
   }
 
   /** Per channel: {channel, songs, videos} copied, plus totals to copy. */
@@ -1056,6 +1094,12 @@ export class Catalog {
   nextArtistPages(limit = 1, cutoff = Date.now()) {
     return this.#sql(`SELECT id FROM artists INDEXED BY artists_page_todo WHERE page_at IS NULL AND first_seen<=?
       ORDER BY first_seen, rowid LIMIT ?`).all(cutoff, limit).map((r) => r.id);
+  }
+
+  /** Fetched artist pages last fetched before [before], oldest first. */
+  staleArtistPages(limit = 1, before = Date.now()) {
+    return this.#sql(`SELECT id FROM artists INDEXED BY artists_page_old WHERE page_ok=1 AND page_at<?
+      ORDER BY page_at LIMIT ?`).all(before, limit).map((r) => r.id);
   }
 
   /** One artist page: its details, songs, albums and similar artists. */

@@ -9,9 +9,12 @@
 // page lists them by popularity).
 //
 // One artist at a time, a few seconds apart; backs off for half an hour when
-// YouTube Music pushes back (HTTP 429/403). Only artists known when the
-// crawl started (meta key artist_crawl_cutoff): artists first seen on the
-// pages it fetches are stored but not crawled in turn, so it finishes.
+// YouTube Music pushes back (HTTP 429/403). It goes in rounds: artists known
+// when the round started (meta key artist_crawl_cutoff). With [rounds] on,
+// a finished round starts the next one with the artists the last found on
+// its pages (similar artists, featured artists), so the catalog and the
+// archive queue keep growing; when no new artist is left, it re-fetches
+// pages older than [refreshMs] for new releases.
 
 const isObj = (v) => v && typeof v === "object";
 const runsOf = (x) => (Array.isArray(x?.runs) ? x.runs : []);
@@ -143,34 +146,119 @@ export class ArtistCrawler {
   /**
    * @param {object} o
    * @param {import("./catalog.js").Catalog} o.catalog
-   * @param {(path: string, body: object) => Promise<object>} o.transport  YouTube Music InnerTube
+   * @param {(path: string, body: object) => Promise<object>} o.transport  YouTube Music InnerTube (this server)
+   * @param {{ id: string, transport: Function }[]} [o.peers]  other servers' InnerTube relays: one more
+   *   artist at a time each. A page from a peer with no songs is fetched again here (some addresses get
+   *   cut-down pages); a peer that keeps sending those rests for [peerRestMs].
    * @param {number} [o.cutoff]  crawl artists first seen up to here
    */
-  constructor({ catalog, transport, cutoff = Date.now(), log = console, now = () => Date.now() }) {
+  constructor({ catalog, transport, peers = [], peerRestMs = 6 * 3600_000, cutoff = Date.now(), rounds = false, onRound = null, refreshMs = 30 * 86400_000, log = console, now = () => Date.now() }) {
     this.catalog = catalog;
     this.transport = transport;
+    this.lanes = [
+      { id: "local", transport, trusted: true, busy: false, pauseUntil: 0, strikes: 0 },
+    ];
+    this.addPeers(peers);
+    this.peerRestMs = peerRestMs;
     this.cutoff = cutoff;
+    this.rounds = rounds;
+    this.onRound = onRound;
+    this.refreshMs = refreshMs;
+    this.round = 0;
     this.log = log;
     this.now = now;
-    this.busy = false;
-    this.pauseUntil = 0;
+    this.inFlight = new Set();
+    /** Artists a peer answered with an empty page: the trusted lane fetches them. */
+    this.recheck = [];
     this.done = 0;
   }
 
-  /** Fetches the next artist's page and songs. False when there's nothing left. */
+  /** More servers to fetch through (see the constructor's peers). */
+  addPeers(peers) {
+    for (const p of peers) {
+      if (this.lanes.some((l) => l.id === p.id)) continue;
+      this.lanes.push({ id: p.id, transport: p.transport, trusted: false, busy: false, pauseUntil: 0, strikes: 0 });
+    }
+  }
+
+  /** Kept for callers that read it: the local lane's pause. */
+  get pauseUntil() {
+    return this.lanes[0].pauseUntil;
+  }
+
+  #pick(ids) {
+    return ids.find((x) => !this.inFlight.has(x)) ?? null;
+  }
+
+  /** The next artist to fetch: this round's, the next round's, or a stale page. */
+  #next() {
+    const want = this.lanes.length + 2;
+    let id = this.#pick(this.catalog.nextArtistPages(want, this.cutoff));
+    if (id || !this.rounds) return id;
+    if (this.inFlight.size) {
+      // Someone is still on this round: start the next one only once it's free.
+      if (this.catalog.nextArtistPages(1, this.cutoff).length) return null;
+    }
+    const now = this.now();
+    // Artists first seen since this round started: the next round.
+    id = this.#pick(this.catalog.nextArtistPages(want, now));
+    if (id) {
+      const st = this.catalog.artistPageStats(now);
+      this.cutoff = now;
+      this.round++;
+      this.onRound?.(now);
+      this.log.log(`[artists] new round: ${st.pending} artists found since the last one`);
+      return id;
+    }
+    return this.#pick(this.catalog.staleArtistPages(want, now - this.refreshMs));
+  }
+
+  /**
+   * Hands an artist to every free lane (this server and each peer) and
+   * waits for them. False when there's nothing left to fetch.
+   */
   async tick() {
-    if (this.busy || this.now() < this.pauseUntil) return true;
-    const [id] = this.catalog.nextArtistPages(1, this.cutoff);
-    if (!id) return false;
-    this.busy = true;
+    const now = this.now();
+    const jobs = [];
+    let any = false;
+    for (const lane of this.lanes) {
+      if (lane.busy || now < lane.pauseUntil) {
+        any ||= lane.busy;
+        continue;
+      }
+      const id = lane.trusted && this.recheck.length ? this.recheck.shift() : this.#next();
+      if (!id) break;
+      any = true;
+      jobs.push(this.#fetch(lane, id));
+    }
+    // Nothing to give out and nobody working: done (for now).
+    if (!jobs.length) return any || this.lanes.some((l) => now < l.pauseUntil && l.trusted);
+    await Promise.all(jobs);
+    return true;
+  }
+
+  async #fetch(lane, id) {
+    lane.busy = true;
+    this.inFlight.add(id);
     try {
-      const page = parseArtistPage(await this.transport("browse", { browseId: id }));
+      const page = parseArtistPage(await lane.transport("browse", { browseId: id }));
       let songs = page.songs;
       if (page.songsPlaylist) {
-        const all = parseSongList(await this.transport("browse", { browseId: page.songsPlaylist }));
+        const all = parseSongList(await lane.transport("browse", { browseId: page.songsPlaylist }));
         const have = new Set(songs.map((s) => s.videoId));
         songs = [...songs, ...all.filter((s) => !have.has(s.videoId))];
       }
+      if (!lane.trusted && !songs.length) {
+        // Maybe a cut-down page for that server's address: ask here instead.
+        this.recheck.push(id);
+        if (++lane.strikes >= 5) {
+          lane.strikes = 0;
+          lane.pauseUntil = this.now() + this.peerRestMs;
+          this.log.error(`[artists] ${lane.id} keeps getting empty artist pages; resting it`);
+        }
+        return;
+      }
+      lane.strikes = 0;
       this.catalog.saveArtistPage(id, { ...page, songs }, this.now());
       // Official videos on the page → their songs' video matches, no search needed.
       this.catalog.matchArtistVideos(id, page.videos || [], this.now());
@@ -183,21 +271,25 @@ export class ArtistCrawler {
       );
       if (++this.done % 100 === 0) {
         const st = this.catalog.artistPageStats(this.cutoff);
-        this.log.log(`[artists] ${st.fetched} pages fetched, ${st.pending} to go, ${st.songs} songs known`);
+        this.log.log(`[artists] ${st.fetched} pages fetched, ${st.pending} to go, ${st.songs} songs known (${this.lanes.filter((l) => this.now() >= l.pauseUntil).length} servers crawling)`);
       }
     } catch (e) {
       const msg = String(e?.message || e);
       if (/HTTP (429|403)/.test(msg)) {
-        // Pushed back: leave this artist for later, pause the crawl.
-        this.pauseUntil = this.now() + 30 * 60_000;
-        this.log.error(`[artists] YouTube Music pushed back (${msg}); pausing 30 min`);
+        // Pushed back: leave this artist for later, pause this lane.
+        lane.pauseUntil = this.now() + 30 * 60_000;
+        this.log.error(`[artists] YouTube Music pushed back on ${lane.id} (${msg}); pausing it 30 min`);
+      } else if (!lane.trusted) {
+        // A peer that can't be reached: rest it a while, the artist stays to do.
+        lane.pauseUntil = this.now() + 10 * 60_000;
+        this.log.error(`[artists] ${lane.id}: ${msg.slice(0, 120)}; resting 10 min`);
       } else {
         this.catalog.markArtistPageFailed(id, this.now());
         this.log.error(`[artists] ${id}: ${msg.slice(0, 120)}`);
       }
     } finally {
-      this.busy = false;
+      lane.busy = false;
+      this.inFlight.delete(id);
     }
-    return true;
   }
 }
